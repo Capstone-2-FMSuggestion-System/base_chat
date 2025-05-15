@@ -36,6 +36,6 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey("conversations.conversation_id"))
     role = Column(String(20))  # "user" hoặc "assistant" hoặc "system"
     content = Column(Text)
-    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP")) 
     is_summarized = Column(Boolean, default=False)  # Đánh dấu tin nhắn đã được tóm tắt hay chưa
     summary = Column(Text, nullable=True)  # Tóm tắt nội dung tin nhắn 

@@ -29,7 +29,7 @@ class NewChatResponse(BaseModel):
 
 class ChatContentResponse(BaseModel):
     conversation_id: int
-    messages: List[MessageModel]
+    messages: List[MessageModel] 
     has_summary: Optional[bool] = False
     summary: Optional[str] = None
     summary_updated_at: Optional[datetime] = None

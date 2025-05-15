@@ -210,8 +210,8 @@ ALWAYS respond in Vietnamese unless otherwise requested.
                                             if chunk.strip():
                                                 token_count += len(chunk.split())
                                                 if token_count <= max_tokens:
-                                                    logger.debug(f"Đang trả về chunk: {chunk}")
-                                                    yield chunk
+                                        logger.debug(f"Đang trả về chunk: {chunk}")
+                                        yield chunk
                                                 else:
                                                     logger.info(f"Đã đạt giới hạn {max_tokens} token, dừng phản hồi")
                                                     break
