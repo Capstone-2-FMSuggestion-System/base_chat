@@ -1,0 +1,67 @@
+# Môi trường ảo Python
+venv/
+env/
+.venv/
+.env
+*.env
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Các file log
+*.log
+logs/
+
+# Thư mục IDE và editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# File build và distribution
+dist/
+build/
+*.egg-info/
+
+# File dữ liệu
+*.db
+*.sqlite
+*.sqlite3
+redis-data/
+
+#thư mục
+docs/
+migrations/
+scripts/
+
+# File tạm
+*.tmp
+tmp/
+.coverage
+htmlcov/
+
+# Các file cài đặt
+node_modules/
+.ipynb_checkpoints/
+
+# File nhạy cảm
+secrets.json
+credentials.json
+config.json
+
+# File sinh ra trong quá trình test
+.coverage
+coverage.xml
+
+# File tạm thời tạo ra trong quá trình phát triển
+*_temp*
+*_backup*
+
+# Thư mục AI model (nếu có)
+models/
+model_cache/
+.hf_cache/ 

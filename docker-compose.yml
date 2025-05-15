@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: medical_chat_app
+    restart: always
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mysql
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./app:/app/app
+    networks:
+      - medical_chat_network
+    environment:
+      - DB_HOST=mysql
+      - DB_USER=root
+      - DB_PASSWORD=12345
+      - DB_PORT=3306
+      - DB_NAME=family_menu_db
+
+  mysql:
+    image: mysql:8.0
+    container_name: medical_chat_mysql
+    restart: always
+    environment:
+      - MYSQL_DATABASE=family_menu_db
+      - MYSQL_ROOT_PASSWORD=12345
+      - MYSQL_ROOT_HOST=%
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init_db:/docker-entrypoint-initdb.d
+    networks:
+      - medical_chat_network
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  redis:
+    image: redis:7.0
+    container_name: medical_chat_redis
+    restart: always
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - medical_chat_network
+
+networks:
+  medical_chat_network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data: 

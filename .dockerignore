@@ -1,0 +1,55 @@
+# Môi trường ảo
+venv/
+env/
+.venv/
+.env
+*.env
+!.env.docker
+
+# Git
+.git
+.gitignore
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Các file log
+*.log
+logs/
+
+# Thư mục IDE và editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# File build và distribution
+dist/
+build/
+*.egg-info/
+
+# File dữ liệu
+*.db
+*.sqlite
+*.sqlite3
+redis-data/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# File tạm thời
+*.tmp
+tmp/
+.coverage
+htmlcov/
+
+# Các thư mục dữ liệu khác
+data/
+models/
+model_cache/ 
