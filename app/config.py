@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     def __init__(self, **data):
         super().__init__(**data)
         if not self.SQLALCHEMY_DATABASE_URL:
-            self.SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+            self.SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?charset=utf8mb4"
     
     class Config:
         env_file = ".env"
