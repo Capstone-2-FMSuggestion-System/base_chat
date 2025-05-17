@@ -17,6 +17,11 @@ class ChatResponse(BaseModel):
     conversation_id: int
     user_message: Dict[str, str]
     assistant_message: Dict[str, str]
+    has_summary: Optional[bool] = False
+    summary: Optional[str] = None
+    health_data: Optional[Dict[str, Any]] = None
+    limit_reached: bool = False
+    message_count: int = 0
 
 
 class NewChatResponse(BaseModel):
@@ -33,7 +38,6 @@ class ChatContentResponse(BaseModel):
     messages: List[MessageModel] 
     has_summary: Optional[bool] = False
     summary: Optional[str] = None
-    summary_updated_at: Optional[datetime] = None
 
     class Config:
         orm_mode = True 

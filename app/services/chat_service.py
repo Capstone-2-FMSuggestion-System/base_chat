@@ -12,6 +12,7 @@ from app.services.gemini_prompt_service import GeminiPromptService
 from app.services.chat_flow import run_chat_flow
 from app.config import settings
 from app.db.models import Message
+from app.schemas.chat import ChatResponse, NewChatResponse
 
 
 logger = logging.getLogger(__name__)
@@ -32,35 +33,36 @@ class ChatService:
     
     async def process_message(self, user_id: int, message: str, conversation_id: Optional[int] = None) -> Dict[str, Any]:
         """Xử lý tin nhắn từ người dùng và trả về phản hồi từ AI"""
-        
-        # Nếu không có conversation_id, lấy cuộc trò chuyện mới nhất hoặc tạo mới
+        # Chọn cuộc trò chuyện hiện tại hoặc tạo mới
         if not conversation_id:
+            # Tìm cuộc trò chuyện gần nhất của người dùng
             conversation = self.repository.get_latest_conversation(user_id)
             if not conversation:
+                # Tạo mới nếu không có
                 conversation = self.repository.create_conversation(user_id)
                 # Thêm lời chào khi bắt đầu cuộc trò chuyện mới
                 welcome_message = await self.gemini_service.generate_welcome_message()
                 self.repository.add_message(conversation.conversation_id, "assistant", welcome_message)
+                
+                # Trả về lời chào để client hiển thị
+                return {
+                    "conversation_id": conversation.conversation_id,
+                    "user_message": {"role": "user", "content": message},
+                    "assistant_message": {"role": "assistant", "content": welcome_message}
+                }
             conversation_id = conversation.conversation_id
         else:
-            # Kiểm tra người dùng có quyền truy cập cuộc trò chuyện không
-            if not self.repository.is_user_owner_of_conversation(user_id, conversation_id):
-                raise HTTPException(status_code=403, detail="Không có quyền truy cập cuộc trò chuyện này")
-            
             # Kiểm tra xem cuộc trò chuyện có tồn tại không
             conversation = self.repository.get_conversation_by_id(conversation_id)
             if not conversation:
-                raise HTTPException(status_code=404, detail="Cuộc trò chuyện không tồn tại")
+                raise ValueError(f"Không tìm thấy cuộc trò chuyện với ID: {conversation_id}")
+            
+            # Kiểm tra quyền sở hữu
+            if conversation.user_id != user_id:
+                raise ValueError(f"Người dùng không có quyền truy cập cuộc trò chuyện này")
         
-        # Lấy lịch sử trò chuyện hiện tại để phân tích
-        chat_history = self.repository.get_messages(conversation_id, limit=10)
-        
-        # Khởi tạo service nếu cần
-        if self.llm_service._active_service is None:
-            try:
-                await self.llm_service.initialize()
-            except Exception as e:
-                logger.error(f"Lỗi khởi tạo LLM service: {str(e)}")
+        # Lấy lịch sử trò chuyện cho tin nhắn hiện tại
+        chat_history = self.repository.get_messages(conversation_id)
         
         # Sử dụng LangGraph flow để xử lý tin nhắn
         try:
@@ -97,24 +99,30 @@ class ChatService:
             return await self._fallback_process_message(user_id, message, conversation_id)
     
     async def _fallback_process_message(self, user_id: int, message: str, conversation_id: int) -> Dict[str, Any]:
-        """Phương thức dự phòng khi LangGraph gặp lỗi"""
+        """Phương thức xử lý dự phòng nếu LangGraph gặp lỗi"""
         logger.info("Sử dụng phương thức xử lý dự phòng")
         try:
-            # Lưu tin nhắn người dùng
-            user_message = self.repository.add_message(conversation_id, "user", message)
+            # Tham chiếu đến tin nhắn người dùng đã tồn tại
+            user_message = self.db.query(Message).filter(
+                Message.conversation_id == conversation_id,
+                Message.role == "user",
+                Message.content == message
+            ).order_by(Message.created_at.desc()).first()
             
-            # Kiểm tra xem có cần tạo tóm tắt mới không
-            await self._check_and_create_summary(conversation_id, user_message.message_id)
+            # Nếu không tìm thấy, tạo mới tin nhắn
+            if not user_message:
+                user_message = self.repository.add_message(conversation_id, "user", message)
+                logger.info(f"Đã tạo tin nhắn người dùng trong fallback: {message[:50]}...")
             
-            # Lấy lịch sử trò chuyện với tóm tắt nếu cần
-            messages = self.repository.get_messages_with_summary(conversation_id)
-            
-            # Khởi tạo service nếu cần
+            # Khởi tạo service
             if self.llm_service._active_service is None:
                 await self.llm_service.initialize()
-                
-            # Tạo prompt tối ưu cho Medichat bằng Gemini
-            medichat_prompt = await self.gemini_service.create_medichat_prompt(messages)
+            
+            # Lấy lịch sử trò chuyện
+            messages = self.repository.get_messages_with_summary(conversation_id)
+            
+            # Tạo prompt tối ưu cho Medichat
+            prompt = await self.gemini_service.create_medichat_prompt(messages)
             
             # Tạo danh sách tin nhắn mới với prompt từ Gemini
             medichat_messages = [
@@ -124,27 +132,31 @@ class ChatService:
                 },
                 {
                     "role": "user",
-                    "content": medichat_prompt
+                    "content": prompt
                 }
             ]
             
-            # Gửi yêu cầu đến Medichat và nhận phản hồi
+            # Gọi đến Medichat
             medichat_response = await self.llm_service.get_full_response(medichat_messages)
             
-            # Kiểm tra và điều chỉnh phản hồi từ Medichat bằng Gemini
-            polished_response = await self.gemini_service.polish_response(medichat_response, medichat_prompt)
+            # Tinh chỉnh phản hồi
+            polished_response = await self.gemini_service.polish_response(medichat_response, prompt)
             
-            # Lưu phản hồi đã điều chỉnh từ AI
+            # Lưu phản hồi
             self.repository.add_message(conversation_id, "assistant", polished_response)
             
+            # Trả về kết quả
             return {
                 "conversation_id": conversation_id,
                 "user_message": {"role": "user", "content": message},
                 "assistant_message": {"role": "assistant", "content": polished_response}
             }
+            
         except Exception as e:
+            error_message = "Xin lỗi, hiện tôi đang gặp vấn đề kết nối. Vui lòng thử lại sau."
             logger.error(f"Lỗi trong phương thức dự phòng: {str(e)}")
-            error_message = "Xin lỗi, hiện tôi không thể kết nối tới hệ thống trí tuệ nhân tạo. Vui lòng thử lại sau."
+            
+            # Lưu thông báo lỗi
             self.repository.add_message(conversation_id, "assistant", error_message)
             
             return {
@@ -278,7 +290,6 @@ class ChatService:
         if summarized_message:
             result["has_summary"] = True
             result["summary"] = summarized_message.summary
-            result["summary_updated_at"] = summarized_message.created_at
         else:
             result["has_summary"] = False
         

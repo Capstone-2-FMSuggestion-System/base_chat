@@ -5,7 +5,7 @@ giữa các dịch vụ LLM khác nhau như LlamaClient và OllamaClient.
 import logging
 import asyncio
 import httpx
-from typing import Dict, List, Optional, Union, AsyncGenerator
+from typing import Dict, List, Optional, Union, AsyncGenerator, Tuple
 from enum import Enum
 
 from app.services.llama_client import LlamaClient
@@ -57,12 +57,15 @@ class LLMServiceFactory:
         # Khởi tạo URLs từ tham số hoặc cấu hình
         self.llama_url = llama_url or getattr(settings, "LLAMA_CPP_URL", "http://localhost:8080")
         self.ollama_url = ollama_url or getattr(settings, "OLLAMA_URL", "http://localhost:11434")
-        self.default_model = default_model or "medichat"
+        self.default_model = default_model or getattr(settings, "MEDICHAT_MODEL", "medichat-llama3:8b_q4_K_M")
         
         # Khởi tạo các biến trạng thái
         self._llama_client = None
         self._ollama_client = None
         self._active_service = None
+        
+        # Lưu trữ thông tin về trạng thái mô hình
+        self.model_status = {}
         
         logger.info(f"Khởi tạo LLMServiceFactory với mode: {self.service_type.value}")
     
@@ -85,6 +88,32 @@ class LLMServiceFactory:
         except Exception as e:
             logger.warning(f"Không thể kết nối đến Ollama API: {str(e)}")
             return False
+            
+    async def check_ollama_models(self) -> Tuple[bool, str]:
+        """
+        Kiểm tra xem các mô hình Ollama cần thiết đã được cài đặt chưa
+        
+        Returns:
+            Tuple[bool, str]: Trạng thái và thông báo
+        """
+        if self._ollama_client is None:
+            self._ollama_client = OllamaClient(base_url=self.ollama_url, target_model=self.default_model)
+            
+        # Kiểm tra mô hình Ollama
+        model_available, message = await self._ollama_client.check_model_availability()
+        
+        # Lưu thông tin trạng thái
+        self.model_status = {
+            "model_name": self.default_model,
+            "available": model_available,
+            "message": message
+        }
+        
+        if not model_available:
+            # Ghi log và trả về thông báo lỗi
+            logger.warning(f"Mô hình Ollama không sẵn sàng: {message}")
+        
+        return model_available, message
     
     async def initialize(self) -> str:
         """
@@ -104,6 +133,8 @@ class LLMServiceFactory:
             elif is_ollama_available:
                 self._active_service = LLMServiceType.OLLAMA
                 logger.info("Tự động chọn dịch vụ Ollama")
+                # Kiểm tra mô hình Ollama khi service được chọn
+                await self.check_ollama_models()
             else:
                 raise ConnectionError("Không thể kết nối đến bất kỳ dịch vụ LLM nào")
         else:
@@ -118,6 +149,8 @@ class LLMServiceFactory:
                     if is_ollama_available:
                         logger.warning("Kết nối đến llama.cpp thất bại, chuyển sang Ollama")
                         self._active_service = LLMServiceType.OLLAMA
+                        # Kiểm tra mô hình Ollama khi chuyển đổi service
+                        await self.check_ollama_models()
                     else:
                         raise ConnectionError("Không thể kết nối đến bất kỳ dịch vụ LLM nào")
             else:  # OLLAMA
@@ -130,6 +163,9 @@ class LLMServiceFactory:
                         self._active_service = LLMServiceType.LLAMA_CPP
                     else:
                         raise ConnectionError("Không thể kết nối đến bất kỳ dịch vụ LLM nào")
+                else:
+                    # Kiểm tra mô hình Ollama khi service được chọn
+                    await self.check_ollama_models()
         
         return self._active_service.value
     

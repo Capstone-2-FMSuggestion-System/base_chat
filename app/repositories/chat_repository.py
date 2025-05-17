@@ -317,6 +317,9 @@ class ChatRepository:
             HealthData object đã được tạo
         """
         try:
+            # Ghi log các thông tin sức khỏe được lưu
+            logger.info(f"Lưu thông tin sức khỏe: condition={health_condition}, allergies={allergies}, goals={health_goals}")
+            
             # Kiểm tra xem đã có dữ liệu cho cuộc trò chuyện này chưa
             existing_data = self.db.query(HealthData).filter(
                 HealthData.conversation_id == conversation_id
@@ -326,14 +329,19 @@ class ChatRepository:
                 # Cập nhật thông tin vào bản ghi đã có
                 if health_condition and health_condition.strip():
                     existing_data.health_condition = health_condition
+                    logger.info(f"Cập nhật health_condition: {health_condition}")
                 if medical_history and medical_history.strip():
                     existing_data.medical_history = medical_history
+                    logger.info(f"Cập nhật medical_history: {medical_history}")
                 if allergies and allergies.strip():
                     existing_data.allergies = allergies
+                    logger.info(f"Cập nhật allergies: {allergies}")
                 if dietary_habits and dietary_habits.strip():
                     existing_data.dietary_habits = dietary_habits
+                    logger.info(f"Cập nhật dietary_habits: {dietary_habits}")
                 if health_goals and health_goals.strip():
                     existing_data.health_goals = health_goals
+                    logger.info(f"Cập nhật health_goals: {health_goals}")
                 
                 # Cập nhật thông tin bổ sung nếu có
                 if additional_info:

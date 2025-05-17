@@ -15,6 +15,56 @@ class OllamaClient:
         self.timeout = timeout
         logger.info(f"Khởi tạo OllamaClient với model: {self.target_model}, URL cơ sở: {self.base_url}")
         
+    async def check_model_availability(self, model_name: str = None) -> tuple[bool, str]:
+        """
+        Kiểm tra xem mô hình đã được cài đặt trên Ollama chưa
+        
+        Args:
+            model_name: Tên mô hình cần kiểm tra, sử dụng target_model nếu không được cung cấp
+            
+        Returns:
+            (bool, str): Tuple gồm trạng thái (True nếu tồn tại) và thông báo
+        """
+        model_name = model_name or self.target_model
+        logger.info(f"Đang kiểm tra mô hình {model_name} trong Ollama...")
+        
+        try:
+            # Kiểm tra danh sách mô hình đã cài đặt
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url=f"{self.base_url}/api/tags",
+                    timeout=10.0
+                )
+                
+                # Kiểm tra kết nối tới Ollama
+                if response.status_code != 200:
+                    error_msg = f"Không thể kết nối tới Ollama API: HTTP {response.status_code}"
+                    logger.error(error_msg)
+                    return False, error_msg
+                
+                # Phân tích danh sách mô hình
+                data = response.json()
+                models = [model["name"] for model in data.get("models", [])]
+                
+                # Kiểm tra xem mô hình có tồn tại không
+                if model_name in models:
+                    logger.info(f"Mô hình {model_name} đã được cài đặt trong Ollama")
+                    return True, f"Mô hình {model_name} đã sẵn sàng"
+                else:
+                    error_msg = f"Mô hình {model_name} chưa được cài đặt trong Ollama. Sử dụng lệnh: ollama pull {model_name}"
+                    logger.warning(error_msg)
+                    return False, error_msg
+                    
+        except httpx.TimeoutException:
+            error_msg = "Timeout khi kiểm tra mô hình Ollama"
+            logger.error(error_msg)
+            return False, error_msg
+            
+        except Exception as e:
+            error_msg = f"Lỗi khi kiểm tra mô hình Ollama: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
+        
     async def generate_response_no_stream(self, messages: List[Dict[str, str]], max_tokens: int = None) -> str:
         """
         Gửi yêu cầu đến API Ollama không sử dụng streaming để debug vấn đề

@@ -27,3 +27,4 @@ tiktoken>=0.5.0
 aiocache>=0.12.1
 cryptography
 ruff>=0.1.6
+langgraph>=0.4.2

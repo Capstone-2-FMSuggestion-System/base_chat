@@ -216,30 +216,74 @@ class GeminiPromptService:
             else:
                 polished_response = await self._query_gemini_with_http(prompt)
                 
-            # Xử lý để loại bỏ metadata "**Đánh giá:**" nếu có
-            if "**Đánh giá:**" in polished_response:
-                try:
-                    # Tìm phần bắt đầu của phản hồi thực sự
-                    if "**Phản hồi đã điều chỉnh:**" in polished_response:
-                        polished_response = polished_response.split("**Phản hồi đã điều chỉnh:**")[1].strip()
-                    else:
-                        # Tìm cách khác để tìm phản hồi thực sự (sau các phần đánh giá)
-                        paragraphs = polished_response.split("\n\n")
-                        for i, para in enumerate(paragraphs):
-                            if "**Đánh giá:**" in para or para.strip().startswith("1.") or "HỢP LỆ" in para or "KHÔNG HỢP LỆ" in para:
-                                continue
-                            else:
-                                # Lấy phần còn lại từ đoạn này trở đi
-                                polished_response = "\n\n".join(paragraphs[i:])
-                                break
+            # Xử lý để loại bỏ các metadata không cần thiết
+            debug_patterns = [
+                "**Đánh giá và Điều chỉnh Phản hồi:**",
+                "**Đánh giá:**",
+                "**Kiểm tra:**", 
+                "**Điều chỉnh:**",
+                "**Phản hồi đã được điều chỉnh:**",
+                "**Phân tích phản hồi:**", 
+                "**HỢP LỆ**", 
+                "**KHÔNG HỢP LỆ**",
+                "Dưới đây là phản hồi đã được điều chỉnh:"
+            ]
+            
+            # Trường hợp phản hồi có cấu trúc điển hình với đánh giá ở đầu và phản hồi thực sự ở sau
+            for pattern in debug_patterns:
+                if pattern in polished_response:
+                    parts = polished_response.split(pattern)
+                    if len(parts) >= 2:
+                        # Giữ lại phần sau pattern cuối cùng
+                        polished_response = parts[-1].strip()
+            
+            # Xử lý trường hợp có định dạng số thứ tự và đánh dấu
+            if polished_response.strip().startswith("1.") or polished_response.strip().startswith("*"):
+                lines = polished_response.split("\n")
+                filtered_lines = []
+                in_debug_section = False
+                
+                for line in lines:
+                    line_lower = line.lower().strip()
+                    # Xác định dòng bắt đầu phần debug
+                    if any(pattern.lower() in line_lower for pattern in debug_patterns):
+                        in_debug_section = True
+                        continue
+                        
+                    # Xác định kết thúc phần debug và bắt đầu nội dung thực
+                    if in_debug_section and (
+                        "phản hồi đã được điều chỉnh" in line_lower or 
+                        "chào bạn" in line_lower or
+                        line.strip() == ""
+                    ):
+                        in_debug_section = False
                     
-                    logger.info(f"Đã loại bỏ metadata từ phản hồi")
-                except Exception as format_err:
-                    logger.warning(f"Lỗi khi loại bỏ metadata: {str(format_err)}")
-                    # Giữ nguyên phản hồi nếu có lỗi xử lý
+                    # Chỉ thêm dòng nếu không nằm trong phần debug
+                    if not in_debug_section:
+                        filtered_lines.append(line)
+                
+                # Kết hợp các dòng đã lọc
+                polished_response = "\n".join(filtered_lines).strip()
+            
+            # Loại bỏ phần đánh dấu còn sót
+            polished_response = polished_response.replace("**Phản hồi:**", "").strip()
+            
+            # Xử lý trường hợp còn sót các phần cụ thể
+            if "đã được điều chỉnh" in polished_response:
+                parts = polished_response.split(":")
+                if len(parts) > 1:  # Có dấu ":" trong phản hồi
+                    polished_response = ":".join(parts[1:]).strip()
+            
+            # Loại bỏ các dấu xuống dòng thừa ở đầu
+            while polished_response.startswith("\n"):
+                polished_response = polished_response[1:]
+            
+            # Loại bỏ các dấu xuống dòng thừa ở cuối
+            while polished_response.endswith("\n\n"):
+                polished_response = polished_response[:-1]
             
             logger.info(f"Đã điều chỉnh phản hồi: {len(polished_response)} ký tự")
-            return polished_response
+            return polished_response.strip()
                 
         except Exception as e:
             logger.error(f"Lỗi khi điều chỉnh phản hồi: {str(e)}")
@@ -286,6 +330,52 @@ Lưu ý: Ngắn gọn, mạch lạc, và thân thiện."""
             logger.error(f"Lỗi khi tạo lời chào: {str(e)}")
             # Trả về lời chào mặc định nếu có lỗi
             return "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp gì cho bạn hôm nay?"
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def get_greeting_response(self, user_message: str) -> str:
+        """
+        Tạo phản hồi cho tin nhắn chào hỏi của người dùng
+        
+        Args:
+            user_message: Nội dung tin nhắn chào hỏi của người dùng
+            
+        Returns:
+            Phản hồi chào hỏi và giới thiệu
+        """
+        if not self.api_key:
+            logger.error("Không thể tạo phản hồi chào hỏi: Thiếu API key của Gemini")
+            return "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp bạn tìm hiểu về các món ăn phù hợp với tình trạng sức khỏe, chế độ dinh dưỡng cân đối, hoặc tư vấn về thói quen ăn uống lành mạnh. Bạn cần hỗ trợ gì hôm nay?"
+        
+        prompt = f"""Người dùng gửi tin nhắn chào hỏi: "{user_message}"
+
+Hãy viết một lời chào thân thiện và giới thiệu ngắn gọn về chức năng của trợ lý tư vấn sức khỏe và dinh dưỡng. 
+Phản hồi cần:
+1. Chào hỏi tương ứng với lời chào của người dùng
+2. Giới thiệu khả năng tư vấn về món ăn phù hợp với tình trạng sức khỏe, dinh dưỡng và thói quen ăn uống
+3. Khuyến khích người dùng chia sẻ về tình trạng sức khỏe hoặc mục tiêu dinh dưỡng
+4. Ngắn gọn, tối đa 3-4 câu
+5. Thân thiện nhưng chuyên nghiệp
+
+Viết bằng tiếng Việt, trực tiếp phản hồi không có giải thích thêm."""
+        
+        try:
+            # Sử dụng thư viện Google hoặc HTTP API
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    greeting_response = await self._query_gemini_with_client(prompt)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client: {str(e)}. Chuyển sang HTTP API.")
+                    greeting_response = await self._query_gemini_with_http(prompt)
+            else:
+                greeting_response = await self._query_gemini_with_http(prompt)
+                
+            logger.info(f"Đã tạo phản hồi chào hỏi: {greeting_response[:50]}...")
+            return greeting_response
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo phản hồi chào hỏi: {str(e)}")
+            # Trả về lời chào mặc định nếu có lỗi
+            return "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp bạn tìm hiểu về các món ăn phù hợp với tình trạng sức khỏe, chế độ dinh dưỡng cân đối, hoặc tư vấn về thói quen ăn uống lành mạnh. Bạn cần hỗ trợ gì hôm nay?"
     
     async def _query_gemini_with_http(self, prompt: str) -> str:
         """
@@ -400,52 +490,75 @@ Lưu ý: Ngắn gọn, mạch lạc, và thân thiện."""
         Returns:
             Prompt cho Gemini để phân tích
         """
-        # Chuyển đổi lịch sử chat thành văn bản
+        # Chuyển đổi lịch sử chat thành văn bản - sử dụng toàn bộ lịch sử
+        # Nhưng tối ưu cho token - giảm độ dài nội dung nếu quá dài
         history_text = ""
+        total_chars = 0
+        max_history_chars = 14000  # Giới hạn ký tự cho lịch sử chat để tránh vượt quá giới hạn token
+        
         if chat_history:
-            for msg in chat_history[-5:]:  # Chỉ sử dụng 5 tin nhắn gần nhất
+            # Sử dụng toàn bộ lịch sử chat nhưng có kiểm soát độ dài
+            for msg in chat_history:
                 role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
-                history_text += f"{role}: {msg['content']}\n"
+                content = msg['content']
+                
+                # Cắt bớt nội dung nếu quá dài
+                if len(content) > 500:
+                    content = content[:500] + "... [nội dung đã cắt ngắn]"
+                
+                msg_text = f"{role}: {content}\n"
+                
+                # Kiểm tra xem có vượt quá giới hạn không
+                if total_chars + len(msg_text) > max_history_chars:
+                    history_text += "[...nhiều tin nhắn trước đó đã được bỏ qua...]\n"
+                    break
+                
+                history_text += msg_text
+                total_chars += len(msg_text)
         
         # Tạo prompt
-        prompt = f"""Phân tích nội dung tin nhắn của người dùng để xác định phạm vi và nhu cầu thông tin:
+        prompt = f"""Phân tích TOÀN BỘ cuộc trò chuyện dưới đây để xác định thông tin sức khỏe và nhu cầu dinh dưỡng của người dùng:
 
-LỊCH SỬ CHAT GẦN ĐÂY:
+LỊCH SỬ CHAT ĐẦY ĐỦ:
 {history_text}
 
 TIN NHẮN NGƯỜI DÙNG MỚI NHẤT:
 {user_message}
 
-NHIỆM VỤ:
+NHIỆM VỤ CỤ THỂ:
 
-1. Phân loại nội dung tin nhắn: xác định xem tin nhắn có thuộc các phạm vi sau không:
-   - Tình trạng sức khỏe
-   - Bệnh lý
-   - Dị ứng
-   - Mục tiêu sức khỏe
-   - Thói quen ăn uống
-   - Món ăn phù hợp hoặc cần tránh
+1. Phân tích kỹ lưỡng toàn bộ cuộc trò chuyện để xác định mọi thông tin liên quan đến:
+   - Tình trạng sức khỏe hiện tại (tiểu đường, cao huyết áp, dị ứng, v.v.)
+   - Bệnh lý đã biết (đặc biệt chú ý phát hiện các bệnh mãn tính)
+   - Dị ứng thực phẩm (nêu cụ thể loại thực phẩm gây dị ứng)
+   - Thói quen ăn uống (kiểu ăn, thời gian, sở thích)
+   - Mục tiêu sức khỏe (giảm cân, kiểm soát đường huyết, v.v.)
 
-2. Xác định các thông tin đã có từ người dùng: như dị ứng, thói quen ăn uống, mục tiêu sức khỏe, món ăn yêu thích/không thích, độ tuổi, giới tính.
+2. Ghi lại chi tiết các yếu tố từ TIN NHẮN MỚI NHẤT và TOÀN BỘ LỊCH SỬ trước đó:
+   - Chú ý đặc biệt đến các lần nhắc đến "tiểu đường", "dị ứng", "bệnh", "không dùng được", "không ăn được"
+   - Liên kết các yêu cầu mới với thông tin sức khỏe đã chia sẻ trước đó
+   - Xác định mong muốn về món ăn hoặc chế độ dinh dưỡng
 
-3. Nếu còn thiếu thông tin, hãy đặt một câu hỏi đơn giản, rõ ràng và dễ hiểu để tiếp tục thu thập (ví dụ: "Bạn có bị dị ứng món gì không?", "Bạn muốn tăng cân hay giảm cân?", ...). 
-   - Không sử dụng các thuật ngữ chuyên môn (ví dụ: "keto", "low-carb")
-   - Tránh liệt kê nhiều lựa chọn trong cùng một câu hỏi
-   - Chỉ hỏi một ý trong mỗi câu
+3. Xác định phạm vi hỗ trợ và nhu cầu thông tin:
+   - Nội dung có liên quan đến tư vấn dinh dưỡng/thực phẩm không?
+   - Cần thu thập thêm thông tin gì để đưa ra gợi ý phù hợp?
+   - Người dùng có từ chối cung cấp thông tin cụ thể nào không?
 
-Trả về kết quả dưới dạng JSON với cấu trúc sau:
+Trả về kết quả dưới dạng JSON với cấu trúc chính xác sau:
 {{
   "is_valid_scope": true/false,
   "need_more_info": true/false,
   "follow_up_question": "Câu hỏi đơn giản, ngắn gọn nếu cần thêm thông tin",
   "collected_info": {{
-    "health_condition": "Tình trạng sức khỏe/triệu chứng đã biết",
-    "medical_history": "Bệnh lý đã biết",
-    "allergies": "Dị ứng đã biết",
-    "dietary_habits": "Thói quen ăn uống đã biết",
-    "health_goals": "Mục tiêu sức khỏe đã biết"
+    "health_condition": "Tình trạng sức khỏe hiện tại đã phát hiện (tiểu đường/cao huyết áp/v.v.)",
+    "medical_history": "Bệnh lý đã biết (chi tiết từ lịch sử)",
+    "allergies": "Dị ứng đã phát hiện (từ TOÀN BỘ cuộc trò chuyện)",
+    "dietary_habits": "Thói quen ăn uống đã đề cập",
+    "health_goals": "Mục tiêu sức khỏe đã đề cập (giảm cân/kiểm soát đường huyết/v.v.)"
   }}
-}}"""
+}}
+
+QUAN TRỌNG: Thu thập thông tin từ TOÀN BỘ cuộc trò chuyện, không chỉ tin nhắn mới nhất. Trích xuất mọi chi tiết về sức khỏe đã được đề cập."""
         
         return prompt
     
@@ -459,34 +572,53 @@ Trả về kết quả dưới dạng JSON với cấu trúc sau:
         Returns:
             Prompt cho Gemini để tạo prompt Medichat
         """
-        # Chuyển đổi các tin nhắn thành văn bản
+        # Chuyển đổi các tin nhắn thành văn bản - sử dụng toàn bộ lịch sử
+        # Nhưng tối ưu cho token - giảm độ dài nội dung nếu quá dài
         conversation_text = "\n\n"
+        total_chars = 0
+        max_conversation_chars = 14000  # Giới hạn ký tự cho lịch sử chat
         
-        for msg in messages[-10:]:  # Chỉ lấy 10 tin nhắn gần nhất
+        # Sử dụng toàn bộ lịch sử chat
+        for msg in messages:
             if msg["role"] != "system":  # Bỏ qua system message
                 role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
-                conversation_text += f"{role}: {msg['content']}\n\n"
+                content = msg['content']
+                
+                # Cắt bớt nội dung nếu quá dài
+                if len(content) > 500:
+                    content = content[:500] + "... [nội dung đã cắt ngắn]"
+                
+                msg_text = f"{role}: {content}\n\n"
+                
+                # Kiểm tra xem có vượt quá giới hạn không
+                if total_chars + len(msg_text) > max_conversation_chars:
+                    conversation_text += "[...nhiều tin nhắn trước đó đã được bỏ qua để đảm bảo không vượt quá giới hạn token...]\n\n"
+                    break
+                
+                conversation_text += msg_text
+                total_chars += len(msg_text)
         
         # Tạo prompt cho Gemini
-        prompt = f"""Tóm tắt thông tin từ cuộc trò chuyện sau để tạo prompt cho mô hình y tế Medichat-LLaMA3-8B:
+        prompt = f"""Tóm tắt thông tin từ TOÀN BỘ cuộc trò chuyện sau để tạo prompt cho mô hình y tế Medichat-LLaMA3-8B:
 
 {conversation_text}
 
 Yêu cầu:
 1. Tạo prompt ngắn gọn DƯỚI 900 KÝ TỰ tổng hợp các thông tin quan trọng về:
+   - Yêu cầu chính/vấn đề mà người dùng đang hỏi (ƯU TIÊN giải quyết cái này)
    - Triệu chứng/tình trạng sức khỏe hiện tại
    - Bệnh lý nền/dị ứng đã biết
-   - Món ăn người dùng quan tâm hoặc đang hỏi
+   - Thông tin về món ăn hoặc chế độ dinh dưỡng mà người dùng đang quan tâm
    - Mục tiêu dinh dưỡng/sức khỏe của người dùng
    - Thói quen ăn uống đã đề cập
 
 2. Cấu trúc prompt theo dạng một yêu cầu rõ ràng: "Tôi cần gợi ý món ăn phù hợp cho [tình trạng sức khỏe] với các đặc điểm [liệt kê]. Tôi muốn món ăn [đặc điểm mong muốn]."
 
-3. Chỉ bao gồm thông tin đã được đề cập trong cuộc trò chuyện, không thêm thông tin không có thật.
+3. Cấu trúc prompt theo dạng một yêu cầu rõ ràng: "Tôi cần gợi ý món ăn phù hợp cho [tình trạng sức khỏe] với các đặc điểm [liệt kê]. Tôi muốn món ăn [đặc điểm mong muốn]."
 
-4. Viết bằng ngôi thứ nhất, như thể người dùng đang trực tiếp hỏi Medichat.
+4. Chỉ bao gồm thông tin đã được đề cập trong cuộc trò chuyện, không thêm thông tin không có thật.
 
-5. Đảm bảo prompt rõ ràng, ngắn gọn nhưng đầy đủ thông tin quan trọng.
+5. Viết bằng ngôi thứ nhất, như thể người dùng đang trực tiếp hỏi Medichat.
 
 PROMPT KẾT QUẢ (DƯỚI 900 KÝ TỰ):"""
         
@@ -503,7 +635,7 @@ PROMPT KẾT QUẢ (DƯỚI 900 KÝ TỰ):"""
         Returns:
             Prompt cho Gemini để kiểm tra và điều chỉnh
         """
-        prompt = f"""Đánh giá và điều chỉnh phản hồi từ mô hình y tế Medichat-LLaMA3-8B dưới đây:
+        prompt = f"""Nhiệm vụ của bạn là đánh giá và điều chỉnh phản hồi từ mô hình y tế để đưa ra phản hồi CUỐI CÙNG hoàn chỉnh, sạch, không chứa metadata.
 
 PROMPT BAN ĐẦU:
 {original_prompt}
@@ -511,26 +643,21 @@ PROMPT BAN ĐẦU:
 PHẢN HỒI TỪ MEDICHAT:
 {medichat_response}
 
-NHIỆM VỤ:
-1. Kiểm tra xem phản hồi có hợp lệ, mạch lạc và phù hợp với prompt không.
-2. Đánh giá xem phản hồi có đang đưa ra lời khuyên về món ăn/dinh dưỡng phù hợp không.
-3. Nếu phản hồi là HỢP LỆ:
-   - Loại bỏ các ký tự thừa, định dạng lại nếu cần
-   - Làm gọn câu, chuẩn hóa nội dung
-   - Giữ nguyên hướng dẫn dinh dưỡng và món ăn đề xuất
-   - Đảm bảo nội dung mạch lạc, dễ hiểu
-4. Nếu phản hồi là KHÔNG HỢP LỆ (rời rạc, sai, hoặc quá chung chung):
-   - Viết lại hoàn toàn một phản hồi mới
-   - Đưa ra 2-3 gợi ý món ăn cụ thể phù hợp với tình trạng được mô tả trong prompt
-   - Giải thích ngắn gọn lợi ích của mỗi món với tình trạng sức khỏe đó
-   - Sử dụng kiến thức y tế và dinh dưỡng một cách chính xác
+NHIỆM VỤ CỤ THỂ:
+1. Đánh giá xem phản hồi hiện tại có cung cấp hướng dẫn dinh dưỡng hữu ích, phù hợp không
+2. Nếu phản hồi tốt, chỉ cần làm sạch định dạng, loại bỏ mọi metadata
+3. Nếu phản hồi chưa đầy đủ hoặc không phù hợp, viết phản hồi mới với nội dung hướng dẫn dinh dưỡng phù hợp
+4. TẤT CẢ phản hồi của bạn sẽ được trả trực tiếp cho người dùng mà không qua bất kỳ xử lý nào nữa
 
-5. Đảm bảo phản hồi:
-   - Bằng tiếng Việt
-   - Không quá dài (tối đa 250 từ)
-   - Không chứa từ ngữ chuyên môn khó hiểu
-   - Không nhắc đến quy trình xử lý này
+HƯỚNG DẪN QUAN TRỌNG:
+- KHÔNG BAO GIỜ bao gồm các từ như "Đánh giá", "Kiểm tra", "Điều chỉnh phản hồi" trong đầu ra
+- KHÔNG BAO GIỜ chia phản hồi thành các phần có tiêu đề hoặc đánh số bước
+- KHÔNG BAO GIỜ nhắc đến quá trình đánh giá hoặc sửa đổi
+- LUÔN viết như thể bạn đang trực tiếp trả lời người dùng
+- LUÔN sử dụng tiếng Việt thân thiện, mạch lạc
+- LUÔN đảm bảo phản hồi ngắn gọn, súc tích và dễ hiểu
+- LUÔN duy trì thông tin y tế chính xác và hữu ích
 
-PHẢN HỒI ĐÃ ĐIỀU CHỈNH:"""
+TRẢ VỀ NGAY LẬP TỨC CHỈ PHẦN NỘI DUNG PHẢN HỒI CUỐI CÙNG DÀNH CHO NGƯỜI DÙNG, KHÔNG CÓ BẤT KỲ METADATA HAY GIẢI THÍCH NÀO:"""
         
         return prompt 

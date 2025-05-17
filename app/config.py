@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     OLLAMA_URL: str
     LLM_SERVICE_TYPE: str
     LLM_MAX_TOKENS: int = 300
-    MEDICHAT_MODEL: str = "medichat-llama3:8b_q4_K_M"  # Model Medichat mặc định
+    MEDICHAT_MODEL: str = "monotykamary/medichat-llama3:8b_q4_K_M"
     
     # Chat History Management
     MAX_HISTORY_MESSAGES: int = 30

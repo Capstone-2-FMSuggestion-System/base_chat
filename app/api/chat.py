@@ -26,6 +26,11 @@ async def chat(
     """Gửi tin nhắn và nhận phản hồi từ AI"""
     chat_service = ChatService(db)
     
+    # Lưu tin nhắn người dùng trước khi xử lý
+    if request.conversation_id:
+        chat_service.repository.add_message(request.conversation_id, "user", request.message)
+        logger.info(f"Đã lưu tin nhắn người dùng trước khi xử lý: {request.message[:50]}...")
+    
     result = await chat_service.process_message(
         user_id=user_id,
         message=request.message,
@@ -44,6 +49,9 @@ async def stream_chat(
 ):
     """Gửi tin nhắn và nhận phản hồi từ AI dạng streaming"""
     chat_service = ChatService(db)
+    
+    # Khởi tạo logger ở phạm vi rộng hơn để có thể truy cập từ khối try và except
+    logger = logging.getLogger(__name__)
     
     # Lưu tin nhắn người dùng và chuẩn bị cuộc trò chuyện
     # Nếu không có conversation_id, lấy cuộc trò chuyện mới nhất hoặc tạo mới
@@ -71,11 +79,12 @@ async def stream_chat(
             raise HTTPException(status_code=404, detail="Cuộc trò chuyện không tồn tại")
         conversation_id = request.conversation_id
     
+    # Lưu tin nhắn người dùng vào database ngay từ đầu
+    chat_service.repository.add_message(conversation_id, "user", request.message)
+    logger.info(f"Đã lưu tin nhắn người dùng trước khi xử lý: {request.message[:50]}...")
+    
     # Lấy lịch sử trò chuyện hiện tại để phân tích
     chat_history = chat_service.repository.get_messages(conversation_id, limit=10)
-    
-    # Khởi tạo logger ở phạm vi rộng hơn để có thể truy cập từ khối try và except
-    logger = logging.getLogger(__name__)
     
     # Hàm generator để stream phản hồi
     async def response_generator():
