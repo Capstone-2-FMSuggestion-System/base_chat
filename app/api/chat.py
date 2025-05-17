@@ -3,11 +3,14 @@ from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 from fastapi.responses import StreamingResponse
 import logging
+import json
 
 from app.db.database import get_db
 from app.services.chat_service import ChatService
+from app.services.chat_flow import run_chat_flow
 # from app.middleware.auth import get_current_user_id
 from app.schemas.chat import ChatRequest, ChatResponse, NewChatResponse, ChatContentResponse
+from app.config import settings
 
 
 router = APIRouter()
@@ -48,6 +51,14 @@ async def stream_chat(
         conversation = chat_service.repository.get_latest_conversation(user_id)
         if not conversation:
             conversation = chat_service.repository.create_conversation(user_id)
+            # Thêm lời chào khi bắt đầu cuộc trò chuyện mới
+            welcome_message = await chat_service.gemini_service.generate_welcome_message()
+            chat_service.repository.add_message(conversation.conversation_id, "assistant", welcome_message)
+            # Stream lời chào ngay lập tức
+            async def welcome_generator():
+                yield f"data: {welcome_message}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(welcome_generator(), media_type="text/event-stream")
         conversation_id = conversation.conversation_id
     else:
         # Kiểm tra người dùng có quyền truy cập cuộc trò chuyện không
@@ -60,19 +71,16 @@ async def stream_chat(
             raise HTTPException(status_code=404, detail="Cuộc trò chuyện không tồn tại")
         conversation_id = request.conversation_id
     
-    # Lưu tin nhắn của người dùng
-    chat_service.repository.add_message(conversation_id, "user", request.message)
-    
-    # Lấy lịch sử trò chuyện đã được tóm tắt (nếu cần)
-    messages = chat_service.repository.get_messages_with_summary(conversation_id)
+    # Lấy lịch sử trò chuyện hiện tại để phân tích
+    chat_history = chat_service.repository.get_messages(conversation_id, limit=10)
     
     # Khởi tạo logger ở phạm vi rộng hơn để có thể truy cập từ khối try và except
     logger = logging.getLogger(__name__)
     
     # Hàm generator để stream phản hồi
     async def response_generator():
-        full_response = ""
         special_tokens = ["<|im_ending|>", "<|im_start|>"]
+        full_response = ""
         error_indicators = ["Xin lỗi, tôi đang có vấn đề", "Xin lỗi, hiện tôi không thể kết nối"]
         
         try:
@@ -84,13 +92,64 @@ async def stream_chat(
                 active_service = chat_service.llm_service._active_service.value
                 yield f"data: {{\"info\": \"Đang sử dụng dịch vụ: {active_service}\"}}\n\n"
             
-            # Log tin nhắn gửi đi để debug
-            logger.info(f"Đang gửi tin nhắn đến LLM: {request.message}")
-            logger.info(f"Số lượng tin nhắn trong cuộc trò chuyện: {len(messages)}")
+            try:
+                # Chạy luồng xử lý với LangGraph
+                result = await run_chat_flow(
+                    user_message=request.message,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    messages=chat_history,
+                    repository=chat_service.repository,
+                    llm_service=chat_service.llm_service
+                )
+            except Exception as e:
+                logger.error(f"Lỗi khi chạy LangGraph flow: {str(e)}")
+                # Fallback - lưu tin nhắn người dùng
+                chat_service.repository.add_message(conversation_id, "user", request.message)
+                error_message = "Xin lỗi, có lỗi xử lý trong hệ thống. Tôi sẽ ghi nhận câu hỏi của bạn và trả lời sau."
+                yield f"data: {error_message}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            
+            # Xử lý kết quả từ LangGraph
+            if "final_response" in result and result["final_response"]:
+                # Phản hồi cuối cùng đã có sẵn trong result
+                response = result["final_response"]
+                yield f"data: {response}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            
+            # Các trường hợp xử lý khác nếu final_response không có
+            if "need_more_info" in result and result["need_more_info"] and "assistant_message" in result:
+                # Nếu cần thu thập thêm thông tin
+                follow_up = result["assistant_message"]["content"]
+                yield f"data: {follow_up}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            
+            # Nếu không, stream với Medichat như thông thường
+            # Trường hợp này xảy ra nếu LangGraph chuyển việc tạo phản hồi cho Medichat
+            # Lấy prompt từ LangGraph hoặc tạo mới
+            medichat_prompt = result.get("medichat_prompt")
+            if not medichat_prompt:
+                medichat_prompt = await chat_service.gemini_service.create_medichat_prompt(messages=chat_history)
+            
+            # Tạo tin nhắn cho Medichat
+            medichat_messages = [
+                {
+                    "role": "system", 
+                    "content": settings.MEDICHAT_SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": medichat_prompt
+                }
+            ]
             
             # Stream từng phần phản hồi
-            async for chunk in chat_service.llm_service.generate_response(messages):
-                # Log từng chunk để debug
+            logger.info(f"Đang gửi prompt đến Medichat: {medichat_prompt}")
+            async for chunk in chat_service.llm_service.generate_response(medichat_messages):
+                # Log từng chunk
                 logger.debug(f"Nhận được chunk: {chunk}")
                 
                 # Loại bỏ các token đặc biệt từ chunk
@@ -113,10 +172,18 @@ async def stream_chat(
                             full_response = full_response[:error_end_pos].strip()
                             break
             
-            # Sau khi hoàn thành, lưu phản hồi vào database
-            if full_response.strip() and not is_error_response:  # Kiểm tra xem có phản hồi không và không phải lỗi
-                chat_service.repository.add_message(conversation_id, "assistant", full_response)
-                logger.info(f"Đã lưu phản hồi thành công: {full_response[:50]}...")
+            # Sau khi hoàn thành, điều chỉnh phản hồi bằng Gemini và lưu vào database
+            if full_response.strip() and not is_error_response:
+                # Điều chỉnh phản hồi
+                polished_response = await chat_service.gemini_service.polish_response(full_response, medichat_prompt)
+                
+                # Lưu phản hồi đã điều chỉnh vào database
+                chat_service.repository.add_message(conversation_id, "assistant", polished_response)
+                logger.info(f"Đã lưu phản hồi đã điều chỉnh: {polished_response[:50]}...")
+                
+                # Gửi phản hồi đã điều chỉnh nếu khác với full_response
+                if polished_response != full_response:
+                    yield f"data: {{\"replace\": \"{json.dumps(polished_response)}\"}}\n\n"
             else:
                 if not full_response.strip():
                     error_message = "Xin lỗi, không nhận được phản hồi từ hệ thống AI. Vui lòng thử lại sau."
@@ -127,7 +194,7 @@ async def stream_chat(
                 yield f"data: {error_message}\n\n"
                 chat_service.repository.add_message(conversation_id, "assistant", error_message)
                 logger.warning(f"Đã lưu thông báo lỗi: {error_message}")
-                full_response = error_message
+                
         except Exception as e:
             # Xử lý lỗi, trả về thông báo lỗi
             logger.error(f"Lỗi khi xử lý phản hồi: {str(e)}")
@@ -136,7 +203,6 @@ async def stream_chat(
             
             # Lưu thông báo lỗi vào database
             chat_service.repository.add_message(conversation_id, "assistant", error_message)
-            full_response = error_message
         
         # Gửi event hoàn thành
         yield "data: [DONE]\n\n"

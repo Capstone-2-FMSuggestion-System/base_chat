@@ -220,26 +220,25 @@ class SummaryService:
             conversation_text += f"{role}: {msg['content']}\n\n"
         
         # Tạo prompt cho Gemini
-        prompt = f"""Dưới đây là cuộc trò chuyện giữa một người dùng và trợ lý y tế.
-Hãy tóm tắt những thông tin quan trọng từ cuộc trò chuyện này, bảo toàn:
-1. Các triệu chứng, vấn đề sức khỏe hoặc bệnh lý được đề cập
-2. Các câu hỏi chính của người dùng
-3. Thông tin y tế quan trọng đã được trao đổi
-4. Lời khuyên chính đã được đưa ra
+        prompt = f"""Dưới đây là cuộc trò chuyện giữa người dùng và trợ lý tư vấn dinh dưỡng & sức khỏe.
 
-Chú ý:
-- Tóm tắt PHẢI DƯỚI 700 KÝ TỰ
-- Giữ ngắn gọn và súc tích
-- Chỉ liệt kê những điểm quan trọng nhất
-- Giữ nguyên ngôn ngữ ban đầu (tiếng Việt)
-- Duy trì tính chính xác của thông tin y tế
-- Đảm bảo tóm tắt dễ hiểu, có cấu trúc rõ ràng
-- Chỉ bao gồm thông tin đã được đề cập trong đoạn hội thoại
+Hãy tóm tắt các thông tin CỐT LÕI sau, phục vụ cho mô hình xử lý kế tiếp:
+1. Các triệu chứng, bệnh lý, tình trạng sức khỏe cụ thể mà người dùng đang gặp
+2. Các câu hỏi chính liên quan đến món ăn, chế độ ăn, dinh dưỡng phù hợp
+3. Thông tin y tế quan trọng: dị ứng, bệnh nền, chỉ số sinh học, thói quen ăn uống, thuốc đang dùng (nếu có)
+4. Các lời khuyên hoặc món ăn/dinh dưỡng đã được đề xuất
 
-Đoạn hội thoại:
+Yêu cầu:
+- Tóm tắt dưới 900 ký tự
+- Giữ nguyên ngôn ngữ tiếng Việt
+- Cấu trúc rõ ràng, dễ hiểu, có thứ tự ưu tiên theo mục trên
+- Chỉ liệt kê thông tin có thật trong cuộc trò chuyện, không suy diễn
+- Nếu vượt giới hạn ký tự, hãy ưu tiên giữ triệu chứng & thông tin y tế, có thể lược bỏ lời chào hoặc phần xã giao
+
+Cuộc trò chuyện:
 {conversation_text}
 
-TÓM TẮT (DƯỚI 700 KÝ TỰ):
+TÓM TẮT (DƯỚI 900 KÝ TỰ):
 """
         
-        return prompt 
+        return prompt

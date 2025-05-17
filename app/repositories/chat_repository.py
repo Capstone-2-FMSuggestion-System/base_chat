@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from sqlalchemy import desc, func
 
-from app.db.models import Conversation, Message, User
+from app.db.models import Conversation, Message, User, HealthData
 from app.db.database import redis_client
 from app.config import settings
 
@@ -290,6 +290,170 @@ class ChatRepository:
         """Kiểm tra xem người dùng có phải là chủ của cuộc trò chuyện không"""
         conversation = self.get_conversation_by_id(conversation_id)
         return conversation is not None and conversation.user_id == user_id
+    
+    def save_health_data(self, 
+                        conversation_id: int, 
+                        user_id: int, 
+                        health_condition: str = None, 
+                        medical_history: str = None,
+                        allergies: str = None,
+                        dietary_habits: str = None,
+                        health_goals: str = None,
+                        additional_info: Dict = None) -> HealthData:
+        """
+        Lưu thông tin sức khỏe người dùng vào cơ sở dữ liệu
+        
+        Args:
+            conversation_id: ID của cuộc trò chuyện
+            user_id: ID của người dùng
+            health_condition: Tình trạng sức khỏe hiện tại
+            medical_history: Bệnh lý đã biết
+            allergies: Dị ứng
+            dietary_habits: Thói quen ăn uống
+            health_goals: Mục tiêu sức khỏe
+            additional_info: Thông tin bổ sung dạng dict
+            
+        Returns:
+            HealthData object đã được tạo
+        """
+        try:
+            # Kiểm tra xem đã có dữ liệu cho cuộc trò chuyện này chưa
+            existing_data = self.db.query(HealthData).filter(
+                HealthData.conversation_id == conversation_id
+            ).first()
+            
+            if existing_data:
+                # Cập nhật thông tin vào bản ghi đã có
+                if health_condition and health_condition.strip():
+                    existing_data.health_condition = health_condition
+                if medical_history and medical_history.strip():
+                    existing_data.medical_history = medical_history
+                if allergies and allergies.strip():
+                    existing_data.allergies = allergies
+                if dietary_habits and dietary_habits.strip():
+                    existing_data.dietary_habits = dietary_habits
+                if health_goals and health_goals.strip():
+                    existing_data.health_goals = health_goals
+                
+                # Cập nhật thông tin bổ sung nếu có
+                if additional_info:
+                    if existing_data.additional_info:
+                        # Nếu đã có dữ liệu, merge thêm dữ liệu mới
+                        current_data = existing_data.additional_info
+                        current_data.update(additional_info)
+                        existing_data.additional_info = current_data
+                    else:
+                        existing_data.additional_info = additional_info
+                
+                # Cập nhật thời gian
+                existing_data.updated_at = datetime.now()
+                
+                self.db.commit()
+                logger.info(f"Đã cập nhật thông tin sức khỏe cho conversation_id={conversation_id}")
+                
+                return existing_data
+            else:
+                # Tạo bản ghi mới
+                health_data = HealthData(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    health_condition=health_condition,
+                    medical_history=medical_history,
+                    allergies=allergies,
+                    dietary_habits=dietary_habits,
+                    health_goals=health_goals,
+                    additional_info=additional_info or {}
+                )
+                
+                self.db.add(health_data)
+                self.db.commit()
+                self.db.refresh(health_data)
+                
+                logger.info(f"Đã thêm mới thông tin sức khỏe cho conversation_id={conversation_id}")
+                
+                # Lưu thông tin vào Redis cache
+                cache_key = f"session:{conversation_id}:health_data"
+                cache_data = {
+                    "user_id": user_id,
+                    "health_condition": health_condition,
+                    "medical_history": medical_history,
+                    "allergies": allergies,
+                    "dietary_habits": dietary_habits,
+                    "health_goals": health_goals,
+                    "additional_info": additional_info or {},
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                try:
+                    redis_client.set(
+                        cache_key,
+                        json.dumps(cache_data),
+                        ex=86400  # Hết hạn sau 24h
+                    )
+                except Exception as e:
+                    logger.error(f"Lỗi khi lưu thông tin sức khỏe vào cache: {str(e)}")
+                
+                return health_data
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi lưu thông tin sức khỏe: {str(e)}")
+            self.db.rollback()
+            raise
+    
+    def get_health_data(self, conversation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Lấy thông tin sức khỏe của một cuộc trò chuyện
+        
+        Args:
+            conversation_id: ID của cuộc trò chuyện
+            
+        Returns:
+            Dict chứa thông tin sức khỏe hoặc None nếu không tìm thấy
+        """
+        # Kiểm tra cache trước
+        cache_key = f"session:{conversation_id}:health_data"
+        cached_data = redis_client.get(cache_key)
+        
+        if cached_data:
+            try:
+                return json.loads(cached_data)
+            except json.JSONDecodeError:
+                logger.error(f"Lỗi giải mã JSON từ cache: {cached_data[:100]}...")
+            except Exception as e:
+                logger.error(f"Lỗi xử lý thông tin sức khỏe từ cache: {str(e)}")
+        
+        # Nếu không có trong cache, lấy từ DB
+        health_data = self.db.query(HealthData).filter(
+            HealthData.conversation_id == conversation_id
+        ).order_by(HealthData.updated_at.desc()).first()
+        
+        if not health_data:
+            return None
+            
+        # Format dữ liệu trả về
+        result = {
+            "user_id": health_data.user_id,
+            "health_condition": health_data.health_condition,
+            "medical_history": health_data.medical_history,
+            "allergies": health_data.allergies,
+            "dietary_habits": health_data.dietary_habits,
+            "health_goals": health_data.health_goals,
+            "additional_info": health_data.additional_info or {},
+            "created_at": health_data.created_at.isoformat() if health_data.created_at else None,
+            "updated_at": health_data.updated_at.isoformat() if health_data.updated_at else None
+        }
+        
+        # Cập nhật cache
+        try:
+            redis_client.set(
+                cache_key,
+                json.dumps(result),
+                ex=3600  # TTL 1 giờ
+            )
+        except Exception as e:
+            logger.error(f"Lỗi lưu thông tin sức khỏe vào cache: {str(e)}")
+        
+        return result
     
     def _cache_conversation_metadata(self, conversation: Conversation):
         """Lưu metadata của cuộc trò chuyện vào Redis"""

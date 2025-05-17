@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     OLLAMA_URL: str
     LLM_SERVICE_TYPE: str
     LLM_MAX_TOKENS: int = 300
+    MEDICHAT_MODEL: str = "medichat-llama3:8b_q4_K_M"  # Model Medichat mặc định
     
     # Chat History Management
     MAX_HISTORY_MESSAGES: int = 30
@@ -37,6 +38,21 @@ class Settings(BaseSettings):
     # Gemini API
     GEMINI_API_KEY: str = ""
     GEMINI_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+    GEMINI_MAX_PROMPT_LENGTH: int = 900  # Giới hạn độ dài prompt cho Medichat
+    
+    # Prompt Templates
+    MEDICHAT_SYSTEM_PROMPT: str = """Bạn là chuyên gia dinh dưỡng, chỉ cung cấp gợi ý món ăn. Khi người dùng chia sẻ tình trạng sức khỏe, hãy gợi ý 2-3 món ăn phù hợp bằng tiếng Việt, mỗi món kèm 1 câu giải thích ngắn gọn. KHÔNG đề cập đến thuốc."""
+    
+    # Chat Flow Settings
+    VALID_SCOPES: List[str] = [
+        "sức khỏe",
+        "dinh dưỡng",
+        "món ăn",
+        "bệnh lý",
+        "chế độ ăn uống",
+        "dị ứng",
+        "thực phẩm"
+    ]
     
     # Security
     SECRET_KEY: str

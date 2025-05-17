@@ -8,10 +8,10 @@ logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = None, target_model: str = "monotykamary/medichat-llama3:8b_q4_K_M", timeout: float = 180.0):
+    def __init__(self, base_url: str = None, target_model: str = None, timeout: float = 180.0):
         self.base_url = base_url or settings.OLLAMA_URL
         self.chat_endpoint = f"{self.base_url}/api/chat"  # Ollama native endpoint
-        self.target_model = target_model
+        self.target_model = target_model or settings.MEDICHAT_MODEL
         self.timeout = timeout
         logger.info(f"Khởi tạo OllamaClient với model: {self.target_model}, URL cơ sở: {self.base_url}")
         
@@ -35,7 +35,7 @@ class OllamaClient:
             if not any(msg.get("role") == "system" for msg in messages):
                 system_message = {
                     "role": "system", 
-                    "content": """Bạn là chuyên gia dinh dưỡng, chỉ cung cấp gợi ý món ăn. Khi người dùng chia sẻ tình trạng sức khỏe, hãy gợi ý 2-3 món ăn phù hợp bằng tiếng Việt, mỗi món kèm 1 câu giải thích ngắn gọn. KHÔNG đề cập đến thuốc."""
+                    "content": settings.MEDICHAT_SYSTEM_PROMPT
                 }
                 messages = [system_message] + messages
             

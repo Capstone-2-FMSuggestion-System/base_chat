@@ -84,9 +84,47 @@ def init_database():
             role VARCHAR(20),
             content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_summarized BOOLEAN DEFAULT FALSE,
+            summary TEXT,
             FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
         )
         """)
+
+        # Tạo bảng health_data để lưu thông tin sức khỏe
+        print("Đang kiểm tra và tạo bảng health_data...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS health_data (
+            data_id INT AUTO_INCREMENT PRIMARY KEY,
+            conversation_id INT,
+            user_id INT,
+            health_condition TEXT,
+            medical_history TEXT,
+            allergies TEXT,
+            dietary_habits TEXT,
+            health_goals TEXT,
+            additional_info JSON,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            is_processed BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+        """)
+        
+        # Kiểm tra các trường của bảng messages có đầy đủ không
+        print("Kiểm tra các trường của bảng messages...")
+        cursor.execute("SHOW COLUMNS FROM messages")
+        columns = [column[0] for column in cursor.fetchall()]
+        
+        # Thêm cột is_summarized nếu chưa có
+        if 'is_summarized' not in columns:
+            print("Thêm cột is_summarized vào bảng messages...")
+            cursor.execute("ALTER TABLE messages ADD COLUMN is_summarized BOOLEAN DEFAULT FALSE")
+        
+        # Thêm cột summary nếu chưa có
+        if 'summary' not in columns:
+            print("Thêm cột summary vào bảng messages...")
+            cursor.execute("ALTER TABLE messages ADD COLUMN summary TEXT")
         
         # Kiểm tra xem có người dùng admin chưa
         cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = 1")
@@ -111,6 +149,46 @@ def init_database():
             print("Người dùng admin đã được tạo thành công với user_id = 1!")
         else:
             print("Người dùng admin với user_id = 1 đã tồn tại.")
+        
+        # Tạo các index để cải thiện hiệu suất truy vấn
+        print("Đang tạo các index cho các bảng...")
+        
+        # Index cho bảng messages
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages (conversation_id)
+        """)
+        
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_role ON messages (role)
+        """)
+        
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages (created_at)
+        """)
+        
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_is_summarized ON messages (is_summarized)
+        """)
+        
+        # Index cho bảng health_data
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_health_data_conversation_id ON health_data (conversation_id)
+        """)
+        
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_health_data_user_id ON health_data (user_id)
+        """)
+        
+        # Index cho bảng conversations
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations (user_id)
+        """)
+        
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations (updated_at)
+        """)
+        
+        print("Đã tạo các index thành công!")
         
         connection.commit()
         print("Khởi tạo cơ sở dữ liệu thành công!")

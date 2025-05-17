@@ -1,5 +1,6 @@
 # Môi trường ảo Python
 venv/
+myenv/
 env/
 .venv/
 .env

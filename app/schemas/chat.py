@@ -22,6 +22,7 @@ class ChatResponse(BaseModel):
 class NewChatResponse(BaseModel):
     conversation_id: int
     created_at: datetime
+    welcome_message: Optional[str] = None
 
     class Config:
         orm_mode = True
