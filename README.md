@@ -1,6 +1,12 @@
-# FMChat - Hỗ trợ Y tế
+# FMChat - Hỗ Trợ Y Tế
 
 Hệ thống chatbot hỗ trợ y tế sử dụng mô hình ngôn ngữ lớn (LLM) được tinh chỉnh cho các tri thức y khoa, tích hợp khả năng tóm tắt lịch sử trò chuyện bằng Gemini API.
+
+## Tổng Quan
+
+FMChat là một hệ thống chatbot y tế thông minh giúp người dùng tìm kiếm thông tin y tế, tư vấn sơ bộ về các vấn đề sức khỏe, và cung cấp hướng dẫn chung về các loại bệnh và phương pháp điều trị. Hệ thống này sử dụng các mô hình ngôn ngữ lớn (LLM) chuyên về y tế để đưa ra thông tin đáng tin cậy.
+
+**Lưu ý quan trọng**: Hệ thống này chỉ cung cấp thông tin tham khảo và không thay thế cho tư vấn y tế chuyên nghiệp.
 
 ## Các tính năng
 
@@ -12,9 +18,8 @@ Hệ thống chatbot hỗ trợ y tế sử dụng mô hình ngôn ngữ lớn (
 
 ## Công nghệ sử dụng
 
-- **Backend**: FastAPI, Python 3.11
-- **Cơ sở dữ liệu**: PostgreSQL
-- **Cache**: Redis
+- **Backend**: FastAPI, Python 3.11+
+- **Cơ sở dữ liệu**: MySQL
 - **ORM**: SQLAlchemy
 - **Deployment**: Docker, Docker Compose
 - **LLM Service**: Hỗ trợ hai hệ thống LLM:
@@ -23,192 +28,96 @@ Hệ thống chatbot hỗ trợ y tế sử dụng mô hình ngôn ngữ lớn (
 - **Model LLM**: Tương thích với các mô hình như MediChat-Llama3 (8B, 70B) hoặc các mô hình khác hỗ trợ bởi llama.cpp/Ollama.
 - **Dịch vụ tóm tắt**: Google Gemini API (ví dụ: `gemini-2.0-flash-lite`).
 
+## Quickstart
+
+### 1. Cài đặt với Docker (Khuyến nghị)
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/fmchat.git
+cd fmchat
+
+# Cấu hình môi trường
+cp .env.example .env.docker
+# Chỉnh sửa file .env.docker với các thông tin cần thiết
+
+# Khởi chạy ứng dụng
+docker-compose up -d
+```
+
+### 2. Cài đặt thủ công
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/fmchat.git
+cd fmchat
+
+# Tạo môi trường ảo
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# hoặc
+.\venv\Scripts\activate  # Windows
+
+# Cài đặt thư viện
+pip install -r requirements.txt
+
+# Cấu hình môi trường
+cp .env.example .env
+# Chỉnh sửa file .env với các thông tin cần thiết
+
+# Khởi tạo database
+python init_db.py
+
+# Khởi chạy ứng dụng
+python main.py
+```
+
 ## Cấu hình LLM Service và Gemini API
 
-Các cấu hình cho dịch vụ LLM (llama.cpp, Ollama) và Gemini API được quản lý thông qua các biến môi trường trong file `.env.docker` (khi chạy bằng Docker) hoặc `.env` (khi chạy thủ công).
+Hệ thống sử dụng biến môi trường để cấu hình kết nối đến các dịch vụ LLM và Gemini API:
 
-### Biến môi trường chính (trong `.env.docker` hoặc `.env`)
+### Biến môi trường chính
 
-- `LLAMA_CPP_URL`: URL của llama.cpp API (ví dụ: `http://host.docker.internal:8080` khi trong Docker, hoặc `http://localhost:8080` khi chạy cục bộ).
-- `OLLAMA_URL`: URL của Ollama API (ví dụ: `http://host.docker.internal:11434` khi trong Docker, hoặc `http://localhost:11434` khi chạy cục bộ).
-- `LLM_SERVICE_TYPE`: Loại dịch vụ LLM (`llama_cpp`, `ollama`, hoặc `auto`).
-    - `auto`: Hệ thống tự động kiểm tra và chọn dịch vụ khả dụng (ưu tiên llama.cpp).
-    - `llama_cpp`: Chỉ sử dụng llama.cpp API.
-    - `ollama`: Chỉ sử dụng Ollama API.
-- `GEMINI_API_KEY`: API Key của bạn cho Google Gemini API.
-- `GEMINI_API_URL`: URL của Gemini API (ví dụ: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent`).
-- `MAX_HISTORY_MESSAGES`: Số lượng tin nhắn tối đa trong lịch sử được gửi đến LLM.
-- `SUMMARY_THRESHOLD`: Ngưỡng số tin nhắn chưa tóm tắt để kích hoạt việc tạo tóm tắt mới.
+- `LLAMA_CPP_URL`: URL của llama.cpp API
+- `OLLAMA_URL`: URL của Ollama API
+- `LLM_SERVICE_TYPE`: Loại dịch vụ LLM (`llama_cpp`, `ollama`, hoặc `auto`)
+- `GEMINI_API_KEY`: API Key của Google Gemini API
+- `GEMINI_API_URL`: URL của Gemini API
+- `MAX_HISTORY_MESSAGES`: Số lượng tin nhắn tối đa trong lịch sử
+- `SUMMARY_THRESHOLD`: Ngưỡng số tin nhắn để kích hoạt tóm tắt
 
-### Cơ chế fallback tự động cho LLM Service
+## API Endpoints
 
-Khi một dịch vụ LLM không khả dụng:
-1. Nếu `LLM_SERVICE_TYPE` là `auto`: Hệ thống tự động chuyển sang dịch vụ còn lại (ưu tiên llama.cpp nếu cả hai đều có sẵn).
-2. Nếu `LLM_SERVICE_TYPE` chỉ định một dịch vụ cụ thể nhưng dịch vụ đó không khả dụng: Hệ thống sẽ cố gắng chuyển sang dịch vụ LLM còn lại.
+Hệ thống cung cấp các API endpoints chính sau:
 
-## Cài đặt và Khởi chạy
+### Authentication
 
-Phần này hướng dẫn các bước để cài đặt, cấu hình và khởi chạy FMChat.
+- `POST /api/login`: Đăng nhập và lấy token
+- `POST /api/register`: Đăng ký tài khoản mới
 
-### Yêu cầu hệ thống
+### Chat
 
-- **Docker và Docker Compose**: Cách khuyến khích để chạy ứng dụng.
-- **Python**: Phiên bản 3.9 trở lên (nếu cài đặt thủ công).
-- **PostgreSQL**: Hệ quản trị cơ sở dữ liệu quan hệ (nếu cài đặt thủ công).
-- **Redis**: Kho lưu trữ dữ liệu key-value (nếu cài đặt thủ công).
-- **Dịch vụ LLM**: Cần cài đặt và cấu hình một trong hai dịch vụ LLM (llama.cpp hoặc Ollama) và đảm bảo chúng có thể truy cập được từ môi trường chạy FMChat.
+- `POST /api/chat/`: Gửi tin nhắn và nhận phản hồi
+- `POST /api/chat/stream-chat`: Gửi tin nhắn và nhận phản hồi theo stream
+- `GET /api/chat/conversations`: Lấy danh sách cuộc trò chuyện
+- `GET /api/chat/conversations/{conversation_id}`: Lấy chi tiết cuộc trò chuyện
 
----
+### System
 
-### A. Sử dụng Docker (Khuyến khích)
+- `GET /`: Kiểm tra trạng thái hệ thống
+- `GET /api/llm/status`: Kiểm tra trạng thái dịch vụ LLM
 
-Đây là phương pháp được khuyến nghị để dễ dàng cài đặt và quản lý tất cả các thành phần của ứng dụng.
+## Tài liệu bổ sung
 
-1.  **Tải mã nguồn:**
-    ```bash
-    git clone https://github.com/yourusername/fmchat.git # Thay thế bằng URL repository của bạn
-    cd fmchat
-    ```
+Xem thêm các tài liệu chi tiết trong thư mục `docs`:
 
-2.  **Cấu hình biến môi trường cho Docker:**
-    Sao chép file `.env.example` thành file `.env.docker`. File này sẽ chứa các cấu hình nhạy cảm cho môi trường Docker.
-    ```bash
-    cp .env.example .env.docker
-    ```
-    Mở file `.env.docker` và **chỉnh sửa các giá trị** cho phù hợp với môi trường của bạn, đặc biệt là:
-    - `DB_PASSWORD`
-    - `REDIS_PASSWORD`
-    - `SECRET_KEY` (nên tạo một giá trị ngẫu nhiên mới)
-    - `LLAMA_CPP_URL`, `OLLAMA_URL` (nếu dịch vụ LLM của bạn chạy ở địa chỉ khác với mặc định `host.docker.internal` từ bên trong container).
-    - `GEMINI_API_KEY` (bắt buộc để tính năng tóm tắt hoạt động).
-
-    **Quan trọng:** Không bao giờ commit file `.env.docker` lên Git repository. File `.gitignore` đã được cấu hình để bỏ qua file này.
-
-3.  **Khởi chạy ứng dụng với Docker Compose:**
-    Lệnh này sẽ build các images (nếu chưa có) và khởi chạy tất cả các services (FastAPI app, PostgreSQL, Redis) được định nghĩa trong `docker-compose.yml`.
-    ```bash
-    docker-compose up -d --build
-    ```
-    - `-d`: Chạy ở chế độ detached (chạy nền).
-    - `--build`: Build lại image nếu có thay đổi trong Dockerfile hoặc mã nguồn.
-
-    Cơ sở dữ liệu sẽ được tự động khởi tạo và migrate khi container khởi chạy lần đầu.
-
-4.  **Kiểm tra ứng dụng:**
-    Ứng dụng FastAPI sẽ có thể truy cập tại `http://localhost:API_PORT` (mặc định là `http://localhost:8000` nếu bạn không thay đổi `API_PORT` trong `.env.docker`).
-
----
-
-### B. Cài đặt thủ công (Nâng cao/Môi trường phát triển cục bộ)
-
-Phương pháp này yêu cầu bạn tự cài đặt và quản lý PostgreSQL, Redis và môi trường Python.
-
-1.  **Tải mã nguồn:** (Như trên)
-
-2.  **Thiết lập môi trường ảo Python:**
-    ```bash
-    python3 -m venv venv
-    ```
-    Kích hoạt môi trường ảo:
-    -   Linux/macOS: `source venv/bin/activate`
-    -   Windows: `.\venv\Scripts\activate`
-
-3.  **Cài đặt các thư viện phụ thuộc:**
-    ```bash
-    python3 -m pip install -r requirements.txt
-    ```
-
-4.  **Cấu hình biến môi trường:**
-    Sao chép file `.env.example` thành file `.env`.
-    ```bash
-    cp .env.example .env
-    ```
-    Mở file `.env` và chỉnh sửa các giá trị cho phù hợp (DB connection, Redis URL, `GEMINI_API_KEY`, LLM URLs, etc.). Đảm bảo PostgreSQL và Redis đang chạy và có thể truy cập.
-
-5.  **Khởi tạo cơ sở dữ liệu:**
-    Chạy script để tạo schema và bảng (đảm bảo bạn đã cấu hình đúng thông tin kết nối trong `.env`):
-    ```bash
-    python3 init_db.py 
-    ```
-    (Hoặc `python3 -m app.db.init_db` tùy theo cấu trúc dự án của bạn cho script `init_db.py`)
-    Bạn cũng cần chạy các migrations nếu có:
-    ```bash
-    alembic upgrade head
-    ```
-
-6.  **Khởi chạy ứng dụng FastAPI:**
-    ```bash
-    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    ```
-
----
-
-## Kiểm tra dịch vụ LLM và Tóm tắt
-
-Sau khi cài đặt, bạn nên kiểm tra các dịch vụ LLM và tính năng tóm tắt.
-
-1.  **Kiểm tra trạng thái dịch vụ LLM:**
-    Nếu chạy bằng Docker:
-    ```bash
-    docker-compose exec app python3 scripts/test_llm_services.py --check-only
-    ```
-    Nếu chạy thủ công:
-    ```bash
-    python3 scripts/test_llm_services.py --check-only
-    ```
-
-2.  **Gửi yêu cầu thử nghiệm đến LLM:**
-    Nếu chạy bằng Docker:
-    ```bash
-    docker-compose exec app python3 scripts/test_llm_services.py --prompt "Bạn có thể cho tôi biết về bệnh đau đầu không?" --service-type auto
-    ```
-    Nếu chạy thủ công:
-    ```bash
-    python3 scripts/test_llm_services.py --prompt "Bạn có thể cho tôi biết về bệnh đau đầu không?" --service-type auto
-    ```
-    Thay đổi `--service-type` thành `llama_cpp` hoặc `ollama` để kiểm tra cụ thể.
-
-3.  **Kiểm tra tính năng tóm tắt (Cần `GEMINI_API_KEY`):**
-    Tính năng tóm tắt được kích hoạt tự động khi lịch sử chat đủ dài. Bạn có thể kiểm tra bằng cách tương tác với chatbot qua API và xem log hoặc kiểm tra cột `summary` trong bảng `conversations` của cơ sở dữ liệu.
-
-## API Endpoints chính
-
-- `POST /api/v1/chat/`: Gửi tin nhắn và nhận phản hồi đầy đủ từ LLM (bao gồm xử lý lịch sử và tóm tắt nếu cần).
-- `POST /api/v1/chat/stream-chat`: Gửi tin nhắn và nhận phản hồi theo từng phần (streaming).
-- `GET /api/v1/chat/conversations`: Lấy danh sách các cuộc trò chuyện của người dùng hiện tại.
-- `GET /api/v1/chat/conversations/{conversation_id}`: Lấy chi tiết một cuộc trò chuyện cụ thể.
-
-(Vui lòng kiểm tra lại đường dẫn API chính xác trong mã nguồn của bạn, ví dụ trong `app/api/chat.py` hoặc router tương ứng.)
-
-## Cấu trúc thư mục (Minh họa)
-
-```
-fmchat/
-├── app/                  # Mã nguồn ứng dụng FastAPI
-│   ├── api/              # Định nghĩa các API endpoints
-│   ├── core/             # Cấu hình, settings
-│   ├── db/               # Models, session, init_db
-│   ├── migrations/       # Alembic migrations
-│   ├── repositories/     # Logic truy cập dữ liệu
-│   ├── schemas/          # Pydantic schemas
-│   ├── services/         # Business logic (chat, LLM, summary)
-│   └── main.py           # Điểm khởi đầu ứng dụng FastAPI
-├── scripts/              # Các script tiện ích (ví dụ: test_llm_services.py)
-├── .env.docker           # (Không commit) Cấu hình cho Docker
-├── .env.example          # File mẫu cho cấu hình
-├── docker-compose.yml    # Định nghĩa các services cho Docker Compose
-├── Dockerfile            # Công thức để build Docker image cho app
-├── requirements.txt      # Danh sách các thư viện Python
-├── .gitignore            # Các file/thư mục được Git bỏ qua
-└── README.md             # Chính là file này
-```
+- [Tổng quan hệ thống](docs/SYSTEM_OVERVIEW.md): Mô tả chi tiết về các chức năng và luồng thực thi
+- [Hướng dẫn sử dụng LLM Services](docs/LLM_SERVICES_GUIDE.md): Cách cấu hình và sử dụng các dịch vụ LLM
 
 ## Đóng góp
 
-Nếu bạn muốn đóng góp cho dự án, vui lòng xem xét các quy tắc và quy trình đóng góp (nếu có).
+Nếu bạn muốn đóng góp cho dự án, vui lòng xem xét các quy tắc đóng góp và gửi Pull Request.
 
 ## Giấy phép
 
-Thông tin giấy phép của dự án (ví dụ: MIT, Apache 2.0).
-
- 
+Dự án này được phân phối dưới giấy phép MIT. Xem file `LICENSE` để biết thêm chi tiết.
