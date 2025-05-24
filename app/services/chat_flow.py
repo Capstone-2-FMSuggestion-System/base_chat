@@ -177,36 +177,84 @@ def persist_user_interaction_node_wrapper(state: ChatState, repository) -> ChatS
         try:
             logger.info("💾 Persist user interaction node - đang lưu user message...")
             
+            # ⭐ VALIDATION: Kiểm tra các trường bắt buộc
+            if not result_state.get('conversation_id'):
+                raise ValueError("conversation_id không được để trống")
+            if not result_state.get('user_message'):
+                raise ValueError("user_message không được để trống")
+            if not repository:
+                raise ValueError("repository không được để trống")
+            
             # Tìm tin nhắn người dùng đã tồn tại trong database
             from sqlalchemy import desc
             from app.db.models import Message
             
             db = repository.db
+            
+            # ⭐ KIỂM TRA DB CONNECTION
+            if not db:
+                raise ValueError("Database connection không khả dụng")
+                
+            # Tìm kiếm với thời gian gần đây để tránh trùng lặp
+            from datetime import datetime, timedelta
+            recent_time = datetime.now() - timedelta(minutes=5)  # Chỉ tìm trong 5 phút gần đây
+            
             existing_message = db.query(Message).filter(
                 Message.conversation_id == result_state['conversation_id'],
                 Message.role == "user",
-                Message.content == result_state['user_message']
+                Message.content == result_state['user_message'],
+                Message.created_at >= recent_time  # ⭐ THÊM ĐIỀU KIỆN THỜI GIAN
             ).order_by(desc(Message.created_at)).first()
             
             if existing_message:
-                # Tin nhắn đã tồn tại, chỉ cập nhật ID
+                # Tin nhắn đã tồn tại gần đây, chỉ cập nhật ID
                 result_state['user_message_id_db'] = existing_message.message_id
-                logger.info(f"📌 User message đã tồn tại với ID: {existing_message.message_id}")
+                logger.info(f"📌 User message đã tồn tại gần đây với ID: {existing_message.message_id}")
             else:
                 # LUÔN lưu tin nhắn người dùng vào cơ sở dữ liệu, bất kể phạm vi
-                user_message_db_obj = repository.add_message(
-                    result_state['conversation_id'], 
-                    "user", 
-                    result_state['user_message']
-                )
-                result_state['user_message_id_db'] = user_message_db_obj.message_id
-                logger.info(f"💾 Đã lưu user message với ID: {user_message_db_obj.message_id}")
+                try:
+                    user_message_db_obj = repository.add_message(
+                        result_state['conversation_id'], 
+                        "user", 
+                        result_state['user_message']
+                    )
+                    
+                    if not user_message_db_obj or not hasattr(user_message_db_obj, 'message_id'):
+                        raise ValueError("add_message không trả về đối tượng hợp lệ")
+                        
+                    result_state['user_message_id_db'] = user_message_db_obj.message_id
+                    logger.info(f"💾 Đã lưu user message với ID: {user_message_db_obj.message_id}")
+                    
+                    # ⭐ VALIDATION: Kiểm tra ID hợp lệ
+                    if not result_state['user_message_id_db'] or result_state['user_message_id_db'] <= 0:
+                        raise ValueError(f"user_message_id_db không hợp lệ: {result_state['user_message_id_db']}")
+                        
+                except Exception as save_error:
+                    logger.error(f"💥 Lỗi khi lưu user message: {save_error}")
+                    # ⭐ FALLBACK: Thử lưu lại một lần nữa với content đã sanitize
+                    try:
+                        sanitized_content = str(result_state['user_message'])[:1000]  # Giới hạn độ dài
+                        user_message_db_obj_retry = repository.add_message(
+                            result_state['conversation_id'], 
+                            "user", 
+                            sanitized_content
+                        )
+                        result_state['user_message_id_db'] = user_message_db_obj_retry.message_id
+                        logger.info(f"💾 Đã lưu user message (retry) với ID: {user_message_db_obj_retry.message_id}")
+                    except Exception as retry_error:
+                        logger.error(f"💥 Lỗi khi retry lưu user message: {retry_error}")
+                        # Set một ID tạm thời để luồng có thể tiếp tục
+                        result_state['user_message_id_db'] = -1
+                        result_state['error'] = f"Không thể lưu user message: {str(save_error)}"
             
-            # Tạo user_message object để đồng nhất với response format
-            result_state["user_message"] = {
-                "role": "user",
-                "content": result_state['user_message']
-            }
+            # ⚠️ GIỮ user_message NGUYÊN VẸN làm string cho các node khác sử dụng
+            # Chỉ tạo formatted user_message khi cần thiết trong response
+            result_state["user_message_original_content"] = result_state['user_message']
+            
+            # ⭐ VALIDATION: Đảm bảo user_message_id_db có giá trị
+            if not result_state.get('user_message_id_db'):
+                logger.warning("⚠️ user_message_id_db vẫn chưa có sau khi xử lý")
+                result_state['user_message_id_db'] = -1  # Giá trị mặc định để tránh None
             
             # Lưu thông tin sức khỏe vào database nếu có collected_info và thuộc phạm vi hợp lệ
             if (result_state.get('collected_info') and 
@@ -227,9 +275,16 @@ def persist_user_interaction_node_wrapper(state: ChatState, repository) -> ChatS
             
             logger.info(f"✅ Persist user interaction hoàn tất. user_message_id_db: {result_state.get('user_message_id_db')}")
             
+            # ⭐ FINAL VALIDATION: Log cảnh báo nếu ID không hợp lệ
+            if result_state.get('user_message_id_db', 0) <= 0:
+                logger.warning(f"⚠️ user_message_id_db có giá trị không hợp lệ: {result_state.get('user_message_id_db')}")
+            
         except Exception as e:
-            logger.error(f"💥 Lỗi trong persist_user_interaction_node: {e}", exc_info=True)
+            logger.error(f"💥 Lỗi nghiêm trọng trong persist_user_interaction_node: {e}", exc_info=True)
             result_state['error'] = f"Lỗi lưu user message: {str(e)}"
+            # Đảm bảo có user_message_id_db ngay cả khi có lỗi
+            if not result_state.get('user_message_id_db'):
+                result_state['user_message_id_db'] = -1
             # Không fail hard, để luồng tiếp tục
         
         return result_state
@@ -456,75 +511,22 @@ async def save_health_data_to_db(repo, conversation_id: int, user_id: int, data:
         logger.error(f"💥 Lỗi khi lưu thông tin sức khỏe vào DB: {str(e)}")
 
 async def recipe_search_node(state: ChatState) -> ChatState:
-    """Tìm kiếm công thức món ăn từ database"""
-    logger.info("🔍 Bắt đầu tìm kiếm công thức món ăn...")
+    """Tìm kiếm công thức món ăn từ database - sử dụng logic function mới"""
+    logger.info("🔍 Bắt đầu recipe search node...")
     
     try:
-        gemini_service = GeminiPromptService()
+        # Sử dụng logic function mới
+        recipes = await recipe_search_logic(state)
+        state['recipe_results'] = recipes
         
-        # Tạo query tìm kiếm với suggest_general_if_needed
-        suggest_general_if_needed = state.get('suggest_general_options', False)
-        
-        search_query = await gemini_service.create_recipe_search_prompt(
-            state['user_message'], 
-            state.get('collected_info', {}),
-            suggest_general_if_needed=suggest_general_if_needed
-        )
-        
-        logger.info(f"🔍 Recipe search query: {search_query}")
-        
-        # Gọi recipe tool (synchronous function - không await)
-        recipe_json_str = search_and_filter_recipes(search_query)
-        
-        # Parse JSON result với error handling mạnh mẽ
-        recipes = []
-        if recipe_json_str:
-            try:
-                recipes_data = json.loads(recipe_json_str)
-                
-                # Kiểm tra định dạng trả về từ recipe_tool
-                if isinstance(recipes_data, list) and all(isinstance(item, dict) for item in recipes_data):
-                    recipes = recipes_data
-                elif isinstance(recipes_data, dict) and "recipes" in recipes_data and isinstance(recipes_data["recipes"], list):
-                    # Trường hợp recipe_tool trả về {"recipes": [...], "errors": [...]}
-                    recipes = recipes_data["recipes"]
-                    if "errors" in recipes_data and recipes_data["errors"]:
-                        logger.warning(f"⚠️ Lỗi từ recipe_tool: {recipes_data['errors']}")
-                elif isinstance(recipes_data, dict) and "error" in recipes_data:
-                    logger.error(f"💥 Recipe tool trả về lỗi: {recipes_data['error']}")
-                    recipes = []
-                else:
-                    logger.warning(f"⚠️ Recipe tool trả về định dạng không mong muốn: {type(recipes_data)}")
-                    recipes = []
-                    
-            except json.JSONDecodeError as json_error:
-                logger.error(f"💥 Lỗi parse JSON từ recipe_tool: {str(json_error)}")
-                logger.error(f"Raw response (first 200 chars): {recipe_json_str[:200]}")
-                recipes = []
-                # Không set error vì recipe search không phải critical
-        else:
-            logger.warning("⚠️ Recipe tool không trả về kết quả.")
-            recipes = []
-
         if recipes:
-            # Lọc trùng lặp bằng Gemini (hàm này là async)
-            try:
-                filtered_recipes = await gemini_service.filter_duplicate_recipes(recipes)
-                state['recipe_results'] = filtered_recipes[:10]  # Giới hạn 10 recipes tốt nhất
-                logger.info(f"✅ Đã lọc từ {len(recipes)} xuống {len(filtered_recipes)} recipes, lưu {len(state['recipe_results'])} recipes")
-            except Exception as filter_error:
-                logger.error(f"💥 Lỗi khi lọc recipes: {str(filter_error)}")
-                # Fallback: sử dụng recipes chưa lọc, giới hạn 10
-                state['recipe_results'] = recipes[:10]
-                logger.info(f"✅ Sử dụng {len(state['recipe_results'])} recipes chưa lọc (fallback)")
+            logger.info(f"✅ Recipe search node: Tìm thấy {len(recipes)} công thức")
         else:
-            state['recipe_results'] = []
-            logger.info("❌ Không tìm thấy công thức món ăn phù hợp sau khi parse.")
+            logger.info("❌ Recipe search node: Không tìm thấy công thức món ăn phù hợp")
             
     except Exception as e:
-        logger.error(f"💥 Lỗi nghiêm trọng khi tìm kiếm công thức: {str(e)}", exc_info=True)
+        logger.error(f"💥 Lỗi nghiêm trọng trong recipe search node: {str(e)}", exc_info=True)
         state['recipe_results'] = []
-        # Không set error để không chặn luồng xử lý tiếp theo
         logger.info("🔄 Tiếp tục xử lý mà không có recipes")
     
     return state
@@ -568,12 +570,82 @@ async def product_search_node(state: ChatState) -> ChatState:
     
     return state
 
-async def beverage_search_node(state: ChatState) -> ChatState:
-    """
-    ⭐ NODE MỚI: Tìm kiếm đồ uống từ product_beverage tool với async optimization.
-    Sử dụng fetch_and_filter_drinks_in_batches_async để lấy danh sách đồ uống.
-    """
-    logger.info("🥤 Bắt đầu tìm kiếm đồ uống...")
+# ⭐ LOGIC FUNCTIONS cho Parallel Processing
+async def recipe_search_logic(state: ChatState) -> List[Dict[str, Any]]:
+    """Tách logic tìm kiếm recipe ra thành hàm riêng để có thể gọi song song"""
+    logger.info("🔍 Executing recipe search logic...")
+    
+    try:
+        gemini_service = GeminiPromptService()
+        
+        # Tạo query tìm kiếm với suggest_general_if_needed
+        suggest_general_if_needed = state.get('suggest_general_options', False)
+        
+        search_query = await gemini_service.create_recipe_search_prompt(
+            state['user_message'], 
+            state.get('collected_info', {}),
+            suggest_general_if_needed=suggest_general_if_needed
+        )
+        
+        logger.info(f"🔍 Recipe search query: {search_query}")
+        
+        # Gọi recipe tool trong executor để không block event loop
+        loop = asyncio.get_event_loop()
+        recipe_json_str = await loop.run_in_executor(None, search_and_filter_recipes, search_query)
+        
+        # Parse JSON result với error handling mạnh mẽ
+        recipes = []
+        if recipe_json_str:
+            try:
+                recipes_data = json.loads(recipe_json_str)
+                
+                # Kiểm tra định dạng trả về từ recipe_tool
+                if isinstance(recipes_data, list) and all(isinstance(item, dict) for item in recipes_data):
+                    recipes = recipes_data
+                elif isinstance(recipes_data, dict) and "recipes" in recipes_data and isinstance(recipes_data["recipes"], list):
+                    # Trường hợp recipe_tool trả về {"recipes": [...], "errors": [...]}
+                    recipes = recipes_data["recipes"]
+                    if "errors" in recipes_data and recipes_data["errors"]:
+                        logger.warning(f"⚠️ Lỗi từ recipe_tool: {recipes_data['errors']}")
+                elif isinstance(recipes_data, dict) and "error" in recipes_data:
+                    logger.error(f"💥 Recipe tool trả về lỗi: {recipes_data['error']}")
+                    recipes = []
+                else:
+                    logger.warning(f"⚠️ Recipe tool trả về định dạng không mong muốn: {type(recipes_data)}")
+                    recipes = []
+                    
+            except json.JSONDecodeError as json_error:
+                logger.error(f"💥 Lỗi parse JSON từ recipe_tool: {str(json_error)}")
+                logger.error(f"Raw response (first 200 chars): {recipe_json_str[:200]}")
+                recipes = []
+        else:
+            logger.warning("⚠️ Recipe tool không trả về kết quả.")
+            recipes = []
+
+        if recipes:
+            # Lọc trùng lặp bằng Gemini (hàm này là async)
+            try:
+                filtered_recipes = await gemini_service.filter_duplicate_recipes(recipes)
+                final_recipes = filtered_recipes[:10]  # Giới hạn 10 recipes tốt nhất
+                logger.info(f"✅ Recipe logic: Đã lọc từ {len(recipes)} xuống {len(filtered_recipes)} recipes, trả về {len(final_recipes)} recipes")
+                return final_recipes
+            except Exception as filter_error:
+                logger.error(f"💥 Lỗi khi lọc recipes: {str(filter_error)}")
+                # Fallback: sử dụng recipes chưa lọc, giới hạn 10
+                final_recipes = recipes[:10]
+                logger.info(f"✅ Recipe logic: Sử dụng {len(final_recipes)} recipes chưa lọc (fallback)")
+                return final_recipes
+        else:
+            logger.info("❌ Recipe logic: Không tìm thấy công thức món ăn phù hợp sau khi parse.")
+            return []
+            
+    except Exception as e:
+        logger.error(f"💥 Lỗi nghiêm trọng trong recipe logic: {str(e)}", exc_info=True)
+        return []
+
+async def beverage_search_logic(state: ChatState) -> List[Dict[str, Any]]:
+    """Tách logic tìm kiếm beverage ra thành hàm riêng để có thể gọi song song"""
+    logger.info("🥤 Executing beverage search logic...")
     
     try:
         # ⭐ KHỞI TẠO SERVICES (CẬP NHẬT CHO VERSION MỚI)
@@ -582,25 +654,119 @@ async def beverage_search_node(state: ChatState) -> ChatState:
             None, init_services
         )
         
-        logger.info(f"🔧 Đã khởi tạo services: vector_dim={vector_dimension}")
+        logger.info(f"🔧 Beverage logic: Đã khởi tạo services: vector_dim={vector_dimension}")
         
         # ⭐ GỌI HÀM ASYNC MỚI TRỰC TIẾP
         beverages_data = await fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimension)
         
         if beverages_data and isinstance(beverages_data, list):
-            state['beverage_results'] = beverages_data
-            logger.info(f"✅ Tìm thấy {len(beverages_data)} đồ uống.")
+            logger.info(f"✅ Beverage logic: Tìm thấy {len(beverages_data)} đồ uống.")
             # Log một vài sản phẩm đầu để debug
             for i, beverage in enumerate(beverages_data[:3]):
                 logger.info(f"   - Đồ uống {i+1}: {beverage.get('product_name', 'N/A')}")
+            return beverages_data
         else:
-            state['beverage_results'] = []
-            logger.info("❌ Không tìm thấy đồ uống phù hợp.")
+            logger.info("❌ Beverage logic: Không tìm thấy đồ uống phù hợp.")
+            return []
             
     except Exception as e:
-        logger.error(f"💥 Lỗi khi tìm kiếm đồ uống: {str(e)}", exc_info=True)
+        logger.error(f"💥 Lỗi nghiêm trọng trong beverage logic: {str(e)}", exc_info=True)
+        return []
+
+async def parallel_tool_runner_node(state: ChatState) -> ChatState:
+    """
+    ⭐ NODE MỚI: Chạy song song recipe_search_logic và beverage_search_logic
+    khi người dùng yêu cầu cả món ăn và đồ uống.
+    """
+    logger.info("⚡ Bắt đầu parallel tool runner - chạy song song recipe và beverage search...")
+    
+    try:
+        # Kiểm tra điều kiện song song
+        requests_food = state.get('requests_food', False)
+        requests_beverage = state.get('requests_beverage', False)
+        
+        if not (requests_food and requests_beverage):
+            logger.warning(f"⚠️ Parallel runner được gọi nhưng không đủ điều kiện: food={requests_food}, beverage={requests_beverage}")
+            # Fallback: chỉ chạy cái nào được yêu cầu
+            if requests_food:
+                state['recipe_results'] = await recipe_search_logic(state)
+                state['beverage_results'] = []
+            elif requests_beverage:
+                state['beverage_results'] = await beverage_search_logic(state)
+                state['recipe_results'] = []
+            else:
+                state['recipe_results'] = []
+                state['beverage_results'] = []
+            return state
+        
+        # ⭐ CHẠY SONG SONG VỚI ASYNCIO.GATHER
+        logger.info("🚀 Chạy song song recipe và beverage search...")
+        start_time = asyncio.get_event_loop().time()
+        
+        recipe_task = recipe_search_logic(state)
+        beverage_task = beverage_search_logic(state)
+        
+        # Chạy song song và chờ kết quả
+        recipe_results, beverage_results = await asyncio.gather(
+            recipe_task, beverage_task, return_exceptions=True
+        )
+        
+        end_time = asyncio.get_event_loop().time()
+        elapsed_time = end_time - start_time
+        
+        # Xử lý kết quả recipe
+        if isinstance(recipe_results, Exception):
+            logger.error(f"💥 Lỗi trong recipe search: {str(recipe_results)}")
+            state['recipe_results'] = []
+        elif isinstance(recipe_results, list):
+            state['recipe_results'] = recipe_results
+            logger.info(f"✅ Recipe results: {len(recipe_results)} công thức")
+        else:
+            logger.warning(f"⚠️ Recipe results không mong đợi: {type(recipe_results)}")
+            state['recipe_results'] = []
+        
+        # Xử lý kết quả beverage
+        if isinstance(beverage_results, Exception):
+            logger.error(f"💥 Lỗi trong beverage search: {str(beverage_results)}")
+            state['beverage_results'] = []
+        elif isinstance(beverage_results, list):
+            state['beverage_results'] = beverage_results
+            logger.info(f"✅ Beverage results: {len(beverage_results)} đồ uống")
+        else:
+            logger.warning(f"⚠️ Beverage results không mong đợi: {type(beverage_results)}")
+            state['beverage_results'] = []
+        
+        logger.info(f"⚡ Parallel processing hoàn thành trong {elapsed_time:.2f}s")
+        logger.info(f"📊 Kết quả tổng hợp: {len(state.get('recipe_results', []))} recipes + {len(state.get('beverage_results', []))} beverages")
+        
+    except Exception as e:
+        logger.error(f"💥 Lỗi nghiêm trọng trong parallel tool runner: {str(e)}", exc_info=True)
+        # Fallback: set empty results
+        state['recipe_results'] = []
         state['beverage_results'] = []
-        # Không set state['error'] để luồng có thể tiếp tục
+        # Không set error để luồng có thể tiếp tục
+    
+    return state
+
+async def beverage_search_node(state: ChatState) -> ChatState:
+    """
+    ⭐ NODE MỚI: Tìm kiếm đồ uống từ product_beverage tool - sử dụng logic function mới
+    """
+    logger.info("🥤 Bắt đầu beverage search node...")
+    
+    try:
+        # Sử dụng logic function mới
+        beverages = await beverage_search_logic(state)
+        state['beverage_results'] = beverages
+        
+        if beverages:
+            logger.info(f"✅ Beverage search node: Tìm thấy {len(beverages)} đồ uống")
+        else:
+            logger.info("❌ Beverage search node: Không tìm thấy đồ uống phù hợp")
+            
+    except Exception as e:
+        logger.error(f"💥 Lỗi nghiêm trọng trong beverage search node: {str(e)}", exc_info=True)
+        state['beverage_results'] = []
         logger.info("🔄 Tiếp tục xử lý mà không có beverage results")
     
     return state
@@ -808,39 +974,125 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                         result_state['final_response'] = polished_response
                     else:
                         result_state['final_response'] = result_state['medichat_response']
-                        # ⭐ KIỂM TRA: Nếu chưa có final_response, tạo fallback
+            
+            # ⭐ KIỂM TRA FALLBACK: Nếu chưa có final_response, tạo fallback
             if not result_state.get('final_response'):
                 if result_state.get('suggest_general_options', False) and result_state.get('is_valid_scope', True):
                     logger.info("🎯 Enhanced Fallback: Tạo gợi ý chung phong phú vì suggest_general_options=True")
                     
-                    # ⭐ SỬ DỤNG TEMPLATE CỐ ĐỊNH CHẤT LƯỢNG CAO 
-                    logger.info("📝 Tạo gợi ý chung từ template có sẵn")
-                    
-                    # Template cố định chất lượng cao
-                    import random
-                    suggestion_templates = [
-                        ("Dạ, tôi hiểu bạn muốn có một số gợi ý chung về món ăn tốt cho sức khỏe. "
-                        "Dựa trên các tiêu chí phổ biến, cân bằng dinh dưỡng và dễ chế biến, "
-                        "tôi xin đề xuất một số lựa chọn:\n\n"
-                        "🥗 **Salad rau củ quả** - Nhiều chất xơ, vitamin, khoáng chất tự nhiên\n"
-                        "🍲 **Canh chua cá** - Giàu protein, vitamin C, dễ tiêu hóa\n"
-                        "🥣 **Cháo gà** - Dễ ăn, bổ dưỡng, phù hợp nhiều lứa tuổi\n"
-                        "🥤 **Nước ép trái cây tươi** - Vitamin tự nhiên, tăng cường miễn dịch\n\n"
-                        "Những món này thường dễ tìm nguyên liệu, tốt cho sức khỏe và ít gây dị ứng. "
-                        "Bạn có muốn tôi tư vấn cụ thể hơn về món nào không?"),
+                    # ⭐ TỐI ƯU: THỬ GỌI GEMINI ĐỂ TẠO GỢI Ý CHẤT LƯỢNG CAO TRƯỚC
+                    try:
+                        gemini_service = GeminiPromptService()
+                        user_msg = result_state.get('user_message', '')
+                        collected_info = result_state.get('collected_info', {})
                         
-                        ("Dạ, để gợi ý các món ăn phù hợp chung, tôi có thể đề xuất một số lựa chọn "
-                        "dựa trên tính cân bằng dinh dưỡng và độ phổ biến:\n\n"
-                        "🍜 **Phở gà** - Nhẹ, dễ ăn, đầy đủ chất dinh dưỡng\n"
-                        "🥙 **Bánh mì kẹp rau** - Tiện lợi, có thể tùy chỉnh nguyên liệu\n"
-                        "🍯 **Sữa chua mật ong** - Probiotics tốt cho tiêu hóa\n"
-                        "🥞 **Bánh yến mạch chuối** - Chất xơ cao, năng lượng bền vững\n\n"
-                        "Đây là những lựa chọn an toàn và được nhiều người yêu thích. "
-                        "Bạn có thể chia sẻ thêm về sở thích hoặc nhu cầu cụ thể để tôi tư vấn chính xác hơn không?")
-                    ]
-                    
-                    selected_template = random.choice(suggestion_templates)
-                    result_state['final_response'] = selected_template
+                        # Tạo prompt đơn giản cho gợi ý chung
+                        general_suggestion_prompt = f"""
+Tạo một gợi ý dinh dưỡng chung và hữu ích dựa trên:
+- Câu hỏi: {user_msg}
+- Thông tin sức khỏe: {collected_info if collected_info else "không có"}
+
+Yêu cầu:
+1. Ngắn gọn (200-300 từ)
+2. Practical và dễ áp dụng
+3. Bao gồm 4-5 gợi ý cụ thể
+4. Sử dụng emoji phù hợp
+5. Kết thúc bằng câu hỏi mời tiếp tục
+
+Trả về ngay câu trả lời, không giải thích."""
+                        
+                        # Gọi Gemini với prompt đơn giản (sử dụng method internal)
+                        gemini_response = await gemini_service._query_gemini_with_client(general_suggestion_prompt)
+                        
+                        if gemini_response and len(gemini_response.strip()) > 50:
+                            result_state['final_response'] = gemini_response.strip()
+                            logger.info("✅ Đã tạo fallback response từ Gemini cho suggest_general_options")
+                        else:
+                            raise Exception("Gemini response quá ngắn hoặc không hợp lệ")
+                            
+                    except Exception as gemini_error:
+                        logger.warning(f"⚠️ Không thể gọi Gemini cho fallback: {gemini_error}, sử dụng template")
+                        
+                        # ⭐ FALLBACK VỚI TEMPLATE CỐ ĐỊNH CHẤT LƯỢNG CAO
+                        import random
+                        
+                        # Phân loại loại gợi ý dựa trên context
+                        user_msg = result_state.get('user_message', '').lower()
+                        collected_info = result_state.get('collected_info', {})
+                        
+                        if 'đồ uống' in user_msg or 'nước' in user_msg or result_state.get('requests_beverage'):
+                            # Gợi ý tập trung đồ uống
+                            fallback_response = (
+                                "Dạ, tôi hiểu bạn muốn có gợi ý về đồ uống tốt cho sức khỏe. "
+                                "Dựa trên các tiêu chí dinh dưỡng và dễ tìm, tôi xin đề xuất:\n\n"
+                                "🥤 **Nước ép cam tươi** - Vitamin C cao, tăng cường miễn dịch\n"
+                                "🍵 **Trà xanh matcha** - Chất chống oxi hóa, thanh nhiệt\n"
+                                "🥛 **Sữa chua Hy Lạp** - Probiotics tốt cho tiêu hóa\n"
+                                "💧 **Nước dừa tươi** - Bù điện giải tự nhiên\n"
+                                "🍯 **Nước mật ong ấm** - Kháng khuẩn, làm dịu cổ họng\n\n"
+                                "Bạn có muốn tôi tư vấn cụ thể hơn về đồ uống nào không?"
+                            )
+                        elif any(condition in str(collected_info.get('health_condition', '')).lower() for condition in ['tim mạch', 'tiểu đường', 'huyết áp', 'cholesterol']):
+                            # Gợi ý cho người có vấn đề sức khỏe
+                            fallback_response = (
+                                "Dạ, tôi hiểu bạn cần gợi ý về món ăn phù hợp với tình trạng sức khỏe. "
+                                "Tôi xin đề xuất một số món ăn nhẹ nhàng và bổ dưỡng:\n\n"
+                                "🥣 **Cháo yến mạch hạt chia** - Chất xơ cao, ít đường, tốt cho tim mạch\n"
+                                "🐟 **Cá hồi nướng giấy bạc** - Omega-3 cao, ít muối\n"
+                                "🥗 **Salad quinoa rau xanh** - Protein thực vật, vitamin\n"
+                                "🍲 **Canh bí đỏ hạt lanh** - Beta-carotene, dễ tiêu hóa\n"
+                                "🥜 **Hạnh nhân sấy khô** - Protein, chất béo tốt\n\n"
+                                "Các món này thường an toàn và phù hợp với nhiều tình trạng sức khỏe. "
+                                "Bạn có muốn tôi tư vấn chi tiết hơn không?"
+                            )
+                        elif 'giảm cân' in user_msg or 'diet' in user_msg:
+                            # Gợi ý cho giảm cân
+                            fallback_response = (
+                                "Dạ, tôi hiểu bạn quan tâm đến việc kiểm soát cân nặng. "
+                                "Đây là một số gợi ý dinh dưỡng lành mạnh:\n\n"
+                                "🥒 **Salad dưa chuột bơ** - Ít calo, nhiều chất xơ\n"
+                                "🍗 **Ức gà nướng herbs** - Protein cao, ít chất béo\n"
+                                "🥬 **Canh rau củ thanh đạm** - Vitamin, khoáng chất\n"
+                                "🥛 **Smoothie rau xanh** - Detox tự nhiên, no lâu\n"
+                                "🍵 **Trà ô long** - Hỗ trợ trao đổi chất\n\n"
+                                "Bạn có muốn tôi tư vấn thực đơn cụ thể hơn không?"
+                            )
+                        else:
+                            # Gợi ý chung với template đa dạng
+                            general_templates = [
+                                ("Dạ, tôi hiểu bạn muốn có một số gợi ý chung về món ăn tốt cho sức khỏe. "
+                                "Dựa trên các tiêu chí cân bằng dinh dưỡng và dễ chế biến, "
+                                "tôi xin đề xuất:\n\n"
+                                "🥗 **Salad Mediterranean** - Vitamin E, chất chống oxi hóa\n"
+                                "🍲 **Canh chua cá bông lau** - Protein, vitamin C, dễ tiêu\n"
+                                "🥣 **Cháo gà yến mạch** - Dễ ăn, bổ dưỡng, đầy đủ amino acid\n"
+                                "🍜 **Phở gà thanh đạm** - Nước dùng trong, cân bằng dinh dưỡng\n"
+                                "🥙 **Wrap rau củ quinoa** - Chất xơ cao, protein thực vật\n\n"
+                                "Bạn có muốn tôi tư vấn cụ thể hơn về món nào không?"),
+                                
+                                ("Dạ, để gợi ý các món ăn phù hợp chung, tôi có thể đề xuất "
+                                "dựa trên tính cân bằng dinh dưỡng:\n\n"
+                                "🥙 **Bánh mì nguyên cám kẹp rau** - Chất xơ, vitamin B\n"
+                                "🍯 **Sữa chua Hy Lạp mật ong** - Probiotics, khoáng chất\n"
+                                "🥞 **Pancake yến mạch chuối** - Năng lượng bền vững\n"
+                                "🍵 **Trà hoa cúc mật ong** - Thanh nhiệt, giảm stress\n"
+                                "🥜 **Mix nuts tự nhiên** - Chất béo tốt, protein\n\n"
+                                "Bạn có thể chia sẻ thêm về nhu cầu cụ thể để tôi tư vấn chính xác hơn không?"),
+                                
+                                ("Dạ, tôi xin đề xuất một số lựa chọn dinh dưỡng cân bằng "
+                                "phù hợp với lối sống hiện đại:\n\n"
+                                "🍳 **Trứng luộc bơ wholemeal** - Protein hoàn chỉnh, chất béo tốt\n"
+                                "🐟 **Cá thu nướng muối vừng** - Omega-3, selenium\n"
+                                "🥑 **Avocado toast hạt chia** - Monounsaturated fat, chất xơ\n"
+                                "🍠 **Khoai lang nướng** - Beta-carotene, vitamin A\n"
+                                "🥤 **Nước ép cần tây táo** - Vitamin K, detox tự nhiên\n\n"
+                                "Bạn có muốn tôi giải thích thêm về lợi ích của món nào không?")
+                            ]
+                            fallback_response = random.choice(general_templates)
+                        
+                        result_state['final_response'] = fallback_response
+                        logger.info("✅ Đã tạo fallback response từ template cho suggest_general_options")
+                        
                 else:
                     # Fallback cuối cùng nếu không có gì khác
                     result_state['final_response'] = ("Xin lỗi, hiện tôi không thể xử lý yêu cầu của bạn vào lúc này. "
@@ -936,9 +1188,9 @@ def define_router(state: ChatState) -> str:
             logger.info("🎯 Router decision: beverage_search (beverage only)")
             return "beverage_search"
         elif requests_food and requests_beverage:
-            # Yêu cầu cả hai - ưu tiên recipe_search trước, sẽ xử lý beverage trong enhanced_medichat_call
-            logger.info("🎯 Router decision: recipe_search (mixed - prioritize food first)")
-            return "recipe_search"
+            # ⭐ YÊU CẦU CẢ HAI - CHẠY SONG SONG
+            logger.info("🎯 Router decision: parallel_tool_runner (run both food and beverage in parallel)")
+            return "parallel_tool_runner"
         elif state.get("suggest_general_options", False) and state.get("is_food_related", False):
             # Gợi ý chung về dinh dưỡng - đi qua recipe_search với query chung
             logger.info("🎯 Router decision: recipe_search (general food suggestions)")
@@ -990,8 +1242,8 @@ def define_post_collect_info_router(state: ChatState) -> str:
         logger.info("🎯 Post-collect router decision: beverage_search (beverage only)")
         return "beverage_search"
     elif requests_food and requests_beverage:
-        logger.info("🎯 Post-collect router decision: recipe_search (mixed - prioritize food first)")
-        return "recipe_search"
+        logger.info("🎯 Post-collect router decision: parallel_tool_runner (run both food and beverage in parallel)")
+        return "parallel_tool_runner"
     elif state.get("is_food_related", False):
         logger.info("🎯 Post-collect router decision: recipe_search (food-related fallback)")
         return "recipe_search"
@@ -1018,6 +1270,8 @@ def create_chat_flow_graph(repository=None, llm_service=None):
     builder.add_node("product_search", run_async(product_search_node))
     # ⭐ NODE MỚI: Beverage search
     builder.add_node("beverage_search", run_async(beverage_search_node))
+    # ⭐ NODE MỚI: Parallel tool runner
+    builder.add_node("parallel_tool_runner", run_async(parallel_tool_runner_node))
     builder.add_node("enhanced_medichat_call", lambda state: enhanced_medichat_call_node_wrapper(state, repository, llm_service))
     builder.add_node("enhanced_response_cleanup", lambda state: enhanced_response_cleanup_node_wrapper(state, repository))
     
@@ -1034,7 +1288,8 @@ def create_chat_flow_graph(repository=None, llm_service=None):
             "enhanced_response_cleanup": "enhanced_response_cleanup",
             "store_data": "store_data",
             "recipe_search": "recipe_search",
-            "beverage_search": "beverage_search"  # ⭐ THÊM EDGE CHO BEVERAGE SEARCH
+            "beverage_search": "beverage_search",  # ⭐ THÊM EDGE CHO BEVERAGE SEARCH
+            "parallel_tool_runner": "parallel_tool_runner"  # ⭐ THÊM EDGE CHO PARALLEL PROCESSING
         }
     )
     
@@ -1046,6 +1301,7 @@ def create_chat_flow_graph(repository=None, llm_service=None):
             "enhanced_response_cleanup": "enhanced_response_cleanup",
             "recipe_search": "recipe_search",
             "beverage_search": "beverage_search",  # ⭐ THÊM EDGE CHO BEVERAGE SEARCH
+            "parallel_tool_runner": "parallel_tool_runner",  # ⭐ THÊM EDGE CHO PARALLEL PROCESSING
             "store_data": "store_data"
         }
     )
@@ -1053,6 +1309,7 @@ def create_chat_flow_graph(repository=None, llm_service=None):
     # Food/Beverage flow sequences
     builder.add_edge("recipe_search", "enhanced_medichat_call")
     builder.add_edge("beverage_search", "enhanced_medichat_call")  # ⭐ BEVERAGE → MEDICHAT
+    builder.add_edge("parallel_tool_runner", "enhanced_medichat_call")  # ⭐ PARALLEL → MEDICHAT
     builder.add_edge("enhanced_medichat_call", "product_search")
     builder.add_edge("product_search", "enhanced_response_cleanup")
     

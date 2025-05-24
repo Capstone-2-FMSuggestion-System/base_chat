@@ -135,18 +135,28 @@ async def call_gemini_api_batch_classification_async(products_batch: list[dict],
         product_list_str += f'{i+1}. ID: {safe_id}, Tên: {safe_name}\n'
 
     prompt = f"""
-Bạn được cung cấp một danh sách các sản phẩm. Với mỗi sản phẩm, hãy xác định xem nó có phải là một loại đồ uống (beverage) HOẶC một sản phẩm dùng để pha chế trực tiếp thành đồ uống không (ví dụ: bột cà phê, trà túi lọc, sữa đặc).
+Bạn được cung cấp một danh sách các sản phẩm. Hãy phân loại CHỈ những sản phẩm thực sự là ĐỒ UỐNG hoặc NGUYÊN LIỆU CHÍNH để pha chế đồ uống.
+
+⭐ CHỈ CHỌN CÁC SẢN PHẨM SAU:
+- ĐỒ UỐNG SẴN SÀNG: nước giải khát, trà, cà phê pha sẵn, sữa, nước ép, sinh tố, bia, rượu vang, nước lọc
+- NGUYÊN LIỆU PHA CHẾ CHÍNH: bột cà phê, trà túi lọc, trà lá, siro pha chế, sữa đặc, bột cacao, matcha, coffee bean
+
+⭐ TUYỆT ĐỐI KHÔNG CHỌN:
+- Gia vị nấu ăn: nước màu dừa, nước tương, dấm, muối
+- Thực phẩm khô: bánh kẹo, snack, mì tôm
+- Đường phèn (trừ khi có bối cảnh "Trà đường phèn" hoặc đồ uống cụ thể)
+- Nguyên liệu nấu ăn khác: hành tây, tỏi, gia vị
 
 Danh sách sản phẩm:
 {product_list_str}
 
-Hãy xem xét kỹ từng sản phẩm.
-Chỉ trả về một danh sách JSON chứa các sản phẩm được xác định là đồ uống.
-Mỗi đối tượng trong danh sách JSON phải có hai trường: "product_id" và "product_name".
-Giá trị của "product_id" phải khớp chính xác với ID được cung cấp trong danh sách đầu vào.
-Giá trị của "product_name" phải khớp chính xác với Tên được cung cấp trong danh sách đầu vào.
+⚠️ YÊU CẦU QUAN TRỌNG:
+1. Mỗi product_id trong danh sách JSON trả về phải là DUY NHẤT - KHÔNG lặp lại sản phẩm
+2. Chỉ trả về JSON array format chính xác
+3. Mỗi object phải có đúng 2 trường: "product_id" và "product_name"
+4. ID và name phải khớp chính xác với input
 
-Ví dụ định dạng JSON đầu ra mong muốn (nếu sản phẩm 1 và 3 là đồ uống):
+Ví dụ format JSON (nếu sản phẩm 1 và 3 là đồ uống):
 [
   {{
     "product_id": "ID_SAN_PHAM_1",
@@ -158,8 +168,8 @@ Ví dụ định dạng JSON đầu ra mong muốn (nếu sản phẩm 1 và 3 l
   }}
 ]
 
-Nếu không có sản phẩm nào là đồ uống, hãy trả về một danh sách JSON rỗng: [].
-Chỉ trả về danh sách JSON. Không thêm bất kỳ giải thích nào khác.
+Nếu không có đồ uống nào: []
+CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH THÊM.
 """
     task_desc = f"Phân loại lô {len(products_batch)} sản phẩm (async)"
 
@@ -233,6 +243,11 @@ Chỉ trả về danh sách JSON. Không thêm bất kỳ giải thích nào kh�
                             if product_id in original_ids:
                                 valid_drinks.append(drink)
                                 seen_product_ids.add(product_id)
+                                
+                                # Break sớm nếu đã đủ số lượng sản phẩm đầu vào
+                                if len(valid_drinks) >= len(products_batch):
+                                    logger.info(f"Đã xử lý đủ {len(products_batch)} sản phẩm, dừng để tránh hallucination")
+                                    break
                             else:
                                 logger.warning(f"Gemini trả về product_id '{product_id}' không có trong lô sản phẩm gốc. Bỏ qua.")
                         else:
@@ -242,8 +257,16 @@ Chỉ trả về danh sách JSON. Không thêm bất kỳ giải thích nào kh�
                         logger.warning(f"Gemini trả về {len(classified_drinks)} items nhưng chỉ có {len(products_batch)} sản phẩm trong lô. "
                                        f"Có thể có hallucination.")
                     
-                    logger.info(f"✅ {task_desc}: Thành công phân loại được {len(valid_drinks)} đồ uống từ {len(products_batch)} sản phẩm")
-                    return valid_drinks
+                    # Lọc lần cuối để đảm bảo không có duplicate
+                    final_unique_drinks = []
+                    final_seen_ids = set()
+                    for drink_item in valid_drinks:
+                        if drink_item['product_id'] not in final_seen_ids:
+                            final_unique_drinks.append(drink_item)
+                            final_seen_ids.add(drink_item['product_id'])
+                    
+                    logger.info(f"✅ {task_desc}: Thành công phân loại được {len(final_unique_drinks)} đồ uống từ {len(products_batch)} sản phẩm")
+                    return final_unique_drinks
                     
                 except json.JSONDecodeError as e:
                     logger.error(f"Lỗi giải mã JSON từ Gemini ({task_desc}): {e}. Response: {json_str}")

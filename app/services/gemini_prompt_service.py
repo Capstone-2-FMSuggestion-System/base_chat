@@ -719,8 +719,12 @@ HÃY TRẢ VỀ KẾT QUẢ DƯỚI DẠNG MỘT ĐỐI TƯỢNG JSON DUY NHẤT
                                 "- Cân bằng dinh dưỡng cơ bản: Có đủ các nhóm chất dinh dưỡng thiết yếu\n" \
                                 "- Ít gây dị ứng phổ biến: Tránh các thành phần dễ gây dị ứng như hải sản, đậu phộng\n" \
                                 "- Dễ chế biến/dễ tìm: Nguyên liệu dễ kiếm, cách làm không quá phức tạp\n" \
-                                "Prompt cho Medichat phải yêu cầu Medichat KHÔNG HỎI THÊM mà đưa ra gợi ý trực tiếp.\n" \
-                                "Nếu có recipes trong `recipe_section` hoặc beverages trong `beverage_section` phù hợp với các tiêu chí chung này, hãy ưu tiên tạo prompt hướng Medichat sử dụng chúng."
+                                "Prompt cho Medichat phải yêu cầu Medichat KHÔNG HỎI THÊM mà đưa ra gợi ý trực tiếp.\n\n" \
+                                "🎯 YÊU CẦU ƯU TIÊN SỬ DỤNG DỮ LIỆU TỪ DATABASE:\n" \
+                                "Nếu có danh sách món ăn (recipe_section) hoặc đồ uống (beverage_section) được cung cấp, " \
+                                "hãy YÊU CẦU MEDICHAT ƯU TIÊN xem xét và lựa chọn từ danh sách này trước khi gợi ý các món/đồ uống khác, " \
+                                "miễn là chúng phù hợp với các tiêu chí gợi ý chung (phổ biến, đa dạng, cân bằng, ít dị ứng, dễ làm). " \
+                                "Prompt cho Medichat cần nhấn mạnh việc sử dụng dữ liệu có sẵn này làm ưu tiên số 1."
         
         # Tạo prompt cho Gemini
         prompt = f""""Bạn là một trợ lý y tế thông minh, chuyên tóm tắt thông tin từ cuộc trò chuyện để tạo ra một prompt ngắn gọn, súc tích và đầy đủ thông tin nhất cho mô hình AI y tế chuyên sâu Medichat-LLaMA3-8B.
@@ -744,14 +748,19 @@ YÊU CẦU TẠO PROMPT CHO MEDICHAT:
 + Nếu gợi ý chung: "Tôi cần gợi ý món ăn/đồ uống [dựa trên tiêu chí từ general_instruction]. Xin đưa ra 2-3 lựa chọn cụ thể."
 
 3. XỬ LÝ CÔNG THỨC MÓN ĂN/ĐỒ UỐNG:
-- Nếu `recipe_section` hoặc `beverage_section` có dữ liệu VÀ KHÔNG phải trường hợp suggest_general=true (tức người dùng có yêu cầu cụ thể):
-  + Tạo prompt hướng dẫn Medichat ƯU TIÊN sử dụng các món ăn từ `recipe_section` và/hoặc đồ uống từ `beverage_section` nếu chúng phù hợp với yêu cầu cụ thể của người dùng
-  + Yêu cầu Medichat kết hợp kiến thức của nó để giải thích tại sao món đó phù hợp hoặc điều chỉnh (ví dụ: giảm gia vị, thay thế nguyên liệu) nếu cần
-  + Nếu không có món nào trong database hoàn toàn phù hợp, yêu cầu Medichat gợi ý món khác dựa trên kiến thức của nó
-- Nếu suggest_general=true VÀ có dữ liệu từ database:
-  + Hướng dẫn Medichat xem xét các món trong `recipe_section` và `beverage_section` để đánh giá xem có món nào phù hợp với tiêu chí chung không
-  + Ưu tiên những món từ database nếu chúng đáp ứng tiêu chí: phổ biến, cân bằng dinh dưỡng, ít dị ứng, dễ làm
-  + Nếu người dùng yêu cầu cả món ăn và đồ uống, hãy tạo prompt yêu cầu Medichat đưa ra gợi ý kết hợp từ `recipe_section` cho món ăn và từ `beverage_section` cho đồ uống, đảm bảo sự hài hòa và phù hợp với yêu cầu/tình trạng sức khỏe
+- Khi suggest_general=True VÀ có recipe_section hoặc beverage_section:
+  + Hướng dẫn Medichat xem xét kỹ các món ăn trong recipe_section và đồ uống trong beverage_section
+  + Yêu cầu Medichat CHỌN LỌC và gợi ý 2-3 items từ danh sách này nếu chúng đáp ứng các tiêu chí chung (phổ biến, cân bằng dinh dưỡng, ít dị ứng, dễ làm)
+  + Nếu không có đủ lựa chọn phù hợp từ danh sách, Medichat có thể bổ sung bằng kiến thức của mình
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi muốn vài gợi ý đồ uống giải nhiệt, ngọt ngào, phổ biến và dễ làm. Bạn có thể xem xét danh sách đồ uống sau đây (nếu có) và chọn ra 2-3 loại phù hợp nhất không: [Nước ép A (ID: B1), Trà B (ID: B2), Sinh tố C (ID: B3)]? Nếu không có gì phù hợp, xin hãy gợi ý các loại khác."
+
+- Khi KHÔNG phải suggest_general=True (người dùng có yêu cầu cụ thể) VÀ có recipe_section hoặc beverage_section:
+  + Tạo prompt hướng dẫn Medichat ƯU TIÊN SỬ DỤNG các món ăn từ recipe_section và/hoặc đồ uống từ beverage_section nếu chúng phù hợp với yêu cầu CỤ THỂ của người dùng (về tình trạng sức khỏe, sở thích đã được collected_info ghi nhận)
+  + Yêu cầu Medichat giải thích tại sao chúng phù hợp. Nếu cần, Medichat có thể điều chỉnh (ví dụ: giảm gia vị) hoặc gợi ý món/đồ uống khác nếu danh sách cung cấp không có gì phù hợp
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi bị tiểu đường và muốn một món canh ít đường. Trong danh sách món ăn này: [Canh X (ID: R1), Canh Y (ID: R2)], món nào phù hợp hơn cho tôi? Xin giải thích. Hoặc bạn có gợi ý nào khác không?"
+
+- Khi có cả món ăn và đồ uống từ database:
+  + Tạo prompt yêu cầu Medichat đưa ra gợi ý kết hợp từ recipe_section cho món ăn và từ beverage_section cho đồ uống, đảm bảo sự hài hòa và phù hợp với yêu cầu/tình trạng sức khỏe
 
 4. Giới hạn:
 - TOÀN BỘ prompt kết quả CHO MEDICHAT PHẢI DƯỚI {word_limit} TỪ.
@@ -1063,7 +1072,8 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
     async def create_product_search_prompt(self, medichat_response: str, recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None) -> str:
         """
         Tạo prompt cho product_find_tool từ phản hồi medichat, recipes và beverages.
-        Gemini sẽ đóng vai trò Kỹ sư AI Tối ưu hóa Prompt để trích xuất thông tin một cách chính xác.
+        Gemini sẽ đóng vai trò Kỹ sư AI Trích xuất Thông tin Chính xác để tập trung vào 
+        gợi ý cuối cùng của Medichat và phân biệt rõ món ăn/đồ uống.
         
         Args:
             medichat_response: Phản hồi từ medichat
@@ -1074,22 +1084,44 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
             Query string tự nhiên để tìm sản phẩm/nguyên liệu
         """
         if not self.api_key:
-            # Fallback được cải thiện cho cả recipes và beverages
+            # Fallback được cải thiện - tập trung vào phân tích medichat_response trước
             ingredients = []
             dish_names = []
             beverage_names = []
             
+            # Trích xuất từ medichat_response trước (tập trung vào gợi ý cuối cùng)
+            response_lower = medichat_response.lower()
+            
+            # Tìm kiếm tên món ăn cụ thể từ recipes trong medichat_response
             if recipes:
                 for recipe in recipes[:3]:
-                    if 'name' in recipe:
-                        dish_names.append(recipe['name'])
-                    if 'ingredients_summary' in recipe:
-                        ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+                    recipe_name = recipe.get('name', '')
+                    if recipe_name and recipe_name.lower() in response_lower:
+                        dish_names.append(recipe_name)
+                        # Lấy nguyên liệu chi tiết từ recipes
+                        if 'ingredients_summary' in recipe:
+                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
             
+            # Tìm kiếm tên đồ uống từ beverages trong medichat_response
             if beverages:
                 for beverage in beverages[:3]:
-                    if 'product_name' in beverage:
-                        beverage_names.append(beverage['product_name'])
+                    beverage_name = beverage.get('product_name', '')
+                    if beverage_name and beverage_name.lower() in response_lower:
+                        beverage_names.append(beverage_name)
+            
+            # Nếu không tìm thấy tên món cụ thể, lấy từ recipes/beverages làm fallback
+            if not dish_names and not beverage_names:
+                if recipes:
+                    for recipe in recipes[:2]:
+                        if 'name' in recipe:
+                            dish_names.append(recipe['name'])
+                        if 'ingredients_summary' in recipe:
+                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+                
+                if beverages:
+                    for beverage in beverages[:2]:
+                        if 'product_name' in beverage:
+                            beverage_names.append(beverage['product_name'])
             
             unique_ingredients = list(set(ingredients))[:15]
             all_items = dish_names + beverage_names
@@ -1101,13 +1133,13 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
             elif unique_ingredients:
                 return f"Tôi cần mua các nguyên liệu sau: {', '.join(unique_ingredients)}."
             
-            # Fallback từ medichat_response
-            if "món" in medichat_response.lower() or "nguyên liệu" in medichat_response.lower():
+            # Fallback từ medichat_response với phân tích đơn giản
+            if "món" in response_lower or "nguyên liệu" in response_lower:
                 return "Tôi cần mua các nguyên liệu chính từ các món ăn đã được gợi ý."
             
             return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
 
-        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TỐI ƯU HÓA PROMPT VÀ TÍCH HỢP TOOL cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ.
+        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TRÍCH XUẤT THÔNG TIN CHÍNH XÁC cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ.
 
 ### ĐÁNH GIÁ NGUỒN DỮ LIỆU:
 
@@ -1124,49 +1156,61 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
 
 ### QUY TRÌNH TRÍCH XUẤT CHUYÊN NGHIỆP:
 
-**BƯỚC 1: XÁC ĐỊNH MÓN ĂN/ĐỒ UỐNG CHÍNH**
-- Đọc kỹ phản hồi của Medichat để xác định TÊN CÁC MÓN ĂN HOẶC ĐỒ UỐNG được gợi ý
-- Nếu Medichat đề cập đến các món trong danh sách `recipes`, ưu tiên ghi nhận chúng
-- Giới hạn tối đa 3-4 món nổi bật nhất để tránh phân tán
+🎯 **QUAN TRỌNG - TAPPING VÀO GỢI Ý CUỐI CÙNG:**
+Chỉ trích xuất nguyên liệu cho những món ăn và đồ uống mà Medichat thực sự GỢI Ý CHO NGƯỜI DÙNG trong phần KẾT LUẬN hoặc PHẦN GỢI Ý CHÍNH của phản hồi. Bỏ qua các nguyên liệu được nhắc đến trong quá trình phân tích hoặc so sánh nếu chúng không phải là gợi ý cuối cùng.
 
-**BƯỚC 2: TRÍCH XUẤT NGUYÊN LIỆU CHI TIẾT**
-- Từ phản hồi Medichat: Thu thập tất cả nguyên liệu được đề cập trực tiếp
-- Từ `recipes` (nếu Medichat tham chiếu): Lấy nguyên liệu từ các món ăn được Medichat nhắc đến
-- Từ `beverages` (nếu Medichat tham chiếu): Lấy thành phần chính từ các đồ uống được Medichat nhắc đến
-- Kết hợp tất cả nguồn để có danh sách đầy đủ nhất
+**BƯỚC 1: XÁC ĐỊNH MÓN ĂN/ĐỒ UỐNG ĐƯỢC GỢI Ý CUỐI CÙNG**
+- Đọc kỹ phần KẾT LUẬN/GỢI Ý CHÍNH của Medichat (thường ở cuối phản hồi hoặc có từ khóa như "gợi ý", "nên thử", "có thể làm")
+- Phân biệt rõ ràng: Nếu Medichat gợi ý cả món ăn và đồ uống, hãy cố gắng tách biệt (nếu có thể) trong suy nghĩ của bạn, nhưng danh sách combined_unique_ingredients cuối cùng vẫn là tổng hợp
+- Giới hạn tối đa 3-4 món được gợi ý thực sự để tránh phân tán
 
-**BƯỚC 3: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
-- **Loại bỏ nguyên liệu quá chung chung:** "gia vị tổng hợp", "nước lọc", "dầu ăn thường" (trừ khi chỉ định cụ thể như "dầu oliu", "muối biển")
+**BƯỚC 2: THAM CHIẾU RECIPES VÀ BEVERAGES MỘT CÁCH CẨN THẬN**
+- Nếu Medichat đề cập đến một món ăn cụ thể có ID trong recipes đã cung cấp, hãy ưu tiên lấy danh sách nguyên liệu chi tiết từ recipes đó cho món ăn đó
+- Tương tự với beverages: Nếu Medichat gợi ý đồ uống có trong danh sách beverages, tham chiếu đến thông tin chi tiết
+- Nếu Medichat chỉ gợi ý tên chung (ví dụ: "nước ép cam") mà không có ID cụ thể, trích xuất nguyên liệu cơ bản từ kiến thức thông thường
+
+**BƯỚC 3: TRÍCH XUẤT VÀ PHÂN LOẠI NGUYÊN LIỆU**
+- Từ phản hồi Medichat: Thu thập nguyên liệu được đề cập trực tiếp trong phần gợi ý
+- Từ `recipes` (nếu Medichat tham chiếu): Lấy nguyên liệu từ các món ăn được Medichat GỢI Ý
+- Từ `beverages` (nếu Medichat tham chiếu): Lấy thành phần chính từ các đồ uống được Medichat GỢI Ý
+- Phân biệt: food ingredients vs beverage ingredients trong quá trình tư duy nhưng kết hợp trong kết quả cuối
+
+**BƯỚC 4: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
+- **Loại bỏ nguyên liệu quá chung chung:** "gia vị", "nước lọc", "dầu ăn" (trừ khi cụ thể như "dầu oliu", "muối hạt")
 - **Chuẩn hóa tên gọi:** 
   + "Hành cây", "Hành lá" → "Hành lá"
-  + "Thịt heo ba rọi", "Ba chỉ" → "Thịt ba chỉ"
+  + "Thịt heo ba rọi", "Ba chỉ" → "Thịt ba chỉ" 
   + "Cà chua bi", "Cà chua" → "Cà chua"
-  + "Mỡ hành", "Hành khô" → "Hành khô"
 - **Tạo danh sách duy nhất:** Loại bỏ trùng lặp, giữ tối đa 15-20 nguyên liệu quan trọng nhất
 
-**BƯỚC 4: TẠO YÊU CẦU MUA SẮM TỰ NHIÊN**
-Dựa trên thông tin đã trích xuất, tạo một đoạn văn bản ngắn gọn (1-2 câu) để người dùng có thể sử dụng khi mua sắm.
+### CẤU TRÚC JSON TRUNG GIAN MONG MUỐN:
 
-### CẤU TRÚC YÊU CẦU MUA SẮM MONG MUỐN:
+Trước khi tạo query string, hãy tạo một JSON để tổ chức thông tin:
 
-**Trường hợp có món ăn cụ thể:**
-"Tôi cần mua nguyên liệu để nấu [tên món 1] và [tên món 2], bao gồm: [danh sách nguyên liệu đã chuẩn hóa]."
+```json
+{{
+  "suggested_items": [
+    {{"item_name": "Canh chua cá lóc", "type": "food", "ingredients": ["cá lóc", "me", "cà chua", "dứa"]}},
+    {{"item_name": "Nước ép dưa hấu", "type": "beverage", "ingredients": ["dưa hấu", "đường (tùy chọn)"]}}
+  ],
+  "combined_unique_ingredients_for_shopping": ["cá lóc", "me", "cà chua", "dứa", "dưa hấu", "đường"]
+}}
+```
 
-**Trường hợp chỉ có nguyên liệu:**
-"Tôi cần mua các nguyên liệu sau: [danh sách nguyên liệu đã chuẩn hóa]."
+**BƯỚC 5: TẠO QUERY MUA SẮM TỰ NHIÊN**
+Dựa trên combined_unique_ingredients_for_shopping và suggested_items, hãy tạo một YÊU CẦU MUA SẮM tự nhiên, ngắn gọn.
 
-### VÍ DỤ MINH HỌA:
+### VÍ DỤ HOÀN CHỈNH:
 
-**Input mẫu:**
-- Medichat response: "Bạn có thể thử làm canh chua cá lóc và uống nước ép cam tươi để bổ sung vitamin C. Canh chua cần có cá lóc, me, cà chua, dứa. Nước ép cam tốt nhất là từ cam tươi."
+**Input:**
+- Medichat: "Tôi gợi ý bạn làm canh chua cá lóc và uống nước ép dưa hấu. Canh chua giúp giải nhiệt với cá lóc, me, cà chua. Dưa hấu rất tốt để bù nước."
 - Recipes: [{{"name": "Canh chua cá lóc", "ingredients_summary": "cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ"}}]
-- Beverages: [{{"product_name": "Nước ép cam tươi 200ml"}}]
 
 **Output mong đợi:**
-"Tôi cần mua nguyên liệu để nấu canh chua cá lóc và làm nước ép cam tươi, bao gồm: cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ, cam tươi."
+"Tôi cần mua nguyên liệu để nấu Canh chua cá lóc và làm Nước ép dưa hấu, bao gồm: cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ, dưa hấu."
 
 ### YÊU CẦU CUỐI CÙNG:
-CHỈ TRẢ VỀ ĐOẠN VĂN BẢN YÊU CẦU MUA SẮM NGẮN GỌN (1-2 CÂU). KHÔNG TRẢ VỀ JSON, KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG THÊM METADATA.
+CHỈ TRẢ VỀ ĐOẠN VĂN BẢN YÊU CẦU MUA SẮM NGẮN GỌN (1-2 CÂU). KHÔNG TRẢ VỀ JSON TRUNG GIAN, KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG THÊM METADATA.
 
 YÊU CẦU MUA SẮM:"""
 
@@ -1188,7 +1232,9 @@ YÊU CẦU MUA SẮM:"""
                 "YÊU CẦU MUA SẮM:",
                 "Đoạn văn bản:",
                 "Kết quả:",
-                "Output:"
+                "Output:",
+                "Query mua sắm:",
+                "Yêu cầu mua sắm:"
             ]
             
             for prefix in prefixes_to_remove:
@@ -1204,27 +1250,49 @@ YÊU CẦU MUA SẮM:"""
                 else:
                     product_query = product_query[:300] + '...'
             
-            logger.info(f"Đã tạo product search query ({len(product_query)} ký tự): {product_query}")
+            logger.info(f"Đã tạo enhanced product search query ({len(product_query)} ký tự): {product_query}")
             return product_query
                 
         except Exception as e:
             logger.error(f"Lỗi khi tạo product search prompt: {str(e)}")
-            # Fallback nâng cao hơn cho cả recipes và beverages
+            # Enhanced fallback tương tự như trong phần API key bị thiếu
             ingredients = []
             dish_names = []
             beverage_names = []
             
+            # Trích xuất từ medichat_response trước (tập trung vào gợi ý cuối cùng)
+            response_lower = medichat_response.lower()
+            
+            # Tìm kiếm tên món ăn cụ thể từ recipes trong medichat_response
             if recipes:
                 for recipe in recipes[:3]:
-                    if 'name' in recipe:
-                        dish_names.append(recipe['name'])
-                    if 'ingredients_summary' in recipe:
-                        ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+                    recipe_name = recipe.get('name', '')
+                    if recipe_name and recipe_name.lower() in response_lower:
+                        dish_names.append(recipe_name)
+                        # Lấy nguyên liệu chi tiết từ recipes
+                        if 'ingredients_summary' in recipe:
+                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
             
+            # Tìm kiếm tên đồ uống từ beverages trong medichat_response
             if beverages:
                 for beverage in beverages[:3]:
-                    if 'product_name' in beverage:
-                        beverage_names.append(beverage['product_name'])
+                    beverage_name = beverage.get('product_name', '')
+                    if beverage_name and beverage_name.lower() in response_lower:
+                        beverage_names.append(beverage_name)
+            
+            # Nếu không tìm thấy tên món cụ thể, lấy từ recipes/beverages làm fallback
+            if not dish_names and not beverage_names:
+                if recipes:
+                    for recipe in recipes[:2]:
+                        if 'name' in recipe:
+                            dish_names.append(recipe['name'])
+                        if 'ingredients_summary' in recipe:
+                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+                
+                if beverages:
+                    for beverage in beverages[:2]:
+                        if 'product_name' in beverage:
+                            beverage_names.append(beverage['product_name'])
             
             unique_ingredients = list(set(ingredients))[:15]
             all_items = dish_names + beverage_names
@@ -1237,7 +1305,7 @@ YÊU CẦU MUA SẮM:"""
                 return f"Tôi cần mua các nguyên liệu sau: {', '.join(unique_ingredients)}."
             
             # Fallback cuối cùng với thông tin từ medichat_response
-            if "món" in medichat_response.lower() or "nguyên liệu" in medichat_response.lower():
+            if "món" in response_lower or "nguyên liệu" in response_lower:
                 return "Tôi cần mua các nguyên liệu chính từ các món ăn đã được gợi ý."
             
             return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
