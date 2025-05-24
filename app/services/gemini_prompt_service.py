@@ -1072,8 +1072,8 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
     async def create_product_search_prompt(self, medichat_response: str, recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None) -> str:
         """
         Tạo prompt cho product_find_tool từ phản hồi medichat, recipes và beverages.
-        Gemini sẽ đóng vai trò Kỹ sư AI Trích xuất Thông tin Chính xác để tập trung vào 
-        gợi ý cuối cùng của Medichat và phân biệt rõ món ăn/đồ uống.
+        Gemini sẽ đóng vai trò Kỹ sư AI Trích xuất Thông tin Chính xác để tập trung VÀO 
+        GỢI Ý CUỐI CÙNG của Medichat và phân biệt rõ món ăn/đồ uống.
         
         Args:
             medichat_response: Phản hồi từ medichat
@@ -1081,7 +1081,7 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
             beverages: Danh sách beverages mà Medichat có thể đã tham khảo (nếu có)
             
         Returns:
-            Query string tự nhiên để tìm sản phẩm/nguyên liệu
+            Query string tự nhiên để tìm sản phẩm/nguyên liệu CHỈ cho gợi ý cuối cùng
         """
         if not self.api_key:
             # Fallback được cải thiện - tập trung vào phân tích medichat_response trước
@@ -1139,7 +1139,7 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
             
             return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
 
-        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TRÍCH XUẤT THÔNG TIN CHÍNH XÁC cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ.
+        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TRÍCH XUẤT THÔNG TIN CHÍNH XÁC cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ CHỈ CHO CÁC GỢI Ý CUỐI CÙNG.
 
 ### ĐÁNH GIÁ NGUỒN DỮ LIỆU:
 
@@ -1156,23 +1156,36 @@ CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
 
 ### QUY TRÌNH TRÍCH XUẤT CHUYÊN NGHIỆP:
 
-🎯 **QUAN TRỌNG - TAPPING VÀO GỢI Ý CUỐI CÙNG:**
-Chỉ trích xuất nguyên liệu cho những món ăn và đồ uống mà Medichat thực sự GỢI Ý CHO NGƯỜI DÙNG trong phần KẾT LUẬN hoặc PHẦN GỢI Ý CHÍNH của phản hồi. Bỏ qua các nguyên liệu được nhắc đến trong quá trình phân tích hoặc so sánh nếu chúng không phải là gợi ý cuối cùng.
+🎯 **QUAN TRỌNG NHẤT - TẬP TRUNG VÀO GỢI Ý CUỐI CÙNG:**
+
+RÀ SOÁT KỸ PHẢN HỒI CỦA MEDICHAT. CHỈ XEM XÉT NHỮNG MÓN ĂN VÀ ĐỒ UỐNG MÀ MEDICHAT KHUYẾN NGHỊ TRỰC TIẾP CHO NGƯỜI DÙNG Ở PHẦN KẾT LUẬN HOẶC PHẦN GỢI Ý CHÍNH. 
+
+**CÁC TRƯỜNG HỢP CỤ THỂ:**
+- Nếu Medichat liệt kê nhiều lựa chọn rồi chốt lại 2-3 món cuối cùng → CHỈ lấy nguyên liệu cho 2-3 món đó
+- Nếu Medichat nói "Tôi gợi ý bạn làm..." hoặc "Tôi khuyên bạn nên..." → CHỈ lấy nguyên liệu từ những món này
+- Nếu Medichat dùng từ "nên thử", "có thể làm", "phù hợp nhất" → CHỈ lấy nguyên liệu từ những món này
+
+**BỎ QUA HOÀN TOÀN:**
+- Các nguyên liệu/món ăn/đồ uống được nhắc đến trong quá trình so sánh, giải thích chung
+- Các ví dụ minh họa mà Medichat không khuyến nghị trực tiếp
+- Các nguyên liệu được đề cập trong phần phân tích hoặc lý thuyết nhưng không phải lựa chọn cuối cùng
 
 **BƯỚC 1: XÁC ĐỊNH MÓN ĂN/ĐỒ UỐNG ĐƯỢC GỢI Ý CUỐI CÙNG**
-- Đọc kỹ phần KẾT LUẬN/GỢI Ý CHÍNH của Medichat (thường ở cuối phản hồi hoặc có từ khóa như "gợi ý", "nên thử", "có thể làm")
-- Phân biệt rõ ràng: Nếu Medichat gợi ý cả món ăn và đồ uống, hãy cố gắng tách biệt (nếu có thể) trong suy nghĩ của bạn, nhưng danh sách combined_unique_ingredients cuối cùng vẫn là tổng hợp
+- Tìm các cụm từ chìa khóa: "gợi ý", "khuyên", "nên thử", "phù hợp nhất", "tôi đề xuất"
+- Đọc kỹ phần KẾT LUẬN/GỢI Ý CHÍNH của Medichat (thường ở cuối phản hồi)
+- Phân biệt rõ ràng: Đánh dấu từng item với type "food" hoặc "beverage"
 - Giới hạn tối đa 3-4 món được gợi ý thực sự để tránh phân tán
 
 **BƯỚC 2: THAM CHIẾU RECIPES VÀ BEVERAGES MỘT CÁCH CẨN THẬN**
+- CHỈ sử dụng thông tin từ recipes/beverages nếu Medichat THỰC SỰ GỢI Ý những món đó
 - Nếu Medichat đề cập đến một món ăn cụ thể có ID trong recipes đã cung cấp, hãy ưu tiên lấy danh sách nguyên liệu chi tiết từ recipes đó cho món ăn đó
-- Tương tự với beverages: Nếu Medichat gợi ý đồ uống có trong danh sách beverages, tham chiếu đến thông tin chi tiết
+- Tương tự với beverages: CHỈ khi Medichat GỢI Ý đồ uống đó trong phần kết luận
 - Nếu Medichat chỉ gợi ý tên chung (ví dụ: "nước ép cam") mà không có ID cụ thể, trích xuất nguyên liệu cơ bản từ kiến thức thông thường
 
 **BƯỚC 3: TRÍCH XUẤT VÀ PHÂN LOẠI NGUYÊN LIỆU**
-- Từ phản hồi Medichat: Thu thập nguyên liệu được đề cập trực tiếp trong phần gợi ý
-- Từ `recipes` (nếu Medichat tham chiếu): Lấy nguyên liệu từ các món ăn được Medichat GỢI Ý
-- Từ `beverages` (nếu Medichat tham chiếu): Lấy thành phần chính từ các đồ uống được Medichat GỢI Ý
+- Từ phản hồi Medichat: Thu thập nguyên liệu được đề cập trực tiếp trong phần gợi ý cuối cùng
+- Từ `recipes` (nếu Medichat tham chiếu): CHỈ lấy nguyên liệu từ các món ăn được Medichat GỢI Ý CUỐI CÙNG
+- Từ `beverages` (nếu Medichat tham chiếu): CHỈ lấy thành phần chính từ các đồ uống được Medichat GỢI Ý CUỐI CÙNG
 - Phân biệt: food ingredients vs beverage ingredients trong quá trình tư duy nhưng kết hợp trong kết quả cuối
 
 **BƯỚC 4: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
@@ -1185,7 +1198,7 @@ Chỉ trích xuất nguyên liệu cho những món ăn và đồ uống mà Med
 
 ### CẤU TRÚC JSON TRUNG GIAN MONG MUỐN:
 
-Trước khi tạo query string, hãy tạo một JSON để tổ chức thông tin:
+Trước khi tạo query string, hãy tạo một JSON để tổ chức thông tin (chỉ suy nghĩ trong đầu, không xuất ra):
 
 ```json
 {{
@@ -1250,7 +1263,7 @@ YÊU CẦU MUA SẮM:"""
                 else:
                     product_query = product_query[:300] + '...'
             
-            logger.info(f"Đã tạo enhanced product search query ({len(product_query)} ký tự): {product_query}")
+            logger.info(f"Đã tạo FOCUSED product search query cho gợi ý cuối cùng ({len(product_query)} ký tự): {product_query}")
             return product_query
                 
         except Exception as e:

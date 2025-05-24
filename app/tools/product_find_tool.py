@@ -242,7 +242,7 @@ async def find_product_for_ingredient_async(pinecone_index, embeddings_model, in
     Chỉ trả về đối tượng JSON.
     """
     
-    logger.info(f"Gửi yêu cầu chọn sản phẩm cho nguyên liệu '{ingredient_name}' đến Gemini...")
+    # Gọi Gemini để chọn sản phẩm (logging đã có trong process_single_ingredient_with_semaphore)
     response_text = await call_gemini_api_generic_async(prompt_for_selection, f"Chọn sản phẩm cho '{ingredient_name}'")
     
     try:
@@ -301,8 +301,13 @@ async def process_user_request_async(user_request_text: str) -> dict:
     
     async def process_single_ingredient_with_semaphore(ingredient_name: str):
         async with semaphore:
-            logger.info(f"Đang tìm sản phẩm cho nguyên liệu: '{ingredient_name}'...")
+            logger.info(f"🔄 BẮT ĐẦU xử lý '{ingredient_name}' (semaphore acquired)...")
+            start_time = asyncio.get_event_loop().time()
+            
             product_id, product_name = await find_product_for_ingredient_async(pinecone_index, embeddings_model, ingredient_name)
+            
+            end_time = asyncio.get_event_loop().time()
+            elapsed = end_time - start_time
             
             if product_id:
                 result = {
@@ -311,7 +316,7 @@ async def process_user_request_async(user_request_text: str) -> dict:
                     "product_name": product_name,
                     "status": "Đã tìm thấy sản phẩm"
                 }
-                logger.info(f"✅ Tìm thấy sản phẩm ID: {product_id}, Tên: {product_name} cho nguyên liệu '{ingredient_name}'")
+                logger.info(f"✅ KẾT THÚC xử lý '{ingredient_name}': Tìm thấy sản phẩm ID: {product_id}, Tên: {product_name} ({elapsed:.2f}s)")
             else:
                 result = {
                     "requested_ingredient": ingredient_name,
@@ -319,12 +324,19 @@ async def process_user_request_async(user_request_text: str) -> dict:
                     "product_name": None,
                     "status": "Không tìm thấy sản phẩm phù hợp"
                 }
-                logger.info(f"❌ Không tìm thấy sản phẩm phù hợp cho nguyên liệu: '{ingredient_name}'")
+                logger.info(f"❌ KẾT THÚC xử lý '{ingredient_name}': Không tìm thấy sản phẩm phù hợp ({elapsed:.2f}s)")
             
             return result
 
-    tasks = [process_single_ingredient_with_semaphore(ingredient) for ingredient in requested_ingredients]
-    logger.info(f"🔄 Bắt đầu xử lý {len(tasks)} nguyên liệu với concurrency tối đa {MAX_CONCURRENT_GEMINI_PRODUCT_CALLS}")
+    # Log chuẩn bị cho tất cả nguyên liệu trước khi tạo tasks
+    logger.info(f"🛒 CHUẨN BỊ tìm sản phẩm cho {len(requested_ingredients)} nguyên liệu: {', '.join(requested_ingredients)}")
+    
+    # Tạo tasks mà không log từng nguyên liệu riêng lẻ
+    tasks = []
+    for ingredient in requested_ingredients:
+        tasks.append(process_single_ingredient_with_semaphore(ingredient))
+    
+    logger.info(f"🚀 Bắt đầu xử lý {len(tasks)} nguyên liệu với concurrency tối đa {MAX_CONCURRENT_GEMINI_PRODUCT_CALLS}")
     
     ingredient_processing_results = await asyncio.gather(*tasks, return_exceptions=True)
     

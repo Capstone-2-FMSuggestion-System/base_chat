@@ -40,7 +40,7 @@ MAX_SAFE_BATCH_SIZE = 80     # Fallback limit nếu dynamic batching fails
 MIN_BATCH_SIZE = 20          # Minimum documents per batch
 
 # ⭐ CONCURRENCY CONTROL: Giới hạn số lượng Gemini API calls đồng thời
-MAX_CONCURRENT_GEMINI_CALLS = 3  # Bắt đầu với 3 calls đồng thời để an toàn
+MAX_CONCURRENT_GEMINI_CALLS = 4  # Bắt đầu với 4 calls đồng thời để an toàn
 
 # Cờ để bật/tắt việc làm sạch văn bản
 SANITIZE_INPUT_TEXT = True
@@ -161,7 +161,7 @@ def init_connections() -> Tuple[Optional[pinecone.Index], Optional[HuggingFaceEm
         raise
 
 def clean_json_response(response_text: str) -> str:
-    """⭐ CẢI THIỆN: Làm sạch response từ Gemini trước khi parse JSON"""
+    """⭐ CẢI THIỆN: Làm sạch response từ Gemini trước khi parse JSON với nhiều fix patterns hơn"""
     try:
         cleaned = response_text.strip()
         
@@ -176,20 +176,100 @@ def clean_json_response(response_text: str) -> str:
             
         cleaned = cleaned.strip()
         
-        # Tìm và sửa một số lỗi JSON phổ biến
-        # Trailing comma trước }
+        # ⭐ CẢI THIỆN: Thêm nhiều pattern fix JSON phổ biến hơn
+        
+        # 1. Trailing comma trước } hoặc ]
         cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
         
-        # Missing quotes cho keys
+        # 2. Missing quotes cho keys (chỉ fix nếu chưa có quotes)
         cleaned = re.sub(r'(\w+):\s*(["\[])', r'"\1": \2', cleaned)
+        
+        # 3. Single quotes thay vì double quotes cho keys và strings
+        cleaned = re.sub(r"'([^']*?)'(\s*:\s*)", r'"\1"\2', cleaned)  # Keys
+        cleaned = re.sub(r':\s*\'([^\']*?)\'', r': "\1"', cleaned)    # String values
+        
+        # 4. Thêm dấu phẩy thiếu giữa objects trong array
+        cleaned = re.sub(r'}\s*{', r'}, {', cleaned)
+        
+        # 5. Loại bỏ control characters có thể gây lỗi JSON
+        cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned)
+        
+        # 6. Fix escaped quotes thừa
+        cleaned = re.sub(r'\\"', '"', cleaned)
+        
+        # 7. Đảm bảo JSON bắt đầu và kết thúc đúng format
+        if not cleaned.startswith('[') and not cleaned.startswith('{'):
+            # Tìm JSON array hoặc object đầu tiên
+            array_match = re.search(r'(\[[\s\S]*\])', cleaned)
+            object_match = re.search(r'(\{[\s\S]*\})', cleaned)
+            
+            if array_match:
+                cleaned = array_match.group(1)
+            elif object_match:
+                cleaned = object_match.group(1)
         
         return cleaned
     except Exception as e:
         logger.warning(f"Lỗi khi clean JSON response: {e}")
         return response_text.strip()
 
+def parse_json_with_fallback(response_text: str) -> dict:
+    """⭐ MỚI: Parse JSON với multiple fallback strategies"""
+    try:
+        cleaned = clean_json_response(response_text)
+        
+        # Thử parse trực tiếp
+        try:
+            result = json.loads(cleaned)
+            return {"success": True, "data": result}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Direct JSON parse failed: {e}")
+        
+        # ⭐ Fallback 1: Tìm và extract JSON object/array từ text
+        json_patterns = [
+            r'\[[\s\S]*?\]',  # JSON array
+            r'\{[\s\S]*?\}',  # JSON object
+        ]
+        
+        for pattern in json_patterns:
+            matches = re.findall(pattern, cleaned)
+            for match in matches:
+                try:
+                    result = json.loads(match)
+                    logger.info("✅ JSON parsed successfully với pattern matching")
+                    return {"success": True, "data": result}
+                except json.JSONDecodeError:
+                    continue
+        
+        # ⭐ Fallback 2: Nếu là object nhưng mong đợi array, extract array từ object
+        try:
+            obj_result = json.loads(cleaned)
+            if isinstance(obj_result, dict):
+                # Tìm key chứa array
+                for key, value in obj_result.items():
+                    if isinstance(value, list):
+                        logger.info(f"✅ Extracted array từ object key: {key}")
+                        return {"success": True, "data": value}
+        except json.JSONDecodeError:
+            pass
+        
+        # ⭐ Fallback 3: Return structured error
+        return {
+            "success": False, 
+            "error": "Invalid JSON from Gemini", 
+            "raw_response": response_text[:500],  # Giới hạn độ dài
+            "cleaned_response": cleaned[:500]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"JSON parsing exception: {str(e)}",
+            "raw_response": response_text[:500]
+        }
+
 async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
-    """⭐ ASYNC VERSION với API KEY ROTATION: Gọi API Gemini với error handling và xoay vòng API keys"""
+    """⭐ ASYNC VERSION với API KEY ROTATION và cải thiện prompt engineering cho JSON"""
     prompt_char_count = len(prompt)
     estimated_tokens = estimate_tokens(prompt)
     
@@ -208,13 +288,12 @@ async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
     for attempt in range(max_retries):
         try:
             # ⭐ CẤU HÌNH GEMINI VỚI KEY HIỆN TẠI VÀ TẠO MODEL MỚI
-            # Điều này đảm bảo mỗi API call sử dụng đúng key được assign
             genai.configure(api_key=current_api_key)
             temp_gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
             
             # ⭐ CHẠY GEMINI TRONG EXECUTOR để không block event loop
             response = await loop.run_in_executor(
-                None,  # Sử dụng default thread pool executor
+                None,
                 lambda: temp_gemini_model.generate_content(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
@@ -225,7 +304,25 @@ async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
             )
             
             if response.parts:
-                return response.text
+                response_text = response.text
+                
+                # ⭐ SỬ DỤNG PARSE_JSON_WITH_FALLBACK
+                parse_result = parse_json_with_fallback(response_text)
+                
+                if parse_result["success"]:
+                    # Trả về JSON string của data đã parse thành công
+                    return json.dumps(parse_result["data"], ensure_ascii=False)
+                else:
+                    # Trả về structured error
+                    logger.error(f"❌ JSON parse failed: {parse_result.get('error')}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"🔄 Retry attempt {attempt + 1}/{max_retries} due to JSON parse error")
+                        await asyncio.sleep(5)
+                        continue
+                    return json.dumps({
+                        "error": parse_result["error"],
+                        "raw_snippet": parse_result.get("raw_response", "")[:200]
+                    })
             else:
                 logger.warning("Gemini không trả về nội dung.")
                 logger.warning(f"Gemini response: {response}")
@@ -237,28 +334,28 @@ async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
             error_str = str(e).lower()
             
             if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
-                retry_delay = 15 + attempt * 10  # Tăng delay
+                retry_delay = 15 + attempt * 10
                 delay_match = re.search(r'retry in (\d+)s', error_str)
                 if delay_match: 
                     retry_delay = max(int(delay_match.group(1)), retry_delay)
                 logger.warning(f"🚫 Quota limit Gemini, retry sau {retry_delay}s (#{attempt+1}/{max_retries})")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)  # ⭐ THAY THẾ time.sleep bằng asyncio.sleep
+                    await asyncio.sleep(retry_delay)
                     
             elif "invalid_argument" in error_str and ("token" in error_str or "size" in error_str):
                 logger.error(f"💥 Prompt quá lớn: {estimated_tokens:,} tokens, {prompt_char_count:,} chars")
-                return json.dumps({"error": f"Prompt quá lớn: {estimated_tokens:,} tokens"})
+                return json.dumps({"error_too_large": True, "estimated_tokens": estimated_tokens})
                 
             elif "500" in error_str or "internal" in error_str or "unavailable" in error_str:
                 retry_delay = 10 + attempt * 15
                 logger.warning(f"🔧 Server error Gemini, retry sau {retry_delay}s (#{attempt+1}/{max_retries})")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)  # ⭐ THAY THẾ time.sleep bằng asyncio.sleep
+                    await asyncio.sleep(retry_delay)
             else:
                 logger.error(f"❌ Lỗi không xác định Gemini (#{attempt+1}/{max_retries}): {str(e)}")
                 if attempt == max_retries - 1:
                     return json.dumps({"error": f"Gemini API error: {str(e)}"})
-                await asyncio.sleep(10)  # ⭐ THAY THẾ time.sleep bằng asyncio.sleep
+                await asyncio.sleep(10)
                 
     logger.error(f"💥 Thất bại hoàn toàn sau {max_retries} lần thử với Gemini")
     return json.dumps({"error": "Không thể kết nối Gemini sau nhiều lần thử"})
@@ -365,29 +462,38 @@ async def search_and_filter_recipes_async(user_query: str) -> str:
                 })
                 continue
 
-            # ⭐ PROMPT TỐI ƯU HÓA cho JSON output
+            # ⭐ PROMPT TỐI ƯU HÓA CHO JSON - CẢI THIỆN THEO YÊU CẦU
             optimized_prompt = f'''Bạn là AI chuyên gia ẩm thực. Phân tích query "{user_query}" và chọn các công thức phù hợp NHẤT.
 
-YÊU CẦU CHÍNH XÁC:
+⚠️ TUYỆT ĐỐI CHỈ TRẢ VỀ MỘT DANH SÁCH JSON (JSON ARRAY) HỢP LỆ. KHÔNG THÊM bất kỳ văn bản nào trước hoặc sau danh sách JSON.
+
+📋 YÊU CẦU CHÍNH XÁC:
 1. Chỉ chọn công thức thực sự liên quan đến query
 2. Trích xuất: id, name, url, ingredients_summary  
-3. TRẢ VỀ JSON ARRAY ĐÚNG ĐỊNH DẠNG:
+3. Đảm bảo tất cả các chuỗi trong JSON được đặt trong dấu ngoặc kép chuẩn (\")
+4. Đảm bảo không có dấu phẩy thừa ở cuối danh sách hoặc cuối đối tượng
+5. Nếu không có kết quả nào, trả về một danh sách JSON rỗng: []
 
+✅ VÍ DỤ VỀ OUTPUT JSON HỢP LỆ:
 [
   {{
-    "id": "recipe_id_here", 
-    "name": "Tên món ăn",
-    "url": "http://url_or_null",
-    "ingredients_summary": "Tóm tắt nguyên liệu chính"
+    "id": "recipe_123", 
+    "name": "Salad giảm cân với rau xanh",
+    "url": "https://example.com/recipe_123",
+    "ingredients_summary": "Rau xanh, cà chua, dưa chuột, dầu oliu"
+  }},
+  {{
+    "id": "recipe_456",
+    "name": "Sinh tố rau củ ít calo", 
+    "url": null,
+    "ingredients_summary": "Cải bó xôi, chuối, táo, nước"
   }}
 ]
-
-Nếu không tìm thấy gì phù hợp: []
 
 DỮLIỆU CÔNG THỨC:
 {batch_context}
 
-CHỈ TRẢ VỀ JSON ARRAY:'''
+🔥 CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH, KHÔNG MARKDOWN, KHÔNG VĂN BẢN THÊM:'''
 
             # ⭐ THÊM TASK VÀO DANH SÁCH ĐỂ XỬ LÝ ĐỒNG THỜI VỚI SEMAPHORE CONTROL
             if optimized_prompt.strip():
@@ -420,52 +526,105 @@ CHỈ TRẢ VỀ JSON ARRAY:'''
                 # result là gemini_response_text thành công
                 gemini_response = result
                 
-                # ⭐ XỬ LÝ RESPONSE CẢI THIỆN
+                # ⭐ XỬ LÝ RESPONSE CẢI THIỆN VỚI ERROR_TOO_LARGE HANDLING
                 try:
-                    cleaned_response = clean_json_response(gemini_response)
-                    
-                    # Kiểm tra error response từ call_gemini_api_async
-                    if cleaned_response.startswith('{"error":'):
-                        error_data = json.loads(cleaned_response)
-                        logger.error(f"💥 Batch {batch_num} Gemini error: {error_data.get('error')}")
+                    # Kiểm tra error_too_large từ call_gemini_api_async trước
+                    if gemini_response.startswith('{"error_too_large":'):
+                        error_data = json.loads(gemini_response)
+                        logger.error(f"💥 Batch {batch_num} quá lớn cho Gemini: {error_data.get('estimated_tokens', 'unknown')} tokens")
+                        logger.warning(f"⚠️ Cần giảm MAX_CHAR_PER_BATCH hiện tại ({MAX_CHAR_PER_BATCH:,}) hoặc DOCUMENTS_PER_GEMINI_CALL hiện tại ({DOCUMENTS_PER_GEMINI_CALL})")
                         error_reports.append({
                             "error_batch": batch_num,
-                            "message": error_data.get('error', 'Unknown Gemini error'),
+                            "error_type": "batch_too_large",
+                            "message": f"Batch quá lớn: {error_data.get('estimated_tokens', 'unknown')} tokens",
+                            "doc_count": doc_count,
+                            "suggestion": "Giảm MAX_CHAR_PER_BATCH hoặc batch size"
+                        })
+                        continue
+                    
+                    # Kiểm tra các error responses khác từ call_gemini_api_async
+                    if gemini_response.startswith('{"error":'):
+                        error_data = json.loads(gemini_response)
+                        error_msg = error_data.get('error', 'Unknown Gemini error')
+                        logger.error(f"💥 Batch {batch_num} Gemini error: {error_msg}")
+                        error_reports.append({
+                            "error_batch": batch_num,
+                            "error_type": "gemini_api_error",
+                            "message": error_msg,
                             "doc_count": doc_count
                         })
                         continue
-
-                    # Parse JSON recipes
-                    batch_recipes = json.loads(cleaned_response)
                     
-                    if isinstance(batch_recipes, list):
-                        if batch_recipes:
-                            valid_recipes = [r for r in batch_recipes if isinstance(r, dict) and 'id' in r and 'name' in r]
-                            all_selected_recipes.extend(valid_recipes)
-                            logger.info(f"✅ Batch {batch_num}: {len(valid_recipes)} valid recipes")
+                    # Parse JSON với fallback handling
+                    parse_result = parse_json_with_fallback(gemini_response)
+                    
+                    if parse_result["success"]:
+                        batch_recipes = parse_result["data"]
+                        
+                        # ⭐ XỬ LÝ TRƯỜNG HỢP GEMINI TRẢ VỀ OBJECT THAY VÌ LIST
+                        if isinstance(batch_recipes, dict):
+                            logger.warning(f"⚠️ Batch {batch_num}: Gemini trả về object thay vì array")
+                            # Thử extract array từ object
+                            extracted_array = None
+                            for key, value in batch_recipes.items():
+                                if isinstance(value, list):
+                                    logger.info(f"✅ Batch {batch_num}: Extracted array từ key '{key}'")
+                                    extracted_array = value
+                                    break
+                            
+                            if extracted_array:
+                                batch_recipes = extracted_array
+                            else:
+                                logger.warning(f"⚠️ Batch {batch_num}: Không tìm thấy array trong object, bỏ qua")
+                                error_reports.append({
+                                    "error_batch": batch_num,
+                                    "error_type": "object_instead_of_array",
+                                    "message": "Gemini trả về object thay vì array và không có array con",
+                                    "doc_count": doc_count
+                                })
+                                continue
+                        
+                        if isinstance(batch_recipes, list):
+                            if batch_recipes:
+                                valid_recipes = [r for r in batch_recipes if isinstance(r, dict) and 'id' in r and 'name' in r]
+                                all_selected_recipes.extend(valid_recipes)
+                                logger.info(f"✅ Batch {batch_num}: {len(valid_recipes)} valid recipes từ {len(batch_recipes)} items")
+                            else:
+                                logger.info(f"📭 Batch {batch_num}: Không tìm thấy recipe phù hợp (empty array)")
                         else:
-                            logger.info(f"📭 Batch {batch_num}: Không tìm thấy recipe phù hợp")
+                            logger.warning(f"⚠️ Batch {batch_num}: Response vẫn không phải array sau xử lý: {type(batch_recipes)}")
+                            error_reports.append({
+                                "error_batch": batch_num,
+                                "error_type": "invalid_response_type",
+                                "message": f"Response type không hợp lệ: {type(batch_recipes)}",
+                                "doc_count": doc_count
+                            })
                     else:
-                        logger.warning(f"⚠️ Batch {batch_num}: Response không phải array")
+                        # Parse failed với structured error
+                        logger.error(f"💥 Batch {batch_num} JSON parse failed: {parse_result.get('error')}")
                         error_reports.append({
                             "error_batch": batch_num,
-                            "message": f"Invalid response type: {type(batch_recipes)}",
+                            "error_type": "json_parse_failed",
+                            "message": parse_result.get('error', 'JSON parse failed'),
+                            "raw_snippet": parse_result.get('raw_response', '')[:200],
                             "doc_count": doc_count
                         })
 
                 except json.JSONDecodeError as e:
-                    logger.error(f"💥 Batch {batch_num} JSON decode error: {e}")
-                    logger.error(f"Raw response: {gemini_response[:300]}...")
+                    logger.error(f"💥 Batch {batch_num} Critical JSON decode error: {e}")
+                    logger.error(f"Raw response sample: {gemini_response[:300]}...")
                     error_reports.append({
                         "error_batch": batch_num,
-                        "message": f"JSON decode error: {str(e)}",
+                        "error_type": "critical_json_error",
+                        "message": f"Critical JSON decode error: {str(e)}",
                         "raw_snippet": gemini_response[:200],
                         "doc_count": doc_count
                     })
                 except Exception as e:
-                    logger.error(f"💥 Batch {batch_num} unexpected error: {e}")
+                    logger.error(f"💥 Batch {batch_num} Unexpected error: {e}")
                     error_reports.append({
                         "error_batch": batch_num,
+                        "error_type": "unexpected_error",
                         "message": f"Unexpected error: {str(e)}",
                         "doc_count": doc_count
                     })

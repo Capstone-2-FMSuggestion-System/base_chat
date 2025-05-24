@@ -12,6 +12,7 @@ from app.middleware.auth import get_verified_user_from_backend, VerifiedUserInfo
 from app.schemas.chat import ChatRequest, ChatResponse, NewChatResponse, ChatContentResponse
 from app.config import settings
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -19,23 +20,29 @@ router = APIRouter()
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
+    background_tasks: BackgroundTasks,
     verified_user: VerifiedUserInfo = Depends(get_verified_user_from_backend),
     db: Session = Depends(get_db)
 ):
-    """Gửi tin nhắn và nhận phản hồi từ AI"""
+    """Gửi tin nhắn và nhận phản hồi từ AI với background DB operations"""
     chat_service = ChatService(db)
     
-    # Lưu tin nhắn người dùng trước khi xử lý
+    # Kiểm tra quyền truy cập conversation nếu có
     if request.conversation_id:
         if not chat_service.repository.is_user_owner_of_conversation(verified_user.user_id, request.conversation_id):
             raise HTTPException(status_code=403, detail="Không có quyền truy cập cuộc trò chuyện này")
-        chat_service.repository.add_message(request.conversation_id, "user", request.message)
     
-    result = await chat_service.process_message(
+    # Xử lý message với background DB operations
+    result, background_task_ids = await chat_service.process_message_with_background(
         user_id=verified_user.user_id,
         message=request.message,
         conversation_id=request.conversation_id
     )
+    
+    # Thêm background tasks để execute các DB operations
+    if background_task_ids:
+        background_tasks.add_task(chat_service.execute_background_tasks, background_task_ids)
+        logger.info(f"🚀 Đã thêm {len(background_task_ids)} background DB tasks")
     
     return result
 
@@ -206,4 +213,27 @@ async def get_chat_content(
     """Lấy nội dung cuộc trò chuyện"""
     chat_service = ChatService(db)
     result = chat_service.get_chat_content(verified_user.user_id, conversation_id)
-    return result 
+    return result
+
+
+@router.get("/background-task-status/{task_id}")
+async def get_background_task_status(
+    task_id: str,
+    verified_user: VerifiedUserInfo = Depends(get_verified_user_from_backend),
+    db: Session = Depends(get_db)
+):
+    """
+    Lấy trạng thái của background task.
+    Endpoint này dùng cho monitoring/debugging.
+    """
+    chat_service = ChatService(db)
+    status = chat_service.get_background_task_status(task_id)
+    
+    if status is None:
+        raise HTTPException(status_code=404, detail="Task không tồn tại")
+        
+    return {
+        "task_id": task_id,
+        "status": status["status"],
+        "details": status
+    } 

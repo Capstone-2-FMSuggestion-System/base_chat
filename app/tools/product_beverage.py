@@ -44,6 +44,114 @@ if not PINECONE_API_KEY or not PINECONE_INDEX_NAME:
     logger.error(f"Các biến môi trường sau không được thiết lập: {', '.join(missing_keys)}")
     raise ValueError(f"Các biến môi trường sau không được thiết lập: {', '.join(missing_keys)}")
 
+def clean_json_response(response_text: str) -> str:
+    """⭐ CẢI THIỆN: Làm sạch response từ Gemini trước khi parse JSON với nhiều fix patterns hơn"""
+    try:
+        cleaned = response_text.strip()
+        
+        # Loại bỏ markdown wrapper
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+            
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+            
+        cleaned = cleaned.strip()
+        
+        # ⭐ CẢI THIỆN: Thêm nhiều pattern fix JSON phổ biến hơn
+        
+        # 1. Trailing comma trước } hoặc ]
+        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
+        
+        # 2. Missing quotes cho keys (chỉ fix nếu chưa có quotes)
+        cleaned = re.sub(r'(\w+):\s*(["\[])', r'"\1": \2', cleaned)
+        
+        # 3. Single quotes thay vì double quotes cho keys và strings
+        cleaned = re.sub(r"'([^']*?)'(\s*:\s*)", r'"\1"\2', cleaned)  # Keys
+        cleaned = re.sub(r':\s*\'([^\']*?)\'', r': "\1"', cleaned)    # String values
+        
+        # 4. Thêm dấu phẩy thiếu giữa objects trong array
+        cleaned = re.sub(r'}\s*{', r'}, {', cleaned)
+        
+        # 5. Loại bỏ control characters có thể gây lỗi JSON
+        cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned)
+        
+        # 6. Fix escaped quotes thừa
+        cleaned = re.sub(r'\\"', '"', cleaned)
+        
+        # 7. Đảm bảo JSON bắt đầu và kết thúc đúng format
+        if not cleaned.startswith('[') and not cleaned.startswith('{'):
+            # Tìm JSON array hoặc object đầu tiên
+            array_match = re.search(r'(\[[\s\S]*\])', cleaned)
+            object_match = re.search(r'(\{[\s\S]*\})', cleaned)
+            
+            if array_match:
+                cleaned = array_match.group(1)
+            elif object_match:
+                cleaned = object_match.group(1)
+        
+        return cleaned
+    except Exception as e:
+        logger.warning(f"Lỗi khi clean JSON response: {e}")
+        return response_text.strip()
+
+def parse_json_with_fallback(response_text: str) -> dict:
+    """⭐ MỚI: Parse JSON với multiple fallback strategies"""
+    try:
+        cleaned = clean_json_response(response_text)
+        
+        # Thử parse trực tiếp
+        try:
+            result = json.loads(cleaned)
+            return {"success": True, "data": result}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Direct JSON parse failed: {e}")
+        
+        # ⭐ Fallback 1: Tìm và extract JSON object/array từ text
+        json_patterns = [
+            r'\[[\s\S]*?\]',  # JSON array
+            r'\{[\s\S]*?\}',  # JSON object
+        ]
+        
+        for pattern in json_patterns:
+            matches = re.findall(pattern, cleaned)
+            for match in matches:
+                try:
+                    result = json.loads(match)
+                    logger.info("✅ JSON parsed successfully với pattern matching")
+                    return {"success": True, "data": result}
+                except json.JSONDecodeError:
+                    continue
+        
+        # ⭐ Fallback 2: Nếu là object nhưng mong đợi array, extract array từ object
+        try:
+            obj_result = json.loads(cleaned)
+            if isinstance(obj_result, dict):
+                # Tìm key chứa array
+                for key, value in obj_result.items():
+                    if isinstance(value, list):
+                        logger.info(f"✅ Extracted array từ object key: {key}")
+                        return {"success": True, "data": value}
+        except json.JSONDecodeError:
+            pass
+        
+        # ⭐ Fallback 3: Return structured error
+        return {
+            "success": False, 
+            "error": "Invalid JSON from Gemini", 
+            "raw_response": response_text[:500],  # Giới hạn độ dài
+            "cleaned_response": cleaned[:500]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"JSON parsing exception: {str(e)}",
+            "raw_response": response_text[:500]
+        }
+
 def init_services():
     """⭐ Khởi tạo kết nối Pinecone và lấy dimension của vector. KHÔNG trả về gemini_model."""
     try:
@@ -134,9 +242,12 @@ async def call_gemini_api_batch_classification_async(products_batch: list[dict],
         safe_name = json.dumps(p_data['name'], ensure_ascii=False)
         product_list_str += f'{i+1}. ID: {safe_id}, Tên: {safe_name}\n'
 
-    prompt = f"""
-Bạn được cung cấp một danh sách các sản phẩm. Hãy phân loại CHỈ những sản phẩm thực sự là ĐỒ UỐNG hoặc NGUYÊN LIỆU CHÍNH để pha chế đồ uống.
+    # ⭐ PROMPT TỐI ƯU HÓA CHO JSON - CẢI THIỆN THEO YÊU CẦU
+    prompt = f"""Bạn được cung cấp một danh sách các sản phẩm. Hãy phân loại CHỈ những sản phẩm thực sự là ĐỒ UỐNG hoặc NGUYÊN LIỆU CHÍNH để pha chế đồ uống.
 
+⚠️ TUYỆT ĐỐI CHỈ TRẢ VỀ MỘT DANH SÁCH JSON (JSON ARRAY) HỢP LỆ. KHÔNG THÊM bất kỳ văn bản nào trước hoặc sau danh sách JSON.
+
+📋 TIÊU CHÍ PHÂN LOẠI:
 ⭐ CHỈ CHỌN CÁC SẢN PHẨM SAU:
 - ĐỒ UỐNG SẴN SÀNG: nước giải khát, trà, cà phê pha sẵn, sữa, nước ép, sinh tố, bia, rượu vang, nước lọc
 - NGUYÊN LIỆU PHA CHẾ CHÍNH: bột cà phê, trà túi lọc, trà lá, siro pha chế, sữa đặc, bột cacao, matcha, coffee bean
@@ -147,30 +258,30 @@ Bạn được cung cấp một danh sách các sản phẩm. Hãy phân loại 
 - Đường phèn (trừ khi có bối cảnh "Trà đường phèn" hoặc đồ uống cụ thể)
 - Nguyên liệu nấu ăn khác: hành tây, tỏi, gia vị
 
-Danh sách sản phẩm:
-{product_list_str}
+📋 YÊU CẦU JSON FORMAT:
+1. Đảm bảo tất cả các chuỗi trong JSON được đặt trong dấu ngoặc kép chuẩn (\")
+2. Đảm bảo không có dấu phẩy thừa ở cuối danh sách hoặc cuối đối tượng
+3. Mỗi product_id trong danh sách JSON trả về phải là DUY NHẤT - KHÔNG lặp lại sản phẩm
+4. Mỗi object phải có đúng 2 trường: "product_id" và "product_name"
+5. ID và name phải khớp chính xác với input
+6. Nếu không có đồ uống nào, trả về một danh sách JSON rỗng: []
 
-⚠️ YÊU CẦU QUAN TRỌNG:
-1. Mỗi product_id trong danh sách JSON trả về phải là DUY NHẤT - KHÔNG lặp lại sản phẩm
-2. Chỉ trả về JSON array format chính xác
-3. Mỗi object phải có đúng 2 trường: "product_id" và "product_name"
-4. ID và name phải khớp chính xác với input
-
-Ví dụ format JSON (nếu sản phẩm 1 và 3 là đồ uống):
+✅ VÍ DỤ VỀ OUTPUT JSON HỢP LỆ (nếu sản phẩm 1 và 3 là đồ uống):
 [
   {{
     "product_id": "ID_SAN_PHAM_1",
     "product_name": "TEN_SAN_PHAM_1"
   }},
   {{
-    "product_id": "ID_SAN_PHAM_3",
+    "product_id": "ID_SAN_PHAM_3", 
     "product_name": "TEN_SAN_PHAM_3"
   }}
 ]
 
-Nếu không có đồ uống nào: []
-CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH THÊM.
-"""
+DANH SÁCH SẢN PHẨM:
+{product_list_str}
+
+🔥 CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH, KHÔNG MARKDOWN, KHÔNG VĂN BẢN THÊM:"""
     task_desc = f"Phân loại lô {len(products_batch)} sản phẩm (async)"
 
     for attempt in range(max_retries):
@@ -202,26 +313,34 @@ CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH THÊM.
             if response.parts:
                 response_text = response.text
 
-                # Cố gắng trích xuất JSON từ phản hồi
-                match_json = re.search(r'```json\s*([\s\S]*?)\s*```', response_text, re.DOTALL)
-                if match_json:
-                    json_str = match_json.group(1).strip()
-                else:
-                    json_str = response_text.strip()
-                    if not (json_str.startswith('[') and json_str.endswith(']')):
-                         match_obj_json = re.search(r'\{\s*[\s\S]*?\s*\}', response_text, re.DOTALL)
-                         if match_obj_json and not (json_str.startswith('[') and json_str.endswith(']')):
-                              logger.warning(f"Gemini trả về JSON object thay vì list cho lô. Response: {response_text}")
-                              if attempt < max_retries - 1:
-                                  logger.info(f"Thử lại ({attempt+1}/{max_retries}) do định dạng không mong đợi.")
-                                  await asyncio.sleep(5 + attempt * 5)
-                                  continue
-                              return []
-
-                try:
-                    classified_drinks = json.loads(json_str)
+                # ⭐ SỬ DỤNG PARSE_JSON_WITH_FALLBACK THAY VÌ MANUAL PARSING
+                parse_result = parse_json_with_fallback(response_text)
+                
+                if parse_result["success"]:
+                    classified_drinks = parse_result["data"]
+                    
+                    # ⭐ XỬ LÝ TRƯỜNG HỢP GEMINI TRẢ VỀ OBJECT THAY VÌ LIST
+                    if isinstance(classified_drinks, dict):
+                        logger.warning(f"⚠️ {task_desc}: Gemini trả về object thay vì array")
+                        # Thử extract array từ object
+                        extracted_array = None
+                        for key, value in classified_drinks.items():
+                            if isinstance(value, list):
+                                logger.info(f"✅ {task_desc}: Extracted array từ key '{key}'")
+                                extracted_array = value
+                                break
+                        
+                        if extracted_array:
+                            classified_drinks = extracted_array
+                        else:
+                            logger.warning(f"⚠️ {task_desc}: Không tìm thấy array trong object, retry")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(5 + attempt * 5)
+                                continue
+                            return []
+                    
                     if not isinstance(classified_drinks, list):
-                        logger.warning(f"Gemini không trả về một danh sách JSON. Response: {json_str}. Thử lại...")
+                        logger.warning(f"⚠️ {task_desc}: Response vẫn không phải list sau xử lý: {type(classified_drinks)}")
                         if attempt < max_retries - 1:
                             await asyncio.sleep(5 + attempt * 5)
                             continue
@@ -268,26 +387,22 @@ CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH THÊM.
                     logger.info(f"✅ {task_desc}: Thành công phân loại được {len(final_unique_drinks)} đồ uống từ {len(products_batch)} sản phẩm")
                     return final_unique_drinks
                     
-                except json.JSONDecodeError as e:
-                    logger.error(f"Lỗi giải mã JSON từ Gemini ({task_desc}): {e}. Response: {json_str}")
+                else:
+                    # Parse failed với structured error
+                    logger.error(f"💥 {task_desc} JSON parse failed: {parse_result.get('error')}")
                     if attempt < max_retries - 1:
+                        logger.info(f"🔄 Retry {task_desc} attempt {attempt + 1}/{max_retries} due to JSON parse error")
                         await asyncio.sleep(10 + attempt * 10)
-            else:
-                logger.warning(f"Gemini không trả về nội dung ({task_desc}). Response: {response}")
-                if response.prompt_feedback and response.prompt_feedback.block_reason:
-                    logger.warning(f"Bị chặn bởi ({task_desc}): {response.prompt_feedback.block_reason_message}")
-                    if "SAFETY" in str(response.prompt_feedback.block_reason).upper():
-                        logger.error("Prompt bị chặn do an toàn. Sẽ không thử lại với prompt này.")
-                        return []
-                if attempt < max_retries - 1:
-                     await asyncio.sleep(10 + attempt * 5)
+                        continue
+                    return []
 
         except Exception as e:
             error_str = str(e).lower()
             if "token" in error_str or "size limit" in error_str or "request payload" in error_str or "too large" in error_str:
                 logger.error(f"💥 Lỗi kích thước prompt/request khi gọi Gemini ({task_desc}): {str(e)}. "
                              f"Lô hiện tại có {len(products_batch)} sản phẩm. Hãy thử giảm PRODUCTS_PER_GEMINI_BATCH.")
-                return [{"error_too_large": True}]
+                logger.warning(f"⚠️ Cần giảm PRODUCTS_PER_GEMINI_BATCH hiện tại ({PRODUCTS_PER_GEMINI_BATCH}) để tránh lỗi này")
+                return [{"error_too_large": True, "batch_size": len(products_batch), "suggestion": "Giảm PRODUCTS_PER_GEMINI_BATCH"}]
 
             if "429" in error_str or "resource_exhausted" in error_str or "too many requests" in error_str or "quota" in error_str:
                 retry_delay = 15 + attempt * 10
@@ -366,9 +481,17 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                 end_time = asyncio.get_event_loop().time()
                 elapsed = end_time - start_time
                 
-                # Xử lý trường hợp prompt quá lớn
+                # ⭐ XỬ LÝ TRƯỜNG HỢP PROMPT QUÁ LỚN VỚI LOGGING RÕ RÀNG HỢN
                 if classified_drinks and isinstance(classified_drinks[0], dict) and classified_drinks[0].get("error_too_large"):
-                    logger.warning(f"⚠️ Batch {batch_num_log}: Lô quá lớn cho Gemini (kích thước: {current_batch_size}). Bỏ qua lô này.")
+                    error_info = classified_drinks[0]
+                    batch_size = error_info.get("batch_size", len(products_in_batch))
+                    suggestion = error_info.get("suggestion", "Giảm batch size")
+                    
+                    logger.error(f"💥 Batch {batch_num_log}: Lô quá lớn cho Gemini API")
+                    logger.error(f"   - Batch size hiện tại: {batch_size} sản phẩm")
+                    logger.error(f"   - PRODUCTS_PER_GEMINI_BATCH hiện tại: {PRODUCTS_PER_GEMINI_BATCH}")
+                    logger.error(f"   - Gợi ý: {suggestion}")
+                    logger.warning(f"⚠️ Cần điều chỉnh cấu hình để tránh lỗi này tiếp tục xảy ra")
                     return []
                 
                 if classified_drinks:

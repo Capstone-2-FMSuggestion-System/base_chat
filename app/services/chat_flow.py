@@ -483,26 +483,12 @@ async def save_health_data_to_cache(conversation_id: int, user_id: int, data: Di
 async def save_health_data_to_db(repo, conversation_id: int, user_id: int, data: Dict[str, Any]) -> None:
     """Lưu thông tin sức khỏe vào cơ sở dữ liệu"""
     try:
-        # Lọc dữ liệu theo các trường được hỗ trợ
-        health_condition = data.get('health_condition')
-        medical_history = data.get('medical_history')
-        allergies = data.get('allergies')
-        dietary_habits = data.get('dietary_habits')
-        health_goals = data.get('health_goals')
-        
-        # Lưu additional_info cho các thông tin khác
-        additional_info = {k: v for k, v in data.items() 
-                         if k not in ['health_condition', 'medical_history', 'allergies', 'dietary_habits', 'health_goals']}
-        
+        # Sử dụng tham số data mới để truyền trực tiếp collected_info
+        # Repository sẽ xử lý logic phân tách và merge thông minh
         health_data = repo.save_health_data(
             conversation_id=conversation_id,
             user_id=user_id,
-            health_condition=health_condition,
-            medical_history=medical_history,
-            allergies=allergies,
-            dietary_habits=dietary_habits,
-            health_goals=health_goals,
-            additional_info=additional_info
+            data=data  # Truyền trực tiếp collected_info
         )
         
         logger.info(f"💾 Đã lưu thông tin sức khỏe vào DB: conversation_id={conversation_id}")

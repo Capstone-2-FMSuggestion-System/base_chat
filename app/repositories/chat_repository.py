@@ -397,39 +397,117 @@ class ChatRepository:
 
     def save_health_data(self, conversation_id: int, user_id: int, health_condition: str = None, 
                         medical_history: str = None, allergies: str = None, dietary_habits: str = None, 
-                        health_goals: str = None, additional_info: Dict = None) -> HealthData:
+                        health_goals: str = None, additional_info: Dict = None, data: Dict = None) -> HealthData:
+        """
+        Lưu thông tin sức khỏe với xử lý thông minh các giá trị rỗng từ collected_info.
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            user_id: ID người dùng
+            health_condition: Tình trạng sức khỏe
+            medical_history: Lịch sử bệnh án
+            allergies: Dị ứng
+            dietary_habits: Thói quen ăn uống
+            health_goals: Mục tiêu sức khỏe
+            additional_info: Thông tin bổ sung
+            data: Dictionary chứa dữ liệu từ collected_info (ưu tiên cao hơn các tham số riêng lẻ)
+        
+        Returns:
+            HealthData object đã được lưu
+        """
         try:
             logger.info(f"Lưu thông tin sức khỏe: conv_id={conversation_id}")
             existing_data = self.db.query(HealthData).filter(HealthData.conversation_id == conversation_id).first()
             
+            # Nếu có data từ collected_info, ưu tiên sử dụng nó
+            if data:
+                health_condition = data.get('health_condition', health_condition)
+                medical_history = data.get('medical_history', medical_history)
+                allergies = data.get('allergies', allergies)
+                dietary_habits = data.get('dietary_habits', dietary_habits)
+                health_goals = data.get('health_goals', health_goals)
+                
+                # Xử lý additional_info từ data
+                if not additional_info:
+                    additional_info = {}
+                
+                # Thêm food_preferences và food_dislikes từ data vào additional_info
+                if data.get('food_preferences') is not None:
+                    additional_info['food_preferences'] = data.get('food_preferences')
+                if data.get('food_dislikes') is not None:
+                    additional_info['food_dislikes'] = data.get('food_dislikes')
+                
+                # Thêm các trường khác từ data vào additional_info (ngoài các trường cơ bản)
+                excluded_fields = ['health_condition', 'medical_history', 'allergies', 'dietary_habits', 'health_goals', 'food_preferences', 'food_dislikes']
+                for k, v in data.items():
+                    if k not in excluded_fields and v is not None:
+                        additional_info[k] = v
+            
             if existing_data:
-                if health_condition is not None:
-                    existing_data.health_condition = health_condition
-                if medical_history is not None:
-                    existing_data.medical_history = medical_history
-                if allergies is not None:
-                    existing_data.allergies = allergies
-                if dietary_habits is not None:
-                    existing_data.dietary_habits = dietary_habits
-                if health_goals is not None:
-                    existing_data.health_goals = health_goals
-                if additional_info:
-                    if existing_data.additional_info:
-                        existing_data.additional_info.update(additional_info)
+                # Hàm helper để cập nhật trường với logic tránh ghi đè bằng chuỗi rỗng
+                def update_field_safely(field_name: str, new_value: str, current_value: str) -> str:
+                    """
+                    Cập nhật trường một cách an toàn:
+                    - Nếu new_value là None: cho phép xóa (trả về None)
+                    - Nếu new_value là chuỗi rỗng và current_value có giá trị: giữ nguyên current_value
+                    - Ngược lại: cập nhật với new_value
+                    """
+                    if new_value is None:
+                        return None  # Cho phép xóa giá trị
+                    elif isinstance(new_value, str) and new_value.strip() == "" and current_value:
+                        logger.debug(f"Giữ nguyên {field_name} hiện có (không ghi đè bằng chuỗi rỗng)")
+                        return current_value  # Giữ nguyên giá trị hiện có
                     else:
-                        existing_data.additional_info = additional_info
+                        return new_value  # Cập nhật với giá trị mới
+                
+                # Áp dụng logic cập nhật an toàn cho các trường cơ bản
+                existing_data.health_condition = update_field_safely(
+                    "health_condition", health_condition, existing_data.health_condition
+                )
+                existing_data.medical_history = update_field_safely(
+                    "medical_history", medical_history, existing_data.medical_history
+                )
+                existing_data.allergies = update_field_safely(
+                    "allergies", allergies, existing_data.allergies
+                )
+                existing_data.dietary_habits = update_field_safely(
+                    "dietary_habits", dietary_habits, existing_data.dietary_habits
+                )
+                existing_data.health_goals = update_field_safely(
+                    "health_goals", health_goals, existing_data.health_goals
+                )
+                
+                # Xử lý additional_info với merge thông minh
+                if additional_info:
+                    # Đảm bảo existing additional_info tồn tại
+                    if not existing_data.additional_info:
+                        existing_data.additional_info = {}
+                    
+                    # Merge từng trường trong additional_info với logic an toàn
+                    for key, value in additional_info.items():
+                        if value is not None:
+                            if isinstance(value, str) and value.strip() == "" and existing_data.additional_info.get(key):
+                                # Không ghi đè giá trị hiện có bằng chuỗi rỗng
+                                logger.debug(f"Giữ nguyên additional_info['{key}'] hiện có (không ghi đè bằng chuỗi rỗng)")
+                            else:
+                                existing_data.additional_info[key] = value
+                        
                 existing_data.updated_at = datetime.now()
                 self.db.commit()
                 
                 health_data_dict = self._format_health_data_for_cache(existing_data)
                 CacheService.cache_health_data(conversation_id, health_data_dict)
+                logger.info(f"✅ Đã cập nhật thông tin sức khỏe cho conversation_id={conversation_id}")
                 return existing_data
             else:
                 health_data = HealthData(
                     conversation_id=conversation_id, user_id=user_id,
-                    health_condition=health_condition, medical_history=medical_history,
-                    allergies=allergies, dietary_habits=dietary_habits,
-                    health_goals=health_goals, additional_info=additional_info or {}
+                    health_condition=health_condition,
+                    medical_history=medical_history,
+                    allergies=allergies,
+                    dietary_habits=dietary_habits,
+                    health_goals=health_goals,
+                    additional_info=additional_info or {}
                 )
                 self.db.add(health_data)
                 self.db.commit()
@@ -437,6 +515,7 @@ class ChatRepository:
                 
                 health_data_dict = self._format_health_data_for_cache(health_data)
                 CacheService.cache_health_data(conversation_id, health_data_dict)
+                logger.info(f"✅ Đã tạo mới thông tin sức khỏe cho conversation_id={conversation_id}")
                 return health_data
                 
         except Exception as e:
@@ -704,23 +783,190 @@ class ChatRepository:
         return recipe_data_db 
 
     def _invalidate_summary_related_caches(self, conversation_id: int) -> None:
+        """Invalidate tất cả cache liên quan đến tóm tắt khi có cập nhật"""
+        try:
+            summary_cache_key = CacheService._get_cache_key(
+                CacheService.CONVERSATION_METADATA, 
+                conversation_id=f"{conversation_id}_latest_summary"
+            )
+            CacheService.delete_cache(summary_cache_key)
+            
+            self._rebuild_messages_cache(conversation_id)
+            self._sync_related_caches(conversation_id)
+            
+            logger.debug(f"🔄 Đã invalidate cache tóm tắt cho conversation_id={conversation_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Lỗi khi invalidate summary cache: {str(e)}")
+
+    # === BACKGROUND DB OPERATIONS METHODS ===
+    
+    def prepare_add_message(self, conversation_id: int, role: str, content: str) -> Message:
         """
-        Invalidate các cache liên quan đến tóm tắt khi có thay đổi.
+        Chuẩn bị message object mà không commit vào DB ngay.
+        Dùng cho background processing.
+        
+        Returns:
+            Message object đã được add vào session nhưng chưa commit
+        """
+        message = Message(
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            is_summarized=False,
+            summary=None
+        )
+        self.db.add(message)
+        
+        # Cập nhật timestamp cuộc trò chuyện
+        conversation = self.get_conversation_by_id(conversation_id)
+        if conversation:
+            conversation.updated_at = datetime.now()
+        
+        # Chưa commit - sẽ được commit ở background
+        logger.debug(f"📝 Prepared add_message for conversation_id={conversation_id}, role={role}")
+        return message
+    
+    def commit_and_refresh_message(self, message: Message) -> Message:
+        """
+        Commit message đã được prepare và refresh để lấy ID.
+        Sau đó invalidate caches.
         
         Args:
-            conversation_id: ID cuộc trò chuyện
+            message: Message object đã được prepare
+            
+        Returns:
+            Message object đã commit và refresh
+        """
+        self.db.commit()
+        self.db.refresh(message)
+        
+        # Invalidate caches sau khi commit
+        self._rebuild_messages_cache(message.conversation_id)
+        self._sync_related_caches(message.conversation_id)
+        
+        # Invalidate cache tóm tắt vì có tin nhắn mới
+        summary_cache_key = CacheService._get_cache_key(
+            CacheService.CONVERSATION_METADATA, 
+            conversation_id=f"{message.conversation_id}_latest_summary"
+        )
+        CacheService.delete_cache(summary_cache_key)
+        
+        logger.debug(f"✅ Committed and refreshed message_id={message.message_id}")
+        return message
+    
+    def add_message_immediate(self, conversation_id: int, role: str, content: str) -> Message:
+        """
+        Version không thay đổi của add_message - commit ngay lập tức.
+        Dùng cho trường hợp cần response ngay (như user message trước khi gọi LLM).
+        """
+        message = self.prepare_add_message(conversation_id, role, content)
+        return self.commit_and_refresh_message(message)
+    
+    def prepare_health_data(self, conversation_id: int, user_id: int, 
+                           health_condition: str = None, medical_history: str = None,
+                           allergies: str = None, dietary_habits: str = None,
+                           health_goals: str = None, additional_info: Dict = None,
+                           data: Dict = None) -> Optional[HealthData]:
+        """
+        Chuẩn bị HealthData object mà không commit vào DB ngay.
+        Dùng cho background processing.
         """
         try:
-            # Invalidate cache unsummarized conversations
-            CacheService.delete_pattern("unsummarized_conversations:*")
-            
-            # Invalidate conversation metadata nếu cần
-            metadata_key = CacheService._get_cache_key(
-                CacheService.CONVERSATION_METADATA, 
-                conversation_id=conversation_id
-            )
-            
-            logger.debug(f"🗑️ Invalidated summary-related caches cho conversation_id={conversation_id}")
-            
+            existing_health_data = self.db.query(HealthData).filter(
+                HealthData.conversation_id == conversation_id,
+                HealthData.user_id == user_id
+            ).first()
+
+            if existing_health_data:
+                # Update existing
+                def update_field_safely(field_name: str, new_value: str, current_value: str) -> str:
+                    if not new_value or new_value.strip() == "":
+                        return current_value
+                    if not current_value or current_value.strip() == "":
+                        return new_value
+                    if new_value not in current_value:
+                        return f"{current_value}. {new_value}"
+                    return current_value
+
+                if health_condition:
+                    existing_health_data.health_condition = update_field_safely(
+                        "health_condition", health_condition, existing_health_data.health_condition or ""
+                    )
+                if medical_history:
+                    existing_health_data.medical_history = update_field_safely(
+                        "medical_history", medical_history, existing_health_data.medical_history or ""
+                    )
+                if allergies:
+                    existing_health_data.allergies = update_field_safely(
+                        "allergies", allergies, existing_health_data.allergies or ""
+                    )
+                if dietary_habits:
+                    existing_health_data.dietary_habits = update_field_safely(
+                        "dietary_habits", dietary_habits, existing_health_data.dietary_habits or ""
+                    )
+                if health_goals:
+                    existing_health_data.health_goals = update_field_safely(
+                        "health_goals", health_goals, existing_health_data.health_goals or ""
+                    )
+
+                if additional_info:
+                    current_additional = existing_health_data.additional_info or {}
+                    if isinstance(current_additional, str):
+                        try:
+                            current_additional = json.loads(current_additional)
+                        except:
+                            current_additional = {}
+                    current_additional.update(additional_info)
+                    existing_health_data.additional_info = current_additional
+
+                if data:
+                    current_data = existing_health_data.data or {}
+                    if isinstance(current_data, str):
+                        try:
+                            current_data = json.loads(current_data)
+                        except:
+                            current_data = {}
+                    current_data.update(data)
+                    existing_health_data.data = current_data
+
+                existing_health_data.updated_at = datetime.now()
+                logger.debug(f"📝 Prepared update health_data for conversation_id={conversation_id}")
+                return existing_health_data
+            else:
+                # Create new
+                health_data = HealthData(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    health_condition=health_condition,
+                    medical_history=medical_history,
+                    allergies=allergies,
+                    dietary_habits=dietary_habits,
+                    health_goals=health_goals,
+                    additional_info=additional_info,
+                    data=data
+                )
+                self.db.add(health_data)
+                logger.debug(f"📝 Prepared create new health_data for conversation_id={conversation_id}")
+                return health_data
+
         except Exception as e:
-            logger.warning(f"⚠️ Lỗi khi invalidate summary caches: {str(e)}") 
+            logger.error(f"💥 Lỗi khi prepare health_data: {str(e)}")
+            return None
+    
+    def commit_and_refresh_health_data(self, health_data: HealthData) -> HealthData:
+        """
+        Commit health_data đã được prepare và refresh để lấy ID.
+        Sau đó invalidate caches.
+        """
+        self.db.commit()
+        self.db.refresh(health_data)
+        
+        # Invalidate health data cache
+        health_cache_key = CacheService._get_cache_key(
+            CacheService.HEALTH_DATA, 
+            conversation_id=health_data.conversation_id
+        )
+        CacheService.delete_cache(health_cache_key)
+        
+        logger.debug(f"✅ Committed and refreshed health_data id={health_data.id}")
+        return health_data 

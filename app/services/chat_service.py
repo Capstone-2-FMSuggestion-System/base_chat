@@ -1,6 +1,6 @@
 import logging
 from sqlalchemy.orm import Session
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
 from fastapi import HTTPException
 import asyncio
 from datetime import datetime
@@ -10,6 +10,7 @@ from app.repositories.chat_repository import ChatRepository
 from app.services.llm_service_factory import LLMServiceFactory
 from app.services.gemini_prompt_service import GeminiPromptService
 from app.services.chat_flow import run_chat_flow
+from app.services.background_db_service import background_db_service
 from app.config import settings
 from app.db.models import Message
 from app.schemas.chat import ChatResponse, NewChatResponse
@@ -382,4 +383,221 @@ class ChatService:
             raise
         except Exception as e:
             logger.error(f"💥 Lỗi khi lấy chat content cho user_id={user_id}, conversation_id={conversation_id}: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Không thể lấy nội dung cuộc trò chuyện") 
+            raise HTTPException(status_code=500, detail="Không thể lấy nội dung cuộc trò chuyện")
+
+    # === BACKGROUND DB OPERATIONS METHODS ===
+    
+    async def process_message_with_background(self, user_id: int, message_content: str, 
+                                           conversation_id: Optional[int] = None) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Version của process_message với background DB operations.
+        
+        Returns:
+            Tuple[response_data, background_task_ids]
+        """
+        background_task_ids = []
+        
+        # Bước 1: Chuẩn bị conversation
+        if not conversation_id:
+            conversation = self.repository.get_latest_conversation(user_id)
+            if not conversation:
+                # Tạo conversation mới và trả về với welcome message
+                return await self._handle_new_conversation_with_background(user_id, message_content)
+            conversation_id = conversation.conversation_id
+        else:
+            conversation = self.repository.get_conversation_by_id(conversation_id)
+            if not conversation or conversation.user_id != user_id:
+                raise ValueError("Cuộc trò chuyện không hợp lệ hoặc không có quyền truy cập.")
+
+        # Bước 2: Lấy lịch sử chat TRƯỚC khi tin nhắn hiện tại được thêm
+        chat_history_before_current_message = self.repository.get_messages(conversation_id)
+        logger.info(f"🔄 Bắt đầu xử lý tin nhắn với background DB cho conversation_id={conversation_id}, user_id={user_id}")
+
+        try:
+            # Bước 3: Gọi LangGraph để xử lý logic chính
+            langgraph_result = await run_chat_flow(
+                user_message=message_content,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=chat_history_before_current_message,
+                repository=self.repository,
+                llm_service=self.llm_service
+            )
+            
+            # Bước 4: Chuẩn bị background tasks cho DB operations
+            background_task_ids.extend(
+                await self._prepare_background_db_tasks(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    message_content=message_content,
+                    langgraph_result=langgraph_result
+                )
+            )
+            
+            # Bước 5: Chuẩn bị response (không chờ DB commit)
+            current_summary = self.repository.get_latest_summary(conversation_id)
+            response_payload = self._build_response_payload(
+                conversation_id=conversation_id,
+                message_content=message_content,
+                langgraph_result=langgraph_result,
+                current_summary=current_summary
+            )
+            
+            logger.info(f"✅ Xử lý thành công tin nhắn với {len(background_task_ids)} background tasks cho conversation_id={conversation_id}")
+            return response_payload, background_task_ids
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi nghiêm trọng khi xử lý tin nhắn với background (ChatService): {str(e)}", exc_info=True)
+            error_response = await self._handle_error_response(conversation_id, message_content, e)
+            return error_response, background_task_ids
+
+    async def _handle_new_conversation_with_background(self, user_id: int, message_content: str) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Xử lý tin nhắn đầu tiên trong conversation mới với background operations.
+        """
+        try:
+            conversation = self.repository.create_conversation(user_id)
+            conversation_id = conversation.conversation_id
+            
+            # Tạo welcome message
+            welcome_message_content = await self.gemini_service.generate_welcome_message()
+            
+            # Tạo background tasks cho messages
+            task_ids = []
+            
+            # Task cho welcome message
+            welcome_task_id = background_db_service.add_message_task(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=welcome_message_content,
+                repository_instance=self.repository
+            )
+            task_ids.append(welcome_task_id)
+            
+            # Task cho user message
+            user_task_id = background_db_service.add_message_task(
+                conversation_id=conversation_id,
+                role="user", 
+                content=message_content,
+                repository_instance=self.repository
+            )
+            task_ids.append(user_task_id)
+            
+            logger.info(f"🆕 Tạo conversation mới với background tasks: {conversation_id} cho user_id={user_id}")
+            
+            response_data = {
+                "conversation_id": conversation_id,
+                "user_message": {"role": "user", "content": message_content},
+                "assistant_message": {"role": "assistant", "content": welcome_message_content},
+                "current_summary": None,
+                "is_new_conversation": True
+            }
+            
+            return response_data, task_ids
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi tạo conversation mới với background: {str(e)}", exc_info=True)
+            raise
+
+    async def _prepare_background_db_tasks(self, conversation_id: int, user_id: int,
+                                         message_content: str, langgraph_result: Dict[str, Any]) -> List[str]:
+        """
+        Chuẩn bị các background DB tasks dựa trên kết quả từ LangGraph.
+        
+        Returns:
+            List task IDs đã được tạo
+        """
+        task_ids = []
+        
+        try:
+            # Task 1: Save user message nếu chưa có
+            user_message_id = langgraph_result.get("user_message_id_db")
+            if not user_message_id:
+                user_task_id = background_db_service.add_message_task(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=message_content,
+                    repository_instance=self.repository
+                )
+                task_ids.append(user_task_id)
+                logger.debug(f"📝 Tạo background task cho user message: {user_task_id}")
+            
+            # Task 2: Save assistant message nếu có final_response
+            final_response = langgraph_result.get("final_response")
+            assistant_message_id = langgraph_result.get("assistant_message_id_db")
+            
+            if final_response and not assistant_message_id:
+                assistant_task_id = background_db_service.add_message_task(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=final_response,
+                    repository_instance=self.repository
+                )
+                task_ids.append(assistant_task_id)
+                logger.debug(f"📝 Tạo background task cho assistant message: {assistant_task_id}")
+            
+            # Task 3: Save conversation summary nếu đủ điều kiện
+            should_create_summary = (
+                langgraph_result.get("is_valid_scope", False) and 
+                not langgraph_result.get("need_more_info", True) and
+                final_response and assistant_message_id
+            )
+            
+            if should_create_summary:
+                # Tạo summary với Gemini
+                previous_summary = self.repository.get_latest_summary(conversation_id)
+                summary_context_messages = self.repository.get_messages_for_summary_context(conversation_id, limit=3)
+                
+                new_summary = await self.gemini_service.create_incremental_summary(
+                    previous_summary=previous_summary,
+                    new_user_message=message_content,
+                    new_assistant_message=final_response,
+                    full_chat_history_for_context=summary_context_messages
+                )
+                
+                if new_summary:
+                    summary_task_id = background_db_service.save_conversation_summary_task(
+                        conversation_id=conversation_id,
+                        assistant_message_id=assistant_message_id,
+                        summary_text=new_summary,
+                        repository_instance=self.repository
+                    )
+                    task_ids.append(summary_task_id)
+                    logger.debug(f"📝 Tạo background task cho conversation summary: {summary_task_id}")
+            
+            # Task 4: Save health data nếu có
+            extracted_health_data = langgraph_result.get("extracted_health_data")
+            if extracted_health_data:
+                health_task_id = background_db_service.save_health_data_task(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    health_data=extracted_health_data,
+                    repository_instance=self.repository
+                )
+                task_ids.append(health_task_id)
+                logger.debug(f"📝 Tạo background task cho health data: {health_task_id}")
+            
+            logger.info(f"🔄 Đã chuẩn bị {len(task_ids)} background DB tasks cho conversation_id={conversation_id}")
+            return task_ids
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi chuẩn bị background DB tasks: {str(e)}", exc_info=True)
+            return task_ids
+
+    def execute_background_tasks(self, task_ids: List[str]) -> None:
+        """
+        Execute các background DB tasks.
+        Được gọi từ FastAPI BackgroundTasks.
+        """
+        if not task_ids:
+            return
+            
+        logger.info(f"🚀 Bắt đầu execute {len(task_ids)} background DB tasks")
+        background_db_service.execute_multiple_tasks(task_ids)
+        
+    def get_background_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Lấy trạng thái của một background task.
+        Dùng cho monitoring/debugging.
+        """
+        return background_db_service.get_task_status(task_id) 
