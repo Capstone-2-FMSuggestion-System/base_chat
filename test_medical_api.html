@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Medical AI Assistant API</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #chat-container {
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            padding: 10px;
+            height: 400px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+            background-color: #f9f9f9;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            border-radius: 5px;
+            white-space: pre-wrap; /* Để hiển thị xuống dòng trong tin nhắn bot */
+        }
+        .user-message {
+            background-color: #dcf8c6;
+            align-self: flex-end;
+            margin-left: 50px;
+        }
+        .bot-message {
+            background-color: #ffffff;
+            align-self: flex-start;
+            margin-right: 50px;
+        }
+        textarea, input[type="text"], input[type="number"] { /* Apply to token and conversation_id input */
+            width: 100%;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            box-sizing: border-box;
+            margin-bottom: 10px;
+        }
+        textarea {
+            height: 80px;
+            resize: none;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 5px;
+            margin-right: 5px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .loading {
+            color: #888;
+            font-style: italic;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Medical AI Assistant (Streaming)</h1>
+
+    <div class="input-group">
+        <label for="api-token">API Token:</label>
+        <input type="text" id="api-token" placeholder="Nhập API Token của bạn...">
+    </div>
+
+    <div class="input-group">
+        <label for="conversation-id">Conversation ID (Tùy chọn):</label>
+        <input type="number" id="conversation-id" placeholder="Nhập Conversation ID (nếu có)">
+    </div>
+
+    <div id="chat-container"></div>
+    <textarea id="user-input" placeholder="Nhập câu hỏi y tế của bạn..."></textarea>
+    <div>
+        <button onclick="sendMessage()">Gửi</button>
+        <button onclick="clearChat()">Xóa chat</button>
+    </div>
+
+    <script>
+        // Thay đổi URL này theo địa chỉ ngrok hoặc server của bạn
+        const API_URL = "http://localhost:8002/api/stream-chat"; // Đảm bảo URL này đúng
+        const chatContainer = document.getElementById('chat-container');
+        const userInput = document.getElementById('user-input');
+        const apiTokenInput = document.getElementById('api-token');
+        const conversationIdInput = document.getElementById('conversation-id'); // Input cho conversation_id
+
+        // Không còn dùng mảng `messages` để gửi toàn bộ lịch sử nữa
+        // vì input của bạn chỉ cần message hiện tại và conversation_id
+
+        // Thêm tin nhắn vào container
+        function addMessageToChat(content, isUser, messageId = null) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            if (messageId) {
+                messageDiv.id = messageId;
+            }
+            messageDiv.textContent = content; // Sử dụng textContent để tránh XSS, pre-wrap sẽ xử lý xuống dòng
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return messageDiv; // Trả về div để có thể cập nhật
+        }
+
+        // Cập nhật tin nhắn đang stream của bot
+        function updateBotMessage(messageDiv, newChunk) {
+            // Xử lý các trường hợp đặc biệt như {"replace": "..."}
+            try {
+                const specialCommand = JSON.parse(newChunk);
+                if (specialCommand.replace) {
+                    messageDiv.textContent = specialCommand.replace;
+                    return; // Đã thay thế, không nối thêm
+                }
+                // Thêm các lệnh đặc biệt khác nếu có
+            } catch (e) {
+                // Không phải JSON hoặc không phải lệnh đặc biệt, cứ nối chuỗi
+            }
+            messageDiv.textContent += newChunk;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+
+        // Gửi tin nhắn
+        async function sendMessage() {
+            const userMessageContent = userInput.value.trim();
+            const apiToken = apiTokenInput.value.trim();
+            const conversationIdStr = conversationIdInput.value.trim();
+
+            if (!userMessageContent) return;
+
+            if (!apiToken) {
+                addMessageToChat("Vui lòng nhập API Token.", false);
+                return;
+            }
+
+            // Hiển thị tin nhắn người dùng
+            addMessageToChat(userMessageContent, true);
+            userInput.value = '';
+
+            // Chuẩn bị payload theo yêu cầu mới
+            const payload = {
+                message: userMessageContent
+            };
+            if (conversationIdStr) {
+                const conversationId = parseInt(conversationIdStr, 10);
+                if (!isNaN(conversationId)) {
+                    payload.conversation_id = conversationId;
+                } else {
+                    addMessageToChat("Conversation ID không hợp lệ. Bỏ qua.", false);
+                }
+            }
+
+            // Tạo một div trống cho tin nhắn của bot để cập nhật dần
+            const botMessageDiv = addMessageToChat("Đang suy nghĩ...", false, 'bot-streaming-message');
+
+
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiToken}`,
+                        'Accept': 'text/event-stream' // Quan trọng: Yêu cầu server stream
+                    },
+                    body: JSON.stringify(payload),
+                });
+
+                if (!response.ok) {
+                    // Xóa tin nhắn "Đang suy nghĩ..." nếu có lỗi trước khi stream bắt đầu
+                    if (botMessageDiv.textContent === "Đang suy nghĩ...") {
+                        botMessageDiv.remove();
+                    }
+                    let errorData;
+                    try {
+                        errorData = await response.json(); // Thử parse lỗi JSON
+                    } catch (e) {
+                        errorData = { detail: await response.text() }; // Nếu không phải JSON, lấy text
+                    }
+                    const errorMessage = errorData.detail || `Lỗi HTTP! Status: ${response.status} ${response.statusText}`;
+                    addMessageToChat(`Lỗi: ${errorMessage}`, false);
+                    return;
+                }
+
+                // Xử lý Server-Sent Events (SSE)
+                if (response.headers.get("content-type") && response.headers.get("content-type").includes("text/event-stream")) {
+                    botMessageDiv.textContent = ""; // Xóa "Đang suy nghĩ..." để bắt đầu stream
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            // Kiểm tra xem có tin nhắn [DONE] cuối cùng không để hoàn tất
+                            // Thường thì không cần xử lý gì thêm ở đây nếu server tự đóng stream
+                            console.log("Stream finished.");
+                            break;
+                        }
+
+                        const chunk = decoder.decode(value, { stream: true });
+                        // SSE thường có dạng "data: <message>\n\n"
+                        // Hoặc chỉ là từng dòng dữ liệu nếu server của bạn không tuân thủ SSE hoàn toàn
+                        const lines = chunk.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const dataContent = line.substring(6).trim(); // Bỏ "data: "
+                                if (dataContent === '[DONE]') {
+                                    console.log("Received [DONE] signal.");
+                                    // Có thể thực hiện hành động cuối cùng ở đây nếu cần
+                                    // Hoặc đơn giản là chờ stream tự kết thúc
+                                    // reader.cancel(); // Có thể gọi để chủ động đóng reader
+                                    // break; // Thoát vòng lặp for, vòng lặp while sẽ tiếp tục cho đến khi done
+                                } else if (dataContent) {
+                                    updateBotMessage(botMessageDiv, dataContent);
+                                }
+                            } else if (line.trim() === '[DONE]') { // Trường hợp server chỉ gửi [DONE] mà không có "data: "
+                                console.log("Received [DONE] signal (no data prefix).");
+                            } else if (line.trim()) { // Nếu server gửi dữ liệu không có "data: " prefix
+                                // Giả định đây là một phần của tin nhắn
+                                // Cần cẩn thận vì có thể có các dòng trống hoặc dòng comment (startsWith(':')) trong SSE chuẩn
+                                // updateBotMessage(botMessageDiv, line.trim());
+                                // Bỏ qua các dòng không phải "data:" để tránh lỗi
+                                console.log("Received non-data line:", line);
+                            }
+                        }
+                    }
+                } else {
+                    // Xử lý phản hồi JSON thông thường nếu không phải stream
+                    botMessageDiv.remove(); // Xóa tin nhắn "Đang suy nghĩ..."
+                    const data = await response.json();
+                     if (data.choices && data.choices.length > 0) { // Giả sử vẫn có thể có cấu trúc này
+                        const botReply = data.choices[0].message.content;
+                        addMessageToChat(botReply, false);
+                    } else if (data.message) { // Hoặc một cấu trúc đơn giản hơn
+                        addMessageToChat(data.message, false);
+                    }
+                    else {
+                        addMessageToChat("Không nhận được phản hồi hợp lệ từ AI.", false);
+                    }
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+                const existingBotMessage = document.getElementById('bot-streaming-message');
+                if (existingBotMessage) {
+                    if (existingBotMessage.textContent === "Đang suy nghĩ...") {
+                        existingBotMessage.textContent = `Lỗi kết nối hoặc xử lý: ${error.message}`;
+                    } else {
+                        // Nếu đang stream dở mà lỗi thì có thể không cần làm gì thêm
+                        // Hoặc thêm một tin nhắn lỗi mới
+                        addMessageToChat(`Lỗi kết nối hoặc xử lý: ${error.message}`, false);
+                    }
+                } else {
+                     addMessageToChat(`Lỗi kết nối hoặc xử lý: ${error.message}`, false);
+                }
+            }
+        }
+
+        // Xóa chat
+        function clearChat() {
+            chatContainer.innerHTML = '';
+            // Không cần reset `messages` nữa nếu bạn không dùng nó để gửi
+        }
+
+        // Hỗ trợ Enter để gửi tin nhắn
+        userInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>

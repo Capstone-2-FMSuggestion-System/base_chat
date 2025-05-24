@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, TIMESTAMP, JSON, Boolean
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, TIMESTAMP, JSON, Boolean, DECIMAL
 from sqlalchemy.sql import text
 from app.db.database import Base
 
@@ -61,4 +61,47 @@ class HealthData(Base):
     updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
     
     # Dánh dấu trạng thái
-    is_processed = Column(Boolean, default=False)  # Đánh dấu dữ liệu đã được xử lý chưa 
+    is_processed = Column(Boolean, default=False)  # Đánh dấu dữ liệu đã được xử lý chưa
+
+
+class Menu(Base):
+    __tablename__ = "menus"
+    
+    menu_id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)  # Tên công thức món ăn
+    description = Column(String(500), nullable=True)  # Mô tả công thức
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class MenuItem(Base):
+    __tablename__ = "menu_items"
+    
+    menu_item_id = Column(Integer, primary_key=True, index=True)
+    menu_id = Column(Integer, ForeignKey("menus.menu_id"), nullable=False)
+    product_id = Column(Integer, nullable=False)  # Product ID từ product database
+    quantity = Column(Integer, nullable=False, default=1)  # Số lượng nguyên liệu cần
+
+
+class Category(Base):
+    __tablename__ = "categories"
+    
+    category_id = Column(Integer, primary_key=True, index=True)
+    parent_id = Column(Integer, ForeignKey("categories.category_id"), nullable=True)
+    name = Column(String(50), nullable=False)
+    description = Column(String(500), nullable=True)
+    level = Column(Integer, nullable=False)
+
+
+class Product(Base):
+    __tablename__ = "products"
+    
+    product_id = Column(Integer, primary_key=True, index=True)
+    category_id = Column(Integer, ForeignKey("categories.category_id"), nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(String(1000), nullable=True)
+    price = Column(DECIMAL(10, 2), nullable=False)
+    original_price = Column(DECIMAL(10, 2), nullable=False)
+    unit = Column(String(20), nullable=True)
+    stock_quantity = Column(Integer, default=0)
+    is_featured = Column(Boolean, default=False)
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP")) 

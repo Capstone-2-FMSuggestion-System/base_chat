@@ -9,7 +9,7 @@ import uvicorn
 from typing import Dict, Any
 
 from app.api.chat import router as chat_router
-from app.api.auth import router as auth_router
+# from app.api.auth import router as auth_router # Removed
 from app.config import settings
 from app.db.database import engine, Base
 from app.services.llm_service_factory import LLMServiceFactory, LLMServiceType
@@ -48,7 +48,7 @@ app.add_middleware(
 )
 
 # Đăng ký router
-app.include_router(auth_router, prefix="/api", tags=["auth"])
+# app.include_router(auth_router, prefix="/api", tags=["auth"]) # Removed
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 
 

@@ -37,8 +37,16 @@ class Settings(BaseSettings):
     
     # Gemini API
     GEMINI_API_KEY: str = ""
+    GEMINI_API_KEYS_LIST: Optional[str] = None  # For API key load balancing
     GEMINI_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+    GEMINI_MODEL: str = "gemini-2.0-flash-lite"
     GEMINI_MAX_PROMPT_LENGTH: int = 900  # Giới hạn độ dài prompt cho Medichat
+    
+    # Pinecone Vector Database
+    PRODUCT_DB_PINECONE_API_KEY: str = ""
+    RECIPE_DB_PINECONE_API_KEY: str = ""
+    PINECONE_INDEX_NAME: str = "product-index"
+    PINECONE_ENVIRONMENT: str = "gcp-starter"
     
     # Prompt Templates
     MEDICHAT_SYSTEM_PROMPT: str = """Bạn là chuyên gia dinh dưỡng, chỉ cung cấp gợi ý món ăn. Khi người dùng chia sẻ tình trạng sức khỏe, hãy gợi ý 2-3 món ăn phù hợp bằng tiếng Việt, mỗi món kèm 1 câu giải thích ngắn gọn. KHÔNG đề cập đến thuốc."""
@@ -58,6 +66,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int
+    BACKEND_AUTH_VERIFY_URL: str
     
     # API
     API_HOST: str

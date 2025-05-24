@@ -39,6 +39,7 @@ class GeminiPromptService:
         self.api_url = api_url or settings.GEMINI_API_URL
         self.model_name = "gemini-2.0-flash-lite"  # Mô hình mặc định
         self.max_prompt_length = 900  # Giới hạn độ dài prompt
+        self.max_prompt_length_with_recipes = 400  # Giới hạn cho prompt có recipes (từ)
         
         # Sử dụng biến global GOOGLE_AI_AVAILABLE
         global GOOGLE_AI_AVAILABLE
@@ -71,8 +72,13 @@ class GeminiPromptService:
             logger.error("Không thể phân tích: Thiếu API key của Gemini")
             return {
                 "is_valid_scope": True,  # Fallback: mặc định là hợp lệ
+                "is_food_related": False,
+                "requests_food": False,
+                "requests_beverage": False,
                 "need_more_info": False,
                 "follow_up_question": None,
+                "user_rejected_info": False,
+                "suggest_general_options": False,
                 "collected_info": {}
             }
         
@@ -101,6 +107,15 @@ class GeminiPromptService:
                 
                 # Phân tích JSON
                 result = json.loads(clean_result)
+                
+                # Đảm bảo các trường mới tồn tại với giá trị mặc định
+                result.setdefault("requests_food", False)
+                result.setdefault("requests_beverage", False)
+                
+                # Validation logic: Đảm bảo logic tính is_food_related
+                if result.get("requests_food", False) or result.get("requests_beverage", False):
+                    result["is_food_related"] = True
+                
                 logger.info(f"Phân tích thành công: {result}")
                 return result
             except json.JSONDecodeError as json_err:
@@ -113,6 +128,15 @@ class GeminiPromptService:
                     if match:
                         potential_json = match.group(1)
                         result = json.loads(potential_json)
+                        
+                        # Đảm bảo các trường mới tồn tại với giá trị mặc định
+                        result.setdefault("requests_food", False)
+                        result.setdefault("requests_beverage", False)
+                        
+                        # Validation logic: Đảm bảo logic tính is_food_related
+                        if result.get("requests_food", False) or result.get("requests_beverage", False):
+                            result["is_food_related"] = True
+                        
                         logger.info(f"Đã trích xuất JSON thành công từ phản hồi: {result}")
                         return result
                 except Exception as extract_err:
@@ -123,15 +147,25 @@ class GeminiPromptService:
                     # Chào hỏi, cần phục vụ luôn
                     return {
                         "is_valid_scope": True,
+                        "is_food_related": False,
+                        "requests_food": False,
+                        "requests_beverage": False,
                         "need_more_info": False,
                         "follow_up_question": analysis_result,
+                        "user_rejected_info": False,
+                        "suggest_general_options": False,
                         "collected_info": {}
                     }
                 else:
                     return {
                         "is_valid_scope": True,
+                        "is_food_related": False,
+                        "requests_food": False,
+                        "requests_beverage": False,
                         "need_more_info": False,
                         "follow_up_question": None,
+                        "user_rejected_info": False,
+                        "suggest_general_options": False,
                         "collected_info": {}
                     }
                 
@@ -140,8 +174,13 @@ class GeminiPromptService:
             # Trả về kết quả mặc định nếu có lỗi
             return {
                 "is_valid_scope": True,  # Fallback: mặc định là hợp lệ
+                "is_food_related": False,
+                "requests_food": False,
+                "requests_beverage": False,
                 "need_more_info": False,
                 "follow_up_question": None,
+                "user_rejected_info": False,
+                "suggest_general_options": False,
                 "collected_info": {}
             }
     
@@ -494,84 +533,132 @@ Viết bằng tiếng Việt, trực tiếp phản hồi không có giải thíc
         # Nhưng tối ưu cho token - giảm độ dài nội dung nếu quá dài
         history_text = ""
         total_chars = 0
-        max_history_chars = 14000  # Giới hạn ký tự cho lịch sử chat để tránh vượt quá giới hạn token
-        
-        if chat_history:
-            # Sử dụng toàn bộ lịch sử chat nhưng có kiểm soát độ dài
-            for msg in chat_history:
-                role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
-                content = msg['content']
-                
-                # Cắt bớt nội dung nếu quá dài
-                if len(content) > 500:
-                    content = content[:500] + "... [nội dung đã cắt ngắn]"
-                
-                msg_text = f"{role}: {content}\n"
-                
-                # Kiểm tra xem có vượt quá giới hạn không
-                if total_chars + len(msg_text) > max_history_chars:
-                    history_text += "[...nhiều tin nhắn trước đó đã được bỏ qua...]\n"
-                    break
-                
-                history_text += msg_text
-                total_chars += len(msg_text)
+        recent_history = chat_history[-10:] # Giữ nguyên giới hạn 10 tin nhắn gần nhất
+
+        for msg in recent_history:
+            role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
+            content = msg['content']
+            if len(content) > 300:
+                content = content[:300] + "... [nội dung đã cắt ngắn]"
+            msg_text = f"{role}: {content}\n"
+            if total_chars + len(msg_text) > 3000: #có thể thay 3000 bằng 14000
+                history_text = "[...một số tin nhắn trước đó đã được bỏ qua...]\n" + history_text
+                break
+            history_text += msg_text
+            total_chars += len(msg_text)
         
         # Tạo prompt
-        prompt = f"""Phân tích TOÀN BỘ cuộc trò chuyện dưới đây để xác định thông tin sức khỏe và nhu cầu dinh dưỡng của người dùng:
+        prompt = f"""Bạn là một chuyên viên phân tích y tế thông minh và tinh tế. Nhiệm vụ của bạn là phân tích CUỘC TRÒ CHUYỆN dưới đây để hiểu rõ ý định của người dùng, trích xuất thông tin và xác định các bước tiếp theo.
 
-LỊCH SỬ CHAT ĐẦY ĐỦ:
+PHẠM VI HỖ TRỢ CỦA TRỢ LÝ: 
+Tư vấn dinh dưỡng, sức khỏe, gợi ý món ăn và đồ uống phù hợp với tình trạng sức khỏe người dùng (nếu được cung cấp). Trợ lý có thể:
+- Tư vấn món ăn, đồ uống tốt cho sức khỏe
+- Gợi ý công thức nấu ăn phù hợp với tình trạng bệnh lý
+- Tư vấn dinh dưỡng cho từng đối tượng (trẻ em, người cao tuổi, người bệnh)
+- Tư vấn thực phẩm nên tránh với các bệnh lý cụ thể
+- Gợi ý nguyên liệu và cách chế biến món ăn
+- Tư vấn chế độ ăn uống khoa học
+
+LỊCH SỬ CHAT GẦN ĐÂY:
 {history_text}
 
 TIN NHẮN NGƯỜI DÙNG MỚI NHẤT:
 {user_message}
 
-NHIỆM VỤ CỤ THỂ:
+YÊU CẦU PHÂN TÍCH CHI TIẾT:
 
-1. Phân tích kỹ lưỡng toàn bộ cuộc trò chuyện để xác định mọi thông tin liên quan đến:
-   - Tình trạng sức khỏe hiện tại (tiểu đường, cao huyết áp, dị ứng, v.v.)
-   - Bệnh lý đã biết (đặc biệt chú ý phát hiện các bệnh mãn tính)
-   - Dị ứng thực phẩm (nêu cụ thể loại thực phẩm gây dị ứng)
-   - Thói quen ăn uống (kiểu ăn, thời gian, sở thích)
-   - Mục tiêu sức khỏe (giảm cân, kiểm soát đường huyết, v.v.)
+1. Xác định Phạm vi Yêu cầu:
+   - is_valid_scope: (boolean) Yêu cầu có nằm trong PHẠM VI HỖ TRỢ không? Chỉ đặt false nếu yêu cầu hoàn toàn không liên quan đến dinh dưỡng, sức khỏe, món ăn, đồ uống.
+   - is_food_related: (boolean) Yêu cầu có cụ thể về món ăn, đồ uống, công thức, nguyên liệu hoặc tư vấn dinh dưỡng không? (Cờ tổng quan cho cả ẩm thực nói chung)
+   - requests_food: (boolean) Người dùng có cụ thể hỏi về món ăn, công thức nấu ăn, thực đơn món ăn không?
+   - requests_beverage: (boolean) Người dùng có cụ thể hỏi về đồ uống, nước uống, công thức pha chế, trà, cà phê, nước ép, sinh tố không?
 
-2. Ghi lại chi tiết các yếu tố từ TIN NHẮN MỚI NHẤT và TOÀN BỘ LỊCH SỬ trước đó:
-   - Chú ý đặc biệt đến các lần nhắc đến "tiểu đường", "dị ứng", "bệnh", "không dùng được", "không ăn được"
-   - Liên kết các yêu cầu mới với thông tin sức khỏe đã chia sẻ trước đó
-   - Xác định mong muốn về món ăn hoặc chế độ dinh dưỡng
+HƯỚNG DẪN CHI TIẾT CHO VIỆC ĐẶT CÁC CỜ:
+- Nếu người dùng hỏi 'món ăn cho người tiểu đường', 'công thức phở bò', 'thực đơn bữa tối', 'cách nấu canh chua', đặt requests_food = true và requests_beverage = false (trừ khi họ cũng hỏi đồ uống).
+- Nếu người dùng hỏi 'nước ép tốt cho da', 'cách pha trà gừng', 'đồ uống giải nhiệt', 'nước detox', 'sinh tố dinh dưỡng', đặt requests_beverage = true và requests_food = false (trừ khi họ cũng hỏi món ăn).
+- Nếu người dùng hỏi 'gợi ý món ăn và đồ uống cho bữa tiệc', 'thực đơn đầy đủ cho ngày hôm nay', đặt cả requests_food = true và requests_beverage = true.
+- Nếu người dùng hỏi chung chung 'tôi nên ăn uống gì hôm nay?' mà không rõ ràng món ăn hay đồ uống, dựa vào ngữ cảnh trước đó. Nếu không có ngữ cảnh rõ ràng, có thể đặt cả hai là false và dựa vào suggest_general_options hoặc follow_up_question.
+- Cờ is_food_related sẽ là true nếu requests_food hoặc requests_beverage là true, hoặc nếu yêu cầu liên quan đến tư vấn dinh dưỡng nói chung.
 
-3. Xác định phạm vi hỗ trợ và nhu cầu thông tin:
-   - Nội dung có liên quan đến tư vấn dinh dưỡng/thực phẩm không?
-   - Cần thu thập thêm thông tin gì để đưa ra gợi ý phù hợp?
-   - Người dùng có từ chối cung cấp thông tin cụ thể nào không?
+2. Trích xuất Thông tin Sức khỏe và Yêu cầu:
+   - collected_info: (object) {{
+       "health_condition": "string (ví dụ: 'tiểu đường type 2', 'cao huyết áp', 'bệnh tim', để trống nếu không có)",
+       "medical_history": "string (ví dụ: 'từng phẫu thuật dạ dày', 'có tiền sử dị ứng', để trống nếu không có)",
+       "allergies": "string (ví dụ: 'hải sản', 'đậu phộng', 'gluten', để trống nếu không có)",
+       "dietary_habits": "string (ví dụ: 'ăn chay', 'thích đồ ngọt', 'ăn ít muối', 'không uống sữa', để trống nếu không có)",
+       "food_preferences": "string (ví dụ: 'thích ăn cá', 'thích vị ngọt', 'cần món nước', 'muốn món dễ làm', 'cần món nhanh gọn', 'thích món truyền thống', để trống nếu không có)",
+       "food_dislikes": "string (ví dụ: 'không ăn được hành', 'ghét sầu riêng', 'không thích đồ chua', để trống nếu không có)",
+       "health_goals": "string (ví dụ: 'giảm cân', 'kiểm soát đường huyết', 'hạ nhiệt', 'tăng cường miễn dịch', để trống nếu không có)"
+     }}
 
-Trả về kết quả dưới dạng JSON với cấu trúc chính xác sau:
+3. Đánh giá Thái độ Từ chối và Gợi ý Chung:
+   - user_rejected_info: (boolean) Người dùng có đang TỪ CHỐI RÕ RÀNG HOẶC NGẦM cung cấp thêm thông tin không? 
+     Các ví dụ từ chối bao gồm:
+     + Rõ ràng: "tôi không muốn nói", "tôi không thể cung cấp thông tin này", "tôi từ chối trả lời"
+     + Ngầm: "tôi không biết nữa", "bạn cứ gợi ý đi", "cho tôi vài ví dụ", "tôi không rõ", "bạn chọn giúp tôi", "tùy bạn", "gì cũng được"
+     
+   - suggest_general_options: (boolean) Đặt TRUE khi:
+     + is_valid_scope là true VÀ 
+     + is_food_related là true VÀ
+     + (user_rejected_info là true HOẶC thông tin trong collected_info + user_message quá ít để đưa ra gợi ý cá nhân hóa) VÀ
+     + KHÔNG CÓ đủ thông tin cụ thể từ người dùng về tình trạng sức khỏe/sở thích cá nhân
+     Khi TRUE: Trợ lý sẽ gợi ý dựa trên tiêu chí chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít gây dị ứng, dễ chế biến)
+
+4. Đánh giá Nhu cầu Thông tin Bổ sung:
+   - need_more_info: (boolean)
+     + **QUY TẮC QUAN TRỌNG: Nếu user_rejected_info là true, thì need_more_info PHẢI LÀ FALSE.**
+     + **QUY TẮC QUAN TRỌNG: Nếu suggest_general_options là true, thì need_more_info PHẢI LÀ FALSE.**
+     + Nếu cả hai điều kiện trên là false, và thông tin trong collected_info + user_message QUÁ ÍT để đưa ra bất kỳ gợi ý nào (kể cả gợi ý chung), thì đặt là true.
+     
+   - follow_up_question: (string | null)
+     + **QUAN TRỌNG: Chỉ tạo khi need_more_info là true VÀ user_rejected_info là false VÀ suggest_general_options là false**
+     + Nếu cần tạo: Tạo câu hỏi NGẮN GỌN, LỊCH SỰ, CỤ THỂ và TRÁNH HỎI LẠI câu hỏi tương tự đã hỏi trước đó
+     + Nếu người dùng không biết chọn gì, đưa ra 2-3 LỰA CHỌN CỤ THỂ để họ chọn
+     + Ví dụ tốt: "Để gợi ý phù hợp, bạn có muốn thử: 1) Đồ uống giải khát (nước ép, trà thảo mộc), 2) Món ăn nhẹ (chè, bánh), hay 3) Món ăn chính (cơm, phở) không ạ?"
+     + Nếu không cần hỏi thêm, trường này PHẢI là null
+
+HÃY TRẢ VỀ KẾT QUẢ DƯỚI DẠNG MỘT ĐỐI TƯỢNG JSON DUY NHẤT, TUÂN THỦ NGHIÊM NGẶT CẤU TRÚC SAU. KHÔNG THÊM BẤT KỲ GIẢI THÍCH HAY VĂN BẢN NÀO BÊN NGOÀI CẤU TRÚC JSON:
+
 {{
-  "is_valid_scope": true/false,
-  "need_more_info": true/false,
-  "follow_up_question": "Câu hỏi đơn giản, ngắn gọn nếu cần thêm thông tin",
+  "is_valid_scope": boolean,
+  "is_food_related": boolean,
+  "requests_food": boolean,
+  "requests_beverage": boolean,
+  "user_rejected_info": boolean,
+  "need_more_info": boolean,
+  "suggest_general_options": boolean, 
+  "follow_up_question": string | null,
   "collected_info": {{
-    "health_condition": "Tình trạng sức khỏe hiện tại đã phát hiện (tiểu đường/cao huyết áp/v.v.)",
-    "medical_history": "Bệnh lý đã biết (chi tiết từ lịch sử)",
-    "allergies": "Dị ứng đã phát hiện (từ TOÀN BỘ cuộc trò chuyện)",
-    "dietary_habits": "Thói quen ăn uống đã đề cập",
-    "health_goals": "Mục tiêu sức khỏe đã đề cập (giảm cân/kiểm soát đường huyết/v.v.)"
+    "health_condition": "string",
+    "medical_history": "string", 
+    "allergies": "string",
+    "dietary_habits": "string",
+    "food_preferences": "string",
+    "food_dislikes": "string",
+    "health_goals": "string"
   }}
-}}
-
-QUAN TRỌNG: Thu thập thông tin từ TOÀN BỘ cuộc trò chuyện, không chỉ tin nhắn mới nhất. Trích xuất mọi chi tiết về sức khỏe đã được đề cập."""
+}}"""
         
         return prompt
     
-    def _create_medichat_prompt_template(self, messages: List[Dict[str, str]]) -> str:
+    def _create_medichat_prompt_template(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False) -> str:
         """
-        Tạo template prompt để tóm tắt thông tin cho Medichat
+        Tạo template prompt để tóm tắt thông tin cho Medichat.
+        Nếu có recipes hoặc beverages, đưa hết vào và giới hạn prompt tổng là 400 TỪ.
+        Nếu suggest_general là true, yêu cầu Medichat gợi ý chung.
         
         Args:
             messages: Danh sách tin nhắn
+            recipes: Danh sách công thức món ăn (nếu có)
+            beverages: Danh sách đồ uống (nếu có)
+            suggest_general: True nếu cần Medichat gợi ý theo tiêu chí chung.
             
         Returns:
             Prompt cho Gemini để tạo prompt Medichat
         """
+        # Xác định giới hạn từ dựa trên có recipes/beverages hay không hoặc suggest_general
+        word_limit = self.max_prompt_length_with_recipes if (recipes or beverages or suggest_general) else 900
+        
         # Chuyển đổi các tin nhắn thành văn bản - sử dụng toàn bộ lịch sử
         # Nhưng tối ưu cho token - giảm độ dài nội dung nếu quá dài
         conversation_text = "\n\n"
@@ -598,29 +685,82 @@ QUAN TRỌNG: Thu thập thông tin từ TOÀN BỘ cuộc trò chuyện, không
                 conversation_text += msg_text
                 total_chars += len(msg_text)
         
+        # Tạo phần recipes nếu có
+        recipe_section = ""
+        if recipes:
+            recipe_section = "\n\nCÔNG THỨC MÓN ĂN CÓ SẴN TRONG DATABASE:\n"
+            for i, recipe in enumerate(recipes, 1):  # Đưa toàn bộ recipes vào
+                recipe_id = recipe.get('id', f'R{i}')
+                name = recipe.get('name', 'N/A')
+                ingredients = recipe.get('ingredients_summary', 'N/A')
+                url = recipe.get('url', '')
+                
+                recipe_section += f"{i}. [ID: {recipe_id}] {name}\n   - Nguyên liệu: {ingredients}\n"
+                if url:
+                    recipe_section += f"   - Link: {url}\n"
+        
+        # Tạo phần beverages nếu có
+        beverage_section = ""
+        if beverages:
+            beverage_section = "\n\nĐỒ UỐNG CÓ SẴN TRONG DATABASE:\n"
+            for i, bev in enumerate(beverages, 1):
+                bev_id = bev.get('product_id', f'B{i}')
+                name = bev.get('product_name', 'N/A')
+                
+                beverage_section += f"{i}. [ID: {bev_id}] {name}\n"
+        
+        # Tạo phần instruction cho suggest_general
+        general_instruction = ""
+        if suggest_general:
+            general_instruction = "\n\nLƯU Ý QUAN TRỌNG CHO VIỆC TẠO PROMPT MEDICHAT:\n" \
+                                "Người dùng không cung cấp đủ thông tin cụ thể. Hãy tạo một prompt yêu cầu Medichat gợi ý 2-3 MÓN ĂN HOẶC ĐỒ UỐNG CỤ THỂ dựa trên các tiêu chí chung sau:\n" \
+                                "- Tính phổ biến: Món ăn/đồ uống được nhiều người biết đến và yêu thích\n" \
+                                "- Tính đa dạng: Gợi ý các loại khác nhau nếu hợp lý (ví dụ: 1 món ăn chính, 1 đồ uống, 1 món tráng miệng)\n" \
+                                "- Cân bằng dinh dưỡng cơ bản: Có đủ các nhóm chất dinh dưỡng thiết yếu\n" \
+                                "- Ít gây dị ứng phổ biến: Tránh các thành phần dễ gây dị ứng như hải sản, đậu phộng\n" \
+                                "- Dễ chế biến/dễ tìm: Nguyên liệu dễ kiếm, cách làm không quá phức tạp\n" \
+                                "Prompt cho Medichat phải yêu cầu Medichat KHÔNG HỎI THÊM mà đưa ra gợi ý trực tiếp.\n" \
+                                "Nếu có recipes trong `recipe_section` hoặc beverages trong `beverage_section` phù hợp với các tiêu chí chung này, hãy ưu tiên tạo prompt hướng Medichat sử dụng chúng."
+        
         # Tạo prompt cho Gemini
-        prompt = f"""Tóm tắt thông tin từ TOÀN BỘ cuộc trò chuyện sau để tạo prompt cho mô hình y tế Medichat-LLaMA3-8B:
+        prompt = f""""Bạn là một trợ lý y tế thông minh, chuyên tóm tắt thông tin từ cuộc trò chuyện để tạo ra một prompt ngắn gọn, súc tích và đầy đủ thông tin nhất cho mô hình AI y tế chuyên sâu Medichat-LLaMA3-8B.
 
+TOÀN BỘ CUỘC TRÒ CHUYỆN ĐỂ TÓM TẮT:
 {conversation_text}
 
-Yêu cầu:
-1. Tạo prompt ngắn gọn DƯỚI 900 KÝ TỰ tổng hợp các thông tin quan trọng về:
-   - Yêu cầu chính/vấn đề mà người dùng đang hỏi (ƯU TIÊN giải quyết cái này)
-   - Triệu chứng/tình trạng sức khỏe hiện tại
-   - Bệnh lý nền/dị ứng đã biết
-   - Thông tin về món ăn hoặc chế độ dinh dưỡng mà người dùng đang quan tâm
-   - Mục tiêu dinh dưỡng/sức khỏe của người dùng
-   - Thói quen ăn uống đã đề cập
+{recipe_section}{beverage_section}{general_instruction}
 
-2. Cấu trúc prompt theo dạng một yêu cầu rõ ràng: "Tôi cần gợi ý món ăn phù hợp cho [tình trạng sức khỏe] với các đặc điểm [liệt kê]. Tôi muốn món ăn [đặc điểm mong muốn]."
+YÊU CẦU TẠO PROMPT CHO MEDICHAT:
+1. Nội dung cốt lõi:
+   - Nếu `general_instruction` có nội dung (suggest_general=true): Tạo prompt yêu cầu Medichat thực hiện gợi ý chung theo các tiêu chí đã nêu. Có thể tham khảo `recipe_section` nếu có món phù hợp với tiêu chí chung.
+   - Nếu không có `general_instruction`: Tập trung vào yêu cầu chính/vấn đề mà người dùng đang hỏi, bao gồm triệu chứng/tình trạng sức khỏe, bệnh lý nền/dị ứng, thông tin về món ăn/chế độ dinh dưỡng quan tâm, mục tiêu dinh dưỡng/sức khỏe, và thói quen ăn uống đã đề cập.
 
-3. Cấu trúc prompt theo dạng một yêu cầu rõ ràng: "Tôi cần gợi ý món ăn phù hợp cho [tình trạng sức khỏe] với các đặc điểm [liệt kê]. Tôi muốn món ăn [đặc điểm mong muốn]."
+2. Định dạng Prompt:
+- Viết bằng NGÔI THỨ NHẤT, như thể người dùng đang trực tiếp đặt câu hỏi cho Medichat.
+- Prompt phải là một YÊU CẦU RÕ RÀNG, dễ hiểu.
+- Ví dụ cấu trúc (linh hoạt điều chỉnh tùy theo ngữ cảnh):
++ Nếu hỏi món ăn: "Tôi bị [tình trạng sức khỏe ví dụ: tiểu đường, dị ứng hải sản], muốn [mục tiêu ví dụ: kiểm soát đường huyết]. Xin gợi ý [số lượng] món [loại món ví dụ: canh, xào] phù hợp, [yêu cầu thêm ví dụ: ít gia vị, dễ làm]."
++ Nếu hỏi tư vấn chung: "Tôi bị [tình trạng sức khỏe], đang theo [thói quen ăn uống]. Tôi nên điều chỉnh chế độ ăn uống như thế nào để [mục tiêu sức khỏe]?"
++ Nếu gợi ý chung: "Tôi cần gợi ý món ăn/đồ uống [dựa trên tiêu chí từ general_instruction]. Xin đưa ra 2-3 lựa chọn cụ thể."
 
-4. Chỉ bao gồm thông tin đã được đề cập trong cuộc trò chuyện, không thêm thông tin không có thật.
+3. XỬ LÝ CÔNG THỨC MÓN ĂN/ĐỒ UỐNG:
+- Nếu `recipe_section` hoặc `beverage_section` có dữ liệu VÀ KHÔNG phải trường hợp suggest_general=true (tức người dùng có yêu cầu cụ thể):
+  + Tạo prompt hướng dẫn Medichat ƯU TIÊN sử dụng các món ăn từ `recipe_section` và/hoặc đồ uống từ `beverage_section` nếu chúng phù hợp với yêu cầu cụ thể của người dùng
+  + Yêu cầu Medichat kết hợp kiến thức của nó để giải thích tại sao món đó phù hợp hoặc điều chỉnh (ví dụ: giảm gia vị, thay thế nguyên liệu) nếu cần
+  + Nếu không có món nào trong database hoàn toàn phù hợp, yêu cầu Medichat gợi ý món khác dựa trên kiến thức của nó
+- Nếu suggest_general=true VÀ có dữ liệu từ database:
+  + Hướng dẫn Medichat xem xét các món trong `recipe_section` và `beverage_section` để đánh giá xem có món nào phù hợp với tiêu chí chung không
+  + Ưu tiên những món từ database nếu chúng đáp ứng tiêu chí: phổ biến, cân bằng dinh dưỡng, ít dị ứng, dễ làm
+  + Nếu người dùng yêu cầu cả món ăn và đồ uống, hãy tạo prompt yêu cầu Medichat đưa ra gợi ý kết hợp từ `recipe_section` cho món ăn và từ `beverage_section` cho đồ uống, đảm bảo sự hài hòa và phù hợp với yêu cầu/tình trạng sức khỏe
 
-5. Viết bằng ngôi thứ nhất, như thể người dùng đang trực tiếp hỏi Medichat.
+4. Giới hạn:
+- TOÀN BỘ prompt kết quả CHO MEDICHAT PHẢI DƯỚI {word_limit} TỪ.
+- Cần cực kỳ súc tích và đúng trọng tâm. CHỈ bao gồm thông tin đã được đề cập trong cuộc trò chuyện. KHÔNG suy diễn, KHÔNG thêm thông tin không có.
 
-PROMPT KẾT QUẢ (DƯỚI 900 KÝ TỰ):"""
+5. Mục tiêu: Tạo ra prompt hiệu quả nhất để Medichat có thể đưa ra câu trả lời y tế chính xác và hữu ích
+
+CHỈ TRẢ VỀ PHẦN PROMPT ĐÃ ĐƯỢC TÓM TẮT VÀ TỐI ƯU HÓA CHO MEDICHAT, KHÔNG BAO GỒM BẤT KỲ LỜI GIẢI THÍCH HAY TIÊU ĐỀ NÀO KHÁC.
+PROMPT KẾT QUẢ (DƯỚI {word_limit} TỪ):"""
         
         return prompt
     
@@ -635,29 +775,724 @@ PROMPT KẾT QUẢ (DƯỚI 900 KÝ TỰ):"""
         Returns:
             Prompt cho Gemini để kiểm tra và điều chỉnh
         """
-        prompt = f"""Nhiệm vụ của bạn là đánh giá và điều chỉnh phản hồi từ mô hình y tế để đưa ra phản hồi CUỐI CÙNG hoàn chỉnh, sạch, không chứa metadata.
+        prompt = f"""Bạn là một chuyên gia biên tập nội dung y tế và dinh dưỡng. Nhiệm vụ của bạn là xem xét phản hồi từ một mô hình AI y tế (Medichat) và tinh chỉnh nó để tạo ra một câu trả lời HOÀN HẢO, SẠCH SẼ, và THÂN THIỆN cho người dùng.
 
-PROMPT BAN ĐẦU:
+PROMPT GỐC ĐÃ GỬI CHO MEDICHAT:
 {original_prompt}
 
-PHẢN HỒI TỪ MEDICHAT:
+PHẢN HỒI THÔ TỪ MEDICHAT:
 {medichat_response}
 
-NHIỆM VỤ CỤ THỂ:
-1. Đánh giá xem phản hồi hiện tại có cung cấp hướng dẫn dinh dưỡng hữu ích, phù hợp không
-2. Nếu phản hồi tốt, chỉ cần làm sạch định dạng, loại bỏ mọi metadata
-3. Nếu phản hồi chưa đầy đủ hoặc không phù hợp, viết phản hồi mới với nội dung hướng dẫn dinh dưỡng phù hợp
-4. TẤT CẢ phản hồi của bạn sẽ được trả trực tiếp cho người dùng mà không qua bất kỳ xử lý nào nữa
-
-HƯỚNG DẪN QUAN TRỌNG:
-- KHÔNG BAO GIỜ bao gồm các từ như "Đánh giá", "Kiểm tra", "Điều chỉnh phản hồi" trong đầu ra
-- KHÔNG BAO GIỜ chia phản hồi thành các phần có tiêu đề hoặc đánh số bước
-- KHÔNG BAO GIỜ nhắc đến quá trình đánh giá hoặc sửa đổi
-- LUÔN viết như thể bạn đang trực tiếp trả lời người dùng
-- LUÔN sử dụng tiếng Việt thân thiện, mạch lạc
-- LUÔN đảm bảo phản hồi ngắn gọn, súc tích và dễ hiểu
-- LUÔN duy trì thông tin y tế chính xác và hữu ích
-
-TRẢ VỀ NGAY LẬP TỨC CHỈ PHẦN NỘI DUNG PHẢN HỒI CUỐI CÙNG DÀNH CHO NGƯỜI DÙNG, KHÔNG CÓ BẤT KỲ METADATA HAY GIẢI THÍCH NÀO:"""
+HƯỚNG DẪN BIÊN TẬP VÀ TINH CHỈNH:
+1. Đánh giá chất lượng phản hồi thô:
+- Nội dung có CHÍNH XÁC về mặt y tế/dinh dưỡng không?
+- Có TRẢ LỜI TRỰC TIẾP và ĐẦY ĐỦ cho PROMPT GỐC không?
+- Ngôn ngữ có DỄ HIỂU, THÂN THIỆN, và PHÙ HỢP với người dùng không?
+- Có chứa thông tin thừa, metadata, hoặc các cụm từ không tự nhiên (ví dụ: "dưới đây là...", "đánh giá của tôi...") không?
+2. Hành động:
+- Nếu phản hồi thô đã tốt (chính xác, đầy đủ, dễ hiểu): Hãy loại bỏ TOÀN BỘ metadata, các cụm từ đánh giá, định dạng thừa. Giữ lại phần nội dung cốt lõi và đảm bảo nó mạch lạc, tự nhiên.
+- Nếu phản hồi thô chưa tốt (lạc đề, không đầy đủ, khó hiểu, chứa thông tin sai lệch, hoặc quá máy móc): Hãy VIẾT LẠI HOÀN TOÀN một phản hồi mới dựa trên PROMPT GỐC. Phản hồi mới phải chính xác, đầy đủ, thân thiện, dễ hiểu, và cung cấp giá trị thực sự cho người dùng.
+3. YÊU CẦU TUYỆT ĐỐI CHO ĐẦU RA CUỐI CÙNG:
+- Đầu ra của bạn sẽ được gửi TRỰC TIẾP cho người dùng.
+- KHÔNG BAO GIỜ bao gồm các từ/cụm từ như: "Đánh giá:", "Kiểm tra:", "Điều chỉnh:", "Phản hồi đã được điều chỉnh:", "Phân tích phản hồi:", "HỢP LỆ", "Dưới đây là...", "Theo tôi...", v.v.
+- KHÔNG BAO GIỜ chia phản hồi thành các phần có tiêu đề kiểu "1. Đánh giá", "2. Điều chỉnh".
+- KHÔNG BAO GIỜ nhắc đến quá trình đánh giá hay sửa đổi nội bộ.
+- LUÔN viết như thể bạn đang trực tiếp trò chuyện và tư vấn cho người dùng.
+- LUÔN sử dụng tiếng Việt tự nhiên, thân thiện, chuyên nghiệp và mạch lạc.
+- LUÔN đảm bảo thông tin y tế/dinh dưỡng là chính xác và hữu ích.
+- Đảm bảo phản hồi ngắn gọn, súc tích nhất có thể mà vẫn đủ ý.
+TRẢ VỀ NGAY LẬP TỨC CHỈ PHẦN NỘI DUNG PHẢN HỒI CUỐI CÙNG DÀNH CHO NGƯỜI DÙNG. KHÔNG CÓ BẤT KỲ METADATA, GIẢI THÍCH, HAY BÌNH LUẬN NÀO.
+"""
         
-        return prompt 
+        return prompt
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def summarize_conversation(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Tóm tắt lịch sử cuộc trò chuyện sử dụng Gemini API
+        
+        Args:
+            messages: Danh sách tin nhắn theo định dạng [{"role": "user", "content": "..."}]
+            
+        Returns:
+            Bản tóm tắt lịch sử trò chuyện
+        """
+        if not self.api_key:
+            logger.error("Không thể tóm tắt: Thiếu API key của Gemini")
+            return "Không thể tóm tắt lịch sử trò chuyện."
+        
+        if not messages:
+            logger.warning("Không có tin nhắn nào để tóm tắt")
+            return ""
+        
+        # Loại bỏ system message khỏi nội dung cần tóm tắt
+        conversation_messages = [msg for msg in messages if msg["role"] != "system"]
+        
+        # Nếu chỉ có ít tin nhắn, không cần tóm tắt
+        if len(conversation_messages) <= 3:
+            return ""
+        
+        # Tạo nội dung prompt để gửi đến Gemini
+        prompt = self._create_medichat_prompt_template(conversation_messages)
+        
+        # Sử dụng biến global GOOGLE_AI_AVAILABLE
+        global GOOGLE_AI_AVAILABLE
+        
+        # Thử sử dụng thư viện Google Generative AI nếu có sẵn
+        if GOOGLE_AI_AVAILABLE:
+            try:
+                summary = await self._query_gemini_with_client(prompt)
+                logger.info(f"[GEMINI SUMMARY] {summary}")
+                return summary
+            except Exception as e:
+                logger.warning(f"Lỗi khi sử dụng Google Generative AI client: {str(e)}. Thử sử dụng HTTP API trực tiếp.")
+                GOOGLE_AI_AVAILABLE = False
+        
+        # Sử dụng HTTP API trực tiếp nếu thư viện không có sẵn hoặc gặp lỗi
+        summary = await self._query_gemini_with_http(prompt)
+        logger.info(f"[GEMINI SUMMARY] {summary}")
+        return summary
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def create_recipe_search_prompt(self, user_message: str, collected_info: Dict[str, Any], suggest_general_if_needed: bool = False) -> str:
+        """
+        Tạo prompt tối ưu cho recipe_tool từ yêu cầu người dùng và thông tin thu thập được
+        
+        Args:
+            user_message: Tin nhắn của người dùng về món ăn
+            collected_info: Thông tin sức khỏe đã thu thập được
+            suggest_general_if_needed: True nếu cần tạo query tìm kiếm chung
+            
+        Returns:
+            Prompt tối ưu cho recipe search
+        """
+        if not self.api_key:
+            # Fallback prompt dựa trên suggest_general_if_needed
+            if suggest_general_if_needed:
+                return "các món ăn đồ uống phổ biến tốt cho sức khỏe dễ làm"
+            
+            if collected_info:
+                conditions = []
+                if collected_info.get('health_condition'):
+                    conditions.append(f"phù hợp với {collected_info['health_condition']}")
+                if collected_info.get('allergies'):
+                    conditions.append(f"không có {collected_info['allergies']}")
+                if collected_info.get('dietary_habits'):
+                    conditions.append(f"theo chế độ {collected_info['dietary_habits']}")
+                
+                if conditions:
+                    return f"{user_message}. {'. '.join(conditions)}"
+            
+            return f"{user_message}. Món ăn phổ biến, cân bằng dinh dưỡng, dễ chế biến"
+        
+        # Tạo prompt thông minh bằng Gemini dựa trên suggest_general_if_needed
+        if suggest_general_if_needed:
+            prompt = f"""Bạn là chuyên gia dinh dưỡng và ẩm thực. Nhiệm vụ của bạn là tạo ra một câu truy vấn chung để tìm kiếm công thức món ăn phù hợp với nhiều người.
+
+YÊU CẦU CỦA NGƯỜI DÙNG:
+"{user_message}"
+
+THÔNG TIN SỨC KHỎE (có thể không đầy đủ):
+{json.dumps(collected_info, ensure_ascii=False, indent=2) if collected_info else "Không có thông tin cụ thể"}
+
+NHIỆM VỤ:
+Tạo một câu truy vấn ngắn gọn để tìm kiếm các món ăn/đồ uống dựa trên các tiêu chí CHUNG sau:
+- Tính phổ biến: Món ăn/đồ uống được nhiều người biết đến và yêu thích
+- Tính đa dạng: Có thể bao gồm các loại khác nhau (món chính, đồ uống, tráng miệng)
+- Cân bằng dinh dưỡng cơ bản: Có đủ các nhóm chất dinh dưỡng thiết yếu
+- Ít gây dị ứng phổ biến: Tránh hải sản, đậu phộng, các thành phần dễ gây dị ứng
+- Dễ chế biến/dễ tìm: Nguyên liệu dễ kiếm, cách làm không quá phức tạp
+
+CẤU TRÚC QUERY MONG MUỐN:
+"[Loại món/đồ uống chung] + [tiêu chí phổ biến] + [cân bằng dinh dưỡng] + [dễ làm]"
+
+Ví dụ output:
+- "gợi ý món ăn dinh dưỡng thông thường"
+- "các món ăn đồ uống phổ biến tốt cho sức khỏe dễ làm"
+
+CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
+        else:
+            prompt = f"""Bạn là chuyên gia dinh dưỡng và ẩm thực. Nhiệm vụ của bạn là tạo ra một câu truy vấn tối ưu để tìm kiếm công thức món ăn phù hợp.
+
+YÊU CẦU CỦA NGƯỜI DÙNG:
+"{user_message}"
+
+THÔNG TIN SỨC KHỎE ĐÃ THU THẬP:
+{json.dumps(collected_info, ensure_ascii=False, indent=2) if collected_info else "Không có thông tin cụ thể"}
+
+NHIỆM VỤ:
+Tạo một câu truy vấn ngắn gọn, súc tích (tối đa 150 từ) để tìm kiếm công thức món ăn phù hợp nhất.
+
+QUY TẮC TẠO QUERY:
+1. **Nếu có thông tin sức khỏe cụ thể**: Kết hợp yêu cầu người dùng với các điều kiện sức khỏe
+2. **Nếu không có thông tin**: Sử dụng tiêu chí mặc định:
+   - Tính phổ biến và đa dạng
+   - Cân bằng dinh dưỡng
+   - Không gây dị ứng phổ biến
+   - Dễ chế biến
+
+CẤU TRÚC QUERY MONG MUỐN:
+"[Loại món ăn/yêu cầu chính] + [điều kiện sức khỏe nếu có] + [ưu tiên dinh dưỡng] + [ưu tiên chế biến]"
+
+Ví dụ:
+- "Món canh dinh dưỡng cho người tiểu đường, ít đường, nhiều chất xơ, dễ nấu"
+- "Món ăn sáng healthy, cân bằng dinh dưỡng, không gây dị ứng, nhanh chóng"
+
+CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
+
+        try:
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    query = await self._query_gemini_with_client(prompt)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client: {str(e)}. Chuyển sang HTTP API.")
+                    query = await self._query_gemini_with_http(prompt)
+            else:
+                query = await self._query_gemini_with_http(prompt)
+            
+            # Làm sạch query
+            query = query.strip().replace('\n', ' ')
+            logger.info(f"Đã tạo recipe search query (suggest_general={suggest_general_if_needed}): {query}")
+            return query
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo recipe search prompt: {str(e)}")
+            # Fallback
+            if suggest_general_if_needed:
+                return "các món ăn đồ uống phổ biến tốt cho sức khỏe dễ làm"
+            
+            if collected_info:
+                conditions = []
+                if collected_info.get('health_condition'):
+                    conditions.append(f"phù hợp với {collected_info['health_condition']}")
+                if collected_info.get('allergies'):
+                    conditions.append(f"không có {collected_info['allergies']}")
+                if collected_info.get('dietary_habits'):
+                    conditions.append(f"theo chế độ {collected_info['dietary_habits']}")
+                
+                if conditions:
+                    return f"{user_message}. {'. '.join(conditions)}"
+            
+            return f"{user_message}. Món ăn phổ biến, cân bằng dinh dưỡng, dễ chế biến"
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def filter_duplicate_recipes(self, recipes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Lọc các công thức trùng lặp bằng Gemini AI
+        
+        Args:
+            recipes: Danh sách các công thức từ recipe_tool
+            
+        Returns:
+            Danh sách công thức đã lọc trùng lặp
+        """
+        if not self.api_key or not recipes or len(recipes) <= 1:
+            return recipes
+        
+        # Giới hạn số lượng recipes để tránh prompt quá dài
+        limited_recipes = recipes[:20]
+        
+        # Tạo danh sách recipes cho prompt
+        recipe_list = []
+        for i, recipe in enumerate(limited_recipes, 1):
+            name = recipe.get('name', 'N/A')
+            ingredients = recipe.get('ingredients_summary', 'N/A')
+            recipe_list.append(f"{i}. {name} - Nguyên liệu: {ingredients}")
+        
+        recipes_text = '\n'.join(recipe_list)
+        
+        prompt = f"""Bạn là chuyên gia ẩm thực. Nhiệm vụ của bạn là lọc các công thức món ăn trùng lặp từ danh sách dưới đây.
+
+DANH SÁCH CÔNG THỨC:
+{recipes_text}
+
+YÊU CẦU:
+1. Xác định các món ăn có tên giống nhau hoặc rất tương tự
+2. Với mỗi nhóm món trùng lặp, chỉ giữ lại món đầu tiên (số thứ tự nhỏ nhất)
+3. Trả về danh sách số thứ tự của các món cần GIỮ LẠI
+
+QUY TẮC XÁC ĐỊNH TRÙNG LẶP:
+- Tên hoàn toàn giống nhau: "Canh chua" và "Canh chua"
+- Tên rất tương tự: "Canh chua cá" và "Canh chua cá lóc"
+- Các biến thể của cùng món: "Phở bò" và "Phở bò tái"
+
+TRẢ VỀ DƯỚI DẠNG JSON:
+{{"selected_indices": [1, 3, 5, ...]}}
+
+CHỈ TRẢ VỀ JSON, KHÔNG CÓ GIẢI THÍCH:"""
+
+        try:
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    response = await self._query_gemini_with_client(prompt)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client: {str(e)}. Chuyển sang HTTP API.")
+                    response = await self._query_gemini_with_http(prompt)
+            else:
+                response = await self._query_gemini_with_http(prompt)
+            
+            # Parse JSON response
+            try:
+                clean_response = response.strip()
+                if "```json" in clean_response:
+                    clean_response = clean_response.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_response:
+                    clean_response = clean_response.split("```")[1].split("```")[0].strip()
+                
+                result = json.loads(clean_response)
+                selected_indices = result.get("selected_indices", [])
+                
+                # Lọc recipes dựa trên indices đã chọn
+                filtered_recipes = []
+                for i, recipe in enumerate(limited_recipes, 1):
+                    if i in selected_indices:
+                        filtered_recipes.append(recipe)
+                
+                logger.info(f"Đã lọc từ {len(limited_recipes)} xuống {len(filtered_recipes)} recipes")
+                return filtered_recipes
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Không thể parse JSON từ Gemini filter response: {e}")
+                return limited_recipes
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi filter duplicate recipes: {str(e)}")
+            return limited_recipes
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def create_product_search_prompt(self, medichat_response: str, recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None) -> str:
+        """
+        Tạo prompt cho product_find_tool từ phản hồi medichat, recipes và beverages.
+        Gemini sẽ đóng vai trò Kỹ sư AI Tối ưu hóa Prompt để trích xuất thông tin một cách chính xác.
+        
+        Args:
+            medichat_response: Phản hồi từ medichat
+            recipes: Danh sách recipes mà Medichat có thể đã tham khảo (nếu có)
+            beverages: Danh sách beverages mà Medichat có thể đã tham khảo (nếu có)
+            
+        Returns:
+            Query string tự nhiên để tìm sản phẩm/nguyên liệu
+        """
+        if not self.api_key:
+            # Fallback được cải thiện cho cả recipes và beverages
+            ingredients = []
+            dish_names = []
+            beverage_names = []
+            
+            if recipes:
+                for recipe in recipes[:3]:
+                    if 'name' in recipe:
+                        dish_names.append(recipe['name'])
+                    if 'ingredients_summary' in recipe:
+                        ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+            
+            if beverages:
+                for beverage in beverages[:3]:
+                    if 'product_name' in beverage:
+                        beverage_names.append(beverage['product_name'])
+            
+            unique_ingredients = list(set(ingredients))[:15]
+            all_items = dish_names + beverage_names
+            
+            if all_items and unique_ingredients:
+                return f"Tôi cần mua nguyên liệu để làm {', '.join(all_items[:3])}, bao gồm: {', '.join(unique_ingredients)}."
+            elif all_items:
+                return f"Tôi cần mua nguyên liệu để làm {', '.join(all_items[:3])}."
+            elif unique_ingredients:
+                return f"Tôi cần mua các nguyên liệu sau: {', '.join(unique_ingredients)}."
+            
+            # Fallback từ medichat_response
+            if "món" in medichat_response.lower() or "nguyên liệu" in medichat_response.lower():
+                return "Tôi cần mua các nguyên liệu chính từ các món ăn đã được gợi ý."
+            
+            return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
+
+        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TỐI ƯU HÓA PROMPT VÀ TÍCH HỢP TOOL cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ.
+
+### ĐÁNH GIÁ NGUỒN DỮ LIỆU:
+
+**PHẢN HỒI TƯ VẤN TỪ MEDICHAT:**
+```
+{medichat_response}
+```
+
+**DANH SÁCH CÔNG THỨC MÀ MEDICHAT CÓ THỂ ĐÃ THAM KHẢO:**
+{json.dumps(recipes, ensure_ascii=False, indent=2) if recipes else "Không có danh sách công thức tham khảo kèm theo."}
+
+**DANH SÁCH ĐỒ UỐNG MÀ MEDICHAT CÓ THỂ ĐÃ THAM KHẢO:**
+{json.dumps(beverages, ensure_ascii=False, indent=2) if beverages else "Không có danh sách đồ uống tham khảo kèm theo."}
+
+### QUY TRÌNH TRÍCH XUẤT CHUYÊN NGHIỆP:
+
+**BƯỚC 1: XÁC ĐỊNH MÓN ĂN/ĐỒ UỐNG CHÍNH**
+- Đọc kỹ phản hồi của Medichat để xác định TÊN CÁC MÓN ĂN HOẶC ĐỒ UỐNG được gợi ý
+- Nếu Medichat đề cập đến các món trong danh sách `recipes`, ưu tiên ghi nhận chúng
+- Giới hạn tối đa 3-4 món nổi bật nhất để tránh phân tán
+
+**BƯỚC 2: TRÍCH XUẤT NGUYÊN LIỆU CHI TIẾT**
+- Từ phản hồi Medichat: Thu thập tất cả nguyên liệu được đề cập trực tiếp
+- Từ `recipes` (nếu Medichat tham chiếu): Lấy nguyên liệu từ các món ăn được Medichat nhắc đến
+- Từ `beverages` (nếu Medichat tham chiếu): Lấy thành phần chính từ các đồ uống được Medichat nhắc đến
+- Kết hợp tất cả nguồn để có danh sách đầy đủ nhất
+
+**BƯỚC 3: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
+- **Loại bỏ nguyên liệu quá chung chung:** "gia vị tổng hợp", "nước lọc", "dầu ăn thường" (trừ khi chỉ định cụ thể như "dầu oliu", "muối biển")
+- **Chuẩn hóa tên gọi:** 
+  + "Hành cây", "Hành lá" → "Hành lá"
+  + "Thịt heo ba rọi", "Ba chỉ" → "Thịt ba chỉ"
+  + "Cà chua bi", "Cà chua" → "Cà chua"
+  + "Mỡ hành", "Hành khô" → "Hành khô"
+- **Tạo danh sách duy nhất:** Loại bỏ trùng lặp, giữ tối đa 15-20 nguyên liệu quan trọng nhất
+
+**BƯỚC 4: TẠO YÊU CẦU MUA SẮM TỰ NHIÊN**
+Dựa trên thông tin đã trích xuất, tạo một đoạn văn bản ngắn gọn (1-2 câu) để người dùng có thể sử dụng khi mua sắm.
+
+### CẤU TRÚC YÊU CẦU MUA SẮM MONG MUỐN:
+
+**Trường hợp có món ăn cụ thể:**
+"Tôi cần mua nguyên liệu để nấu [tên món 1] và [tên món 2], bao gồm: [danh sách nguyên liệu đã chuẩn hóa]."
+
+**Trường hợp chỉ có nguyên liệu:**
+"Tôi cần mua các nguyên liệu sau: [danh sách nguyên liệu đã chuẩn hóa]."
+
+### VÍ DỤ MINH HỌA:
+
+**Input mẫu:**
+- Medichat response: "Bạn có thể thử làm canh chua cá lóc và uống nước ép cam tươi để bổ sung vitamin C. Canh chua cần có cá lóc, me, cà chua, dứa. Nước ép cam tốt nhất là từ cam tươi."
+- Recipes: [{{"name": "Canh chua cá lóc", "ingredients_summary": "cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ"}}]
+- Beverages: [{{"product_name": "Nước ép cam tươi 200ml"}}]
+
+**Output mong đợi:**
+"Tôi cần mua nguyên liệu để nấu canh chua cá lóc và làm nước ép cam tươi, bao gồm: cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ, cam tươi."
+
+### YÊU CẦU CUỐI CÙNG:
+CHỈ TRẢ VỀ ĐOẠN VĂN BẢN YÊU CẦU MUA SẮM NGẮN GỌN (1-2 CÂU). KHÔNG TRẢ VỀ JSON, KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG THÊM METADATA.
+
+YÊU CẦU MUA SẮM:"""
+
+        try:
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    product_query = await self._query_gemini_with_client(prompt)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client: {str(e)}. Chuyển sang HTTP API.")
+                    product_query = await self._query_gemini_with_http(prompt)
+            else:
+                product_query = await self._query_gemini_with_http(prompt)
+            
+            # Làm sạch query - loại bỏ xuống dòng thừa và chuẩn hóa
+            product_query = product_query.strip().replace('\n', ' ')
+            
+            # Loại bỏ các prefix thừa nếu Gemini thêm vào
+            prefixes_to_remove = [
+                "YÊU CẦU MUA SẮM:",
+                "Đoạn văn bản:",
+                "Kết quả:",
+                "Output:"
+            ]
+            
+            for prefix in prefixes_to_remove:
+                if product_query.startswith(prefix):
+                    product_query = product_query[len(prefix):].strip()
+            
+            # Đảm bảo query không quá dài (giới hạn hợp lý cho product_find_tool)
+            if len(product_query) > 300:
+                # Cắt ngắn nhưng giữ ý nghĩa
+                sentences = product_query.split('.')
+                if len(sentences) > 1:
+                    product_query = sentences[0] + '.'
+                else:
+                    product_query = product_query[:300] + '...'
+            
+            logger.info(f"Đã tạo product search query ({len(product_query)} ký tự): {product_query}")
+            return product_query
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo product search prompt: {str(e)}")
+            # Fallback nâng cao hơn cho cả recipes và beverages
+            ingredients = []
+            dish_names = []
+            beverage_names = []
+            
+            if recipes:
+                for recipe in recipes[:3]:
+                    if 'name' in recipe:
+                        dish_names.append(recipe['name'])
+                    if 'ingredients_summary' in recipe:
+                        ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+            
+            if beverages:
+                for beverage in beverages[:3]:
+                    if 'product_name' in beverage:
+                        beverage_names.append(beverage['product_name'])
+            
+            unique_ingredients = list(set(ingredients))[:15]
+            all_items = dish_names + beverage_names
+            
+            if all_items and unique_ingredients:
+                return f"Tôi cần mua nguyên liệu để làm {', '.join(all_items[:3])}, bao gồm: {', '.join(unique_ingredients)}."
+            elif all_items:
+                return f"Tôi cần mua nguyên liệu để làm {', '.join(all_items[:3])}."
+            elif unique_ingredients:
+                return f"Tôi cần mua các nguyên liệu sau: {', '.join(unique_ingredients)}."
+            
+            # Fallback cuối cùng với thông tin từ medichat_response
+            if "món" in medichat_response.lower() or "nguyên liệu" in medichat_response.lower():
+                return "Tôi cần mua các nguyên liệu chính từ các món ăn đã được gợi ý."
+            
+            return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def create_enhanced_medichat_prompt(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False) -> str:
+        """
+        Tạo prompt nâng cao cho Medichat với recipes và beverages (nếu có) và khả năng gợi ý chung
+        
+        Args:
+            messages: Danh sách tin nhắn theo định dạng [{"role": "user", "content": "..."}]
+            recipes: Danh sách recipes từ database (nếu có)
+            beverages: Danh sách beverages từ database (nếu có)
+            suggest_general: True nếu cần Medichat gợi ý theo tiêu chí chung
+            
+        Returns:
+            Prompt được tối ưu hóa cho Medichat
+        """
+        if not self.api_key or not messages:
+            logger.error("Không thể tạo enhanced prompt: Thiếu API key hoặc không có tin nhắn")
+            # Cải thiện fallback dựa trên suggest_general
+            if suggest_general:
+                return "Tôi muốn tìm một vài món ăn hoặc đồ uống giải nhiệt, phổ biến, cân bằng dinh dưỡng, dễ làm và ít gây dị ứng. Bạn có thể gợi ý được không?"
+            else:
+                return "Cần tư vấn dinh dưỡng và món ăn phù hợp."
+        
+        # Tạo prompt template với recipes, beverages và suggest_general
+        prompt_template = self._create_medichat_prompt_template(messages, recipes, beverages, suggest_general)
+        
+        try:
+            # Sử dụng thư viện Google hoặc HTTP API
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    result_prompt = await self._query_gemini_with_client(prompt_template)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client: {str(e)}. Chuyển sang HTTP API.")
+                    result_prompt = await self._query_gemini_with_http(prompt_template)
+            else:
+                result_prompt = await self._query_gemini_with_http(prompt_template)
+            
+            # Logging chi tiết về độ dài prompt được tạo
+            char_count = len(result_prompt)
+            word_count_estimate = len(result_prompt.split())
+            word_limit = self.max_prompt_length_with_recipes if (recipes or beverages or suggest_general) else 900
+            
+            logger.info(f"Đã tạo enhanced prompt: {char_count} ký tự, ~{word_count_estimate} từ (giới hạn: {word_limit} {'từ' if (recipes or suggest_general) else 'ký tự'})")
+            logger.info(f"Prompt preview: {result_prompt[:100]}...")
+            
+            # Không cắt result_prompt theo ký tự nữa, tin tưởng Gemini tuân thủ giới hạn TỪ
+            # Nếu Gemini thường xuyên vi phạm, chúng ta sẽ xem xét lại prompt cho Gemini
+            
+            return result_prompt
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo enhanced prompt: {str(e)}")
+            # Fallback được cải thiện dựa trên suggest_general
+            if suggest_general:
+                return "Tôi muốn tìm một vài món ăn hoặc đồ uống giải nhiệt, phổ biến, cân bằng dinh dưỡng, dễ làm và ít gây dị ứng. Bạn có thể gợi ý được không?"
+            else:
+                return "Cần tư vấn dinh dưỡng và món ăn phù hợp."
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    async def create_incremental_summary(
+        self,
+        previous_summary: Optional[str],
+        new_user_message: str,
+        new_assistant_message: str,
+        full_chat_history_for_context: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        """
+        Tạo bản tóm tắt tăng dần dựa trên tóm tắt trước đó và lượt tương tác mới.
+        Sử dụng Gemini với vai trò Kỹ sư AI chuyên về Xử lý Ngôn ngữ Tự nhiên.
+
+        Args:
+            previous_summary: Bản tóm tắt của cuộc trò chuyện tính đến trước lượt tương tác này.
+                              Có thể là None nếu đây là lần tóm tắt đầu tiên.
+            new_user_message: Tin nhắn mới nhất của người dùng.
+            new_assistant_message: Phản hồi mới nhất của trợ lý.
+            full_chat_history_for_context: (Tùy chọn) 3-5 tin nhắn cuối cùng của lịch sử chat
+                                           để cung cấp thêm ngữ cảnh cho Gemini nếu previous_summary quá cô đọng.
+
+        Returns:
+            Bản tóm tắt mới, bao gồm cả thông tin mới được tích hợp một cách thông minh.
+        """
+        if not self.api_key:
+            logger.error("Không thể tạo tóm tắt tăng dần: Thiếu API key của Gemini.")
+            # Fallback: nối chuỗi đơn giản nếu không có API key
+            new_interaction = f"Người dùng: {new_user_message}\nTrợ lý: {new_assistant_message}\n"
+            return f"{previous_summary}\n\n---\n\n{new_interaction}" if previous_summary else new_interaction
+
+        # Xây dựng prompt chuyên nghiệp cho Gemini với vai trò Kỹ sư AI
+        prompt_parts = [
+            "Bạn là một KỸ SƯ AI CHUYÊN VỀ XỬ LÝ NGÔN NGỮ TỰ NHIÊN VÀ QUẢN LÝ NGỮ CẢNH HỘI THOẠI cho hệ thống Chatbot Y tế.",
+            "Nhiệm vụ chuyên môn của bạn là tạo ra các bản tóm tắt 'cuộn' (incremental summary) để duy trì ngữ cảnh của toàn bộ cuộc trò chuyện một cách hiệu quả và thông minh.",
+            "",
+            "### PHÂN TÍCH NGUỒN DỮ LIỆU:"
+        ]
+
+        # Xử lý previous_summary
+        if previous_summary:
+            summary_word_count = len(previous_summary.split())
+            prompt_parts.extend([
+                "",
+                "**BẢN TÓM TẮT CUỘC TRÒ CHUYỆN TÍNH ĐẾN THỜI ĐIỂM HIỆN TẠI:**",
+                f"```text",
+                f"{previous_summary}",
+                f"```",
+                f"(Độ dài hiện tại: ~{summary_word_count} từ)"
+            ])
+        else:
+            prompt_parts.extend([
+                "",
+                "**BẢN TÓM TẮT TRƯỚC ĐÓ:** Không có (đây là lần tóm tắt đầu tiên)"
+            ])
+
+        # Thêm lượt tương tác mới
+        user_preview = new_user_message[:150] + "..." if len(new_user_message) > 150 else new_user_message
+        assistant_preview = new_assistant_message[:150] + "..." if len(new_assistant_message) > 150 else new_assistant_message
+        
+        prompt_parts.extend([
+            "",
+            "**LƯỢT TƯƠNG TÁC MỚI NHẤT CẦN TÍCH HỢP:**",
+            f"Người dùng: {new_user_message}",
+            f"Trợ lý: {new_assistant_message}"
+        ])
+
+        # Xử lý ngữ cảnh bổ sung nếu có
+        if full_chat_history_for_context:
+            context_messages = full_chat_history_for_context[-5:]  # Lấy tối đa 5 tin nhắn cuối
+            context_text = ""
+            for msg in context_messages:
+                role_label = "Người dùng" if msg.get('role') == 'user' else "Trợ lý"
+                content_preview = msg.get('content', '')[:200]  # Cắt ngắn 200 ký tự
+                if len(msg.get('content', '')) > 200:
+                    content_preview += "..."
+                context_text += f"{role_label}: {content_preview}\n"
+            
+            if context_text.strip():
+                prompt_parts.extend([
+                    "",
+                    "**NGỮ CẢNH BỔ SUNG TỪ VÀI LƯỢT TRAO ĐỔI GẦN ĐÂY:**",
+                    f"```text",
+                    f"{context_text.strip()}",
+                    f"```",
+                    "(Chỉ sử dụng nếu cần thiết để hiểu rõ hơn lượt tương tác mới)"
+                ])
+
+        # Hướng dẫn chuyên nghiệp cho Gemini
+        summary_instructions = [
+            "",
+            "### NHIỆM VỤ CHUYÊN MÔN:",
+            "",
+            "Hãy cập nhật bản tóm tắt trên (hoặc tạo mới nếu chưa có) bằng cách tích hợp thông tin cốt lõi từ lượt tương tác mới nhất một cách THÔNG MINH và HIỆU QUẢ.",
+            "",
+            "**TIÊU CHÍ CHẤT LƯỢNG TÓM TẮT:**",
+            "",
+            "1. **Tính Súc Tích và Tập Trung:**",
+            "   - Ngắn gọn, súc tích, tập trung vào các điểm chính, quyết định, thông tin quan trọng",
+            "   - Ưu tiên thông tin sức khỏe, sở thích dinh dưỡng, mục tiêu của người dùng đã được xác nhận hoặc làm rõ",
+            "   - Ghi nhận các món ăn, nguyên liệu, chế độ dinh dưỡng đã được thảo luận",
+            "",
+            "2. **Tính Mạch Lạc và Tự Nhiên:**",
+            "   - Duy trì dòng chảy tự nhiên và logic của cuộc trò chuyện",
+            "   - Sắp xếp thông tin theo thứ tự thời gian hoặc theo chủ đề một cách hợp lý",
+            "",
+            "3. **Tối Ưu Hóa Nội Dung:**",
+            "   - Loại bỏ những chi tiết không cần thiết, lời chào hỏi lặp lại",
+            "   - Tránh nhắc lại thông tin đã được tóm tắt đầy đủ ở `previous_summary` (trừ khi có thay đổi hoặc bổ sung ý nghĩa)",
+            "   - Nếu lượt tương tác mới không thêm nhiều thông tin quan trọng, bản tóm tắt có thể không thay đổi nhiều",
+            "",
+            "4. **Quản Lý Độ Dài:**"
+        ]
+
+        # Thêm logic quản lý độ dài dựa trên previous_summary
+        if previous_summary:
+            current_word_count = len(previous_summary.split())
+            if current_word_count > 700:
+                summary_instructions.extend([
+                    f"   - Previous_summary đã khá dài ({current_word_count} từ), hãy CÔ ĐỌNG NÓ một cách thông minh trước khi thêm thông tin mới",
+                    "   - Đảm bảo bản tóm tắt cập nhật KHÔNG VƯỢT QUÁ 1000 từ",
+                    "   - Ưu tiên giữ lại thông tin quan trọng nhất và mới nhất"
+                ])
+            else:
+                summary_instructions.extend([
+                    "   - Giữ bản tóm tắt ở mức độ hợp lý (tối đa khoảng 1000 từ)",
+                    "   - Tích hợp thông tin mới một cách tự nhiên"
+                ])
+        else:
+            summary_instructions.extend([
+                "   - Tạo bản tóm tắt đầu tiên súc tích và đầy đủ",
+                "   - Tập trung vào những thông tin cốt lõi từ lượt tương tác đầu tiên"
+            ])
+
+        summary_instructions.extend([
+            "",
+            "5. **Tính Chuyên Nghiệp:**",
+            "   - Sử dụng ngôn ngữ chuyên nghiệp, rõ ràng, phù hợp với ngữ cảnh y tế/dinh dưỡng",
+            "   - Duy trì tông giọng trung tính, khách quan",
+            "",
+            "### YÊU CẦU ĐẦU RA:",
+            "",
+            "CHỈ TRẢ VỀ NỘI DUNG BẢN TÓM TẮT MỚI ĐÃ ĐƯỢC CẬP NHẬT.",
+            "KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG TIÊU ĐỀ, KHÔNG METADATA, KHÔNG ĐỊNH DẠNG ĐẶC BIỆT.",
+            "",
+            "BẢN TÓM TẮT CẬP NHẬT:"
+        ])
+
+        # Kết hợp tất cả các phần
+        prompt_parts.extend(summary_instructions)
+        full_prompt = "\n".join(prompt_parts)
+        
+        try:
+            # Gọi API Gemini với logging chi tiết
+            prompt_char_count = len(full_prompt)
+            logger.info(f"Tạo tóm tắt tăng dần - Prompt: {prompt_char_count} ký tự, Previous summary: {len(previous_summary) if previous_summary else 0} ký tự")
+            
+            if GOOGLE_AI_AVAILABLE:
+                try:
+                    updated_summary = await self._query_gemini_with_client(full_prompt)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi sử dụng Google client cho tóm tắt: {str(e)}. Chuyển sang HTTP API.")
+                    updated_summary = await self._query_gemini_with_http(full_prompt)
+            else:
+                updated_summary = await self._query_gemini_with_http(full_prompt)
+            
+            # Làm sạch kết quả
+            updated_summary = updated_summary.strip()
+            
+            # Loại bỏ các prefix thừa nếu Gemini thêm vào
+            prefixes_to_remove = [
+                "BẢN TÓM TẮT CẬP NHẬT:",
+                "Bản tóm tắt mới:",
+                "Tóm tắt cập nhật:",
+                "Kết quả:",
+                "**Bản tóm tắt cập nhật:**"
+            ]
+            
+            for prefix in prefixes_to_remove:
+                if updated_summary.startswith(prefix):
+                    updated_summary = updated_summary[len(prefix):].strip()
+            
+            # Logging kết quả
+            final_word_count = len(updated_summary.split())
+            logger.info(f"Đã tạo tóm tắt tăng dần: {final_word_count} từ, {len(updated_summary)} ký tự")
+            logger.info(f"Preview tóm tắt: {updated_summary[:100]}...")
+            
+            return updated_summary
+                
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo tóm tắt tăng dần: {str(e)}", exc_info=True)
+            # Fallback an toàn: nối chuỗi với format cải thiện
+            logger.warning("Sử dụng fallback cho tóm tắt tăng dần")
+            new_interaction_text = f"📝 Lượt tương tác mới:\n• Người dùng: {new_user_message}\n• Trợ lý: {new_assistant_message}"
+            
+            if previous_summary:
+                return f"{previous_summary}\n\n---\n\n{new_interaction_text}"
+            else:
+                return new_interaction_text

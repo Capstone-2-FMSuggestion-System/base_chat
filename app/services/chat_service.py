@@ -4,10 +4,10 @@ from typing import Dict, List, Optional, Any, Union
 from fastapi import HTTPException
 import asyncio
 from datetime import datetime
+from sqlalchemy import desc
 
 from app.repositories.chat_repository import ChatRepository
 from app.services.llm_service_factory import LLMServiceFactory
-from app.services.summary_service import SummaryService
 from app.services.gemini_prompt_service import GeminiPromptService
 from app.services.chat_flow import run_chat_flow
 from app.config import settings
@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class ChatService:
+    """
+    ChatService - Kiến trúc sư Hệ thống Chatbot
+    
+    Chịu trách nhiệm điều phối toàn bộ quy trình xử lý tin nhắn,
+    bao gồm tạo và lưu trữ tóm tắt tăng dần sau mỗi lượt tương tác.
+    """
+    
     def __init__(self, db: Session):
         self.db = db
         self.repository = ChatRepository(db)
@@ -27,274 +34,352 @@ class ChatService:
             llama_url=settings.LLAMA_CPP_URL,
             ollama_url=settings.OLLAMA_URL
         )
-        self.summary_service = SummaryService()
         self.gemini_service = GeminiPromptService()
         self.medichat_model = "medichat-llama3:8b_q4_K_M"  # Model Medichat từ Ollama
     
-    async def process_message(self, user_id: int, message: str, conversation_id: Optional[int] = None) -> Dict[str, Any]:
-        """Xử lý tin nhắn từ người dùng và trả về phản hồi từ AI"""
-        # Chọn cuộc trò chuyện hiện tại hoặc tạo mới
+    async def process_message(self, user_id: int, message_content: str, conversation_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Điều phối quy trình xử lý tin nhắn với tóm tắt tăng dần.
+        
+        Flow:
+        1. Chuẩn bị conversation và lấy lịch sử chat
+        2. Gọi run_chat_flow (LangGraph) để xử lý logic chính
+        3. Kiểm tra điều kiện và tạo tóm tắt tăng dần
+        4. Lưu tóm tắt và trả về kết quả hoàn chỉnh
+        
+        Args:
+            user_id: ID người dùng
+            message_content: Nội dung tin nhắn
+            conversation_id: ID cuộc trò chuyện (optional)
+            
+        Returns:
+            Dict chứa kết quả xử lý và tóm tắt hiện tại
+        """
+        # Bước 1: Chuẩn bị conversation
         if not conversation_id:
-            # Tìm cuộc trò chuyện gần nhất của người dùng
             conversation = self.repository.get_latest_conversation(user_id)
             if not conversation:
-                # Tạo mới nếu không có
-                conversation = self.repository.create_conversation(user_id)
-                # Thêm lời chào khi bắt đầu cuộc trò chuyện mới
-                welcome_message = await self.gemini_service.generate_welcome_message()
-                self.repository.add_message(conversation.conversation_id, "assistant", welcome_message)
-                
-                # Trả về lời chào để client hiển thị
-                return {
-                    "conversation_id": conversation.conversation_id,
-                    "user_message": {"role": "user", "content": message},
-                    "assistant_message": {"role": "assistant", "content": welcome_message}
-                }
+                # Tạo conversation mới và trả về với welcome message
+                return await self._handle_new_conversation(user_id, message_content)
             conversation_id = conversation.conversation_id
         else:
-            # Kiểm tra xem cuộc trò chuyện có tồn tại không
             conversation = self.repository.get_conversation_by_id(conversation_id)
-            if not conversation:
-                raise ValueError(f"Không tìm thấy cuộc trò chuyện với ID: {conversation_id}")
-            
-            # Kiểm tra quyền sở hữu
-            if conversation.user_id != user_id:
-                raise ValueError(f"Người dùng không có quyền truy cập cuộc trò chuyện này")
-        
-        # Lấy lịch sử trò chuyện cho tin nhắn hiện tại
-        chat_history = self.repository.get_messages(conversation_id)
-        
-        # Sử dụng LangGraph flow để xử lý tin nhắn
+            if not conversation or conversation.user_id != user_id:
+                raise ValueError("Cuộc trò chuyện không hợp lệ hoặc không có quyền truy cập.")
+
+        # Bước 2: Lấy lịch sử chat TRƯỚC khi tin nhắn hiện tại được thêm
+        chat_history_before_current_message = self.repository.get_messages(conversation_id)
+        logger.info(f"🔄 Bắt đầu xử lý tin nhắn cho conversation_id={conversation_id}, user_id={user_id}")
+
         try:
-            result = await run_chat_flow(
-                user_message=message,
+            # Bước 3: Gọi LangGraph để xử lý logic chính
+            langgraph_result = await run_chat_flow(
+                user_message=message_content,
                 user_id=user_id,
                 conversation_id=conversation_id,
-                messages=chat_history,
+                messages=chat_history_before_current_message,
                 repository=self.repository,
                 llm_service=self.llm_service
             )
             
-            # Kiểm tra xem có cần tạo tóm tắt mới không
-            if result["is_valid_scope"] and not result["need_more_info"]:
-                # Tìm message_id của tin nhắn mới nhất từ user
-                last_user_msg = self.db.query(Message).filter(
-                    Message.conversation_id == conversation_id,
-                    Message.role == "user"
-                ).order_by(Message.created_at.desc()).first()
-                
-                if last_user_msg:
-                    await self._check_and_create_summary(conversation_id, last_user_msg.message_id)
+            # Bước 4: Xử lý tóm tắt tăng dần
+            current_summary = await self._handle_incremental_summary(
+                conversation_id=conversation_id,
+                message_content=message_content,
+                langgraph_result=langgraph_result
+            )
             
-            # Chỉ lấy phần thông tin cần thiết cho phản hồi
-            return {
-                "conversation_id": conversation_id,
-                "user_message": result["user_message"],
-                "assistant_message": result["assistant_message"]
-            }
+            # Bước 5: Chuẩn bị và trả về response
+            response_payload = self._build_response_payload(
+                conversation_id=conversation_id,
+                message_content=message_content,
+                langgraph_result=langgraph_result,
+                current_summary=current_summary
+            )
             
-        except Exception as e:
-            logger.error(f"Lỗi khi xử lý tin nhắn qua LangGraph: {str(e)}")
-            # Fallback nếu LangGraph gặp lỗi, sử dụng luồng cũ
-            return await self._fallback_process_message(user_id, message, conversation_id)
-    
-    async def _fallback_process_message(self, user_id: int, message: str, conversation_id: int) -> Dict[str, Any]:
-        """Phương thức xử lý dự phòng nếu LangGraph gặp lỗi"""
-        logger.info("Sử dụng phương thức xử lý dự phòng")
-        try:
-            # Tham chiếu đến tin nhắn người dùng đã tồn tại
-            user_message = self.db.query(Message).filter(
-                Message.conversation_id == conversation_id,
-                Message.role == "user",
-                Message.content == message
-            ).order_by(Message.created_at.desc()).first()
-            
-            # Nếu không tìm thấy, tạo mới tin nhắn
-            if not user_message:
-                user_message = self.repository.add_message(conversation_id, "user", message)
-                logger.info(f"Đã tạo tin nhắn người dùng trong fallback: {message[:50]}...")
-            
-            # Khởi tạo service
-            if self.llm_service._active_service is None:
-                await self.llm_service.initialize()
-            
-            # Lấy lịch sử trò chuyện
-            messages = self.repository.get_messages_with_summary(conversation_id)
-            
-            # Tạo prompt tối ưu cho Medichat
-            prompt = await self.gemini_service.create_medichat_prompt(messages)
-            
-            # Tạo danh sách tin nhắn mới với prompt từ Gemini
-            medichat_messages = [
-                {
-                    "role": "system", 
-                    "content": settings.MEDICHAT_SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-            
-            # Gọi đến Medichat
-            medichat_response = await self.llm_service.get_full_response(medichat_messages)
-            
-            # Tinh chỉnh phản hồi
-            polished_response = await self.gemini_service.polish_response(medichat_response, prompt)
-            
-            # Lưu phản hồi
-            self.repository.add_message(conversation_id, "assistant", polished_response)
-            
-            # Trả về kết quả
-            return {
-                "conversation_id": conversation_id,
-                "user_message": {"role": "user", "content": message},
-                "assistant_message": {"role": "assistant", "content": polished_response}
-            }
+            logger.info(f"✅ Xử lý thành công tin nhắn cho conversation_id={conversation_id}")
+            return response_payload
             
         except Exception as e:
-            error_message = "Xin lỗi, hiện tôi đang gặp vấn đề kết nối. Vui lòng thử lại sau."
-            logger.error(f"Lỗi trong phương thức dự phòng: {str(e)}")
-            
-            # Lưu thông báo lỗi
-            self.repository.add_message(conversation_id, "assistant", error_message)
-            
-            return {
-                "conversation_id": conversation_id,
-                "user_message": {"role": "user", "content": message},
-                "assistant_message": {"role": "assistant", "content": error_message}
-            }
-    
-    async def _check_and_create_summary(self, conversation_id: int, message_id: int) -> None:
+            logger.error(f"💥 Lỗi nghiêm trọng khi xử lý tin nhắn (ChatService): {str(e)}", exc_info=True)
+            return await self._handle_error_response(conversation_id, message_content, e)
+
+    async def _handle_new_conversation(self, user_id: int, message_content: str) -> Dict[str, Any]:
         """
-        Kiểm tra xem cuộc trò chuyện có cần tạo tóm tắt mới không và tạo tóm tắt nếu cần
+        Xử lý tin nhắn đầu tiên trong conversation mới.
+        
+        Returns:
+            Dict với conversation_id mới và welcome message
+        """
+        try:
+            conversation = self.repository.create_conversation(user_id)
+            conversation_id = conversation.conversation_id
+            
+            # Tạo welcome message
+            welcome_message_content = await self.gemini_service.generate_welcome_message()
+            self.repository.add_message(conversation_id, "assistant", welcome_message_content)
+            
+            # Thêm tin nhắn user
+            self.repository.add_message(conversation_id, "user", message_content)
+            
+            logger.info(f"🆕 Tạo conversation mới: {conversation_id} cho user_id={user_id}")
+            
+            return {
+                "conversation_id": conversation_id,
+                "user_message": {"role": "user", "content": message_content},
+                "assistant_message": {"role": "assistant", "content": welcome_message_content},
+                "current_summary": None,
+                "is_new_conversation": True
+            }
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi tạo conversation mới: {str(e)}", exc_info=True)
+            raise
+
+    async def _handle_incremental_summary(self, conversation_id: int, message_content: str, langgraph_result: Dict[str, Any]) -> Optional[str]:
+        """
+        Xử lý việc tạo và lưu tóm tắt tăng dần.
+        
+        Logic:
+        - Chỉ tạo tóm tắt nếu: is_valid_scope=True, need_more_info=False, có final_response
+        - Cần có user_message_id_db và assistant_message_id_db từ LangGraph
         
         Args:
-            conversation_id: ID của cuộc trò chuyện
-            message_id: ID của tin nhắn người dùng mới nhất
+            conversation_id: ID cuộc trò chuyện
+            message_content: Nội dung tin nhắn user
+            langgraph_result: Kết quả từ LangGraph
+            
+        Returns:
+            Tóm tắt hiện tại (mới hoặc cũ)
         """
-        # Đếm số lượng tin nhắn chưa được tóm tắt
-        unsummarized_count = self.db.query(Message).filter(
-            Message.conversation_id == conversation_id,
-            Message.is_summarized == False,
-            Message.role != "system"
-        ).count()
-        
-        # Đếm tổng số tin nhắn non-system
-        total_messages = self.db.query(Message).filter(
-            Message.conversation_id == conversation_id,
-            Message.role != "system"
-        ).count()
-        
-        logger.debug(f"Kiểm tra tóm tắt: total={total_messages}, unsummarized={unsummarized_count}")
-        
-        # Nếu có đủ tin nhắn chưa được tóm tắt, tạo tóm tắt mới
-        if (unsummarized_count >= settings.SUMMARY_THRESHOLD or 
-            total_messages >= settings.MAX_HISTORY_MESSAGES):
-            # Tạo tóm tắt mới
-            await self._create_message_summary(conversation_id, message_id)
-    
-    async def _create_message_summary(self, conversation_id: int, message_id: int) -> None:
+        # Lấy message IDs từ LangGraph result
+        user_message_id = langgraph_result.get("user_message_id_db")
+        assistant_message_id = langgraph_result.get("assistant_message_id_db")
+
+        if not user_message_id or not assistant_message_id:
+            logger.warning(f"⚠️ Không nhận được message IDs từ chat_flow (user: {user_message_id}, assistant: {assistant_message_id}) - bỏ qua tạo tóm tắt")
+            return self.repository.get_latest_summary(conversation_id)
+
+        # Kiểm tra điều kiện tạo tóm tắt
+        should_create_summary = (
+            langgraph_result.get("is_valid_scope", False) and 
+            not langgraph_result.get("need_more_info", True) and
+            langgraph_result.get("final_response")
+        )
+
+        if not should_create_summary:
+            logger.debug(f"🔍 Không đủ điều kiện tạo tóm tắt cho conversation_id={conversation_id}")
+            logger.debug(f"   - is_valid_scope: {langgraph_result.get('is_valid_scope')}")
+            logger.debug(f"   - need_more_info: {langgraph_result.get('need_more_info')}")
+            logger.debug(f"   - has_final_response: {bool(langgraph_result.get('final_response'))}")
+            return self.repository.get_latest_summary(conversation_id)
+
+        # Tạo tóm tắt tăng dần
+        try:
+            logger.info(f"📝 Bắt đầu tạo tóm tắt tăng dần cho conversation_id={conversation_id}")
+            
+            # Lấy dữ liệu cần thiết cho tóm tắt
+            previous_summary_text = self.repository.get_latest_summary(conversation_id)
+            summary_context_messages = self.repository.get_messages_for_summary_context(conversation_id, limit=3)
+            final_response = langgraph_result.get("final_response", "")
+
+            logger.debug(f"   - Previous summary: {'Có' if previous_summary_text else 'Không'} ({len(previous_summary_text or '')} ký tự)")
+            logger.debug(f"   - Context messages: {len(summary_context_messages)} tin nhắn")
+            logger.debug(f"   - Final response: {len(final_response)} ký tự")
+
+            # Gọi Gemini để tạo tóm tắt
+            new_summary_text = await self.gemini_service.create_incremental_summary(
+                previous_summary=previous_summary_text,
+                new_user_message=message_content,
+                new_assistant_message=final_response,
+                full_chat_history_for_context=summary_context_messages
+            )
+
+            if not new_summary_text:
+                logger.warning(f"⚠️ Gemini trả về summary rỗng cho conversation_id={conversation_id}")
+                return previous_summary_text
+
+            # Lưu tóm tắt vào DB
+            save_success = self.repository.save_conversation_summary(
+                conversation_id=conversation_id,
+                assistant_message_id=assistant_message_id,
+                summary_text=new_summary_text
+            )
+
+            if save_success:
+                logger.info(f"💾 Đã lưu tóm tắt mới: {len(new_summary_text)} ký tự cho conversation_id={conversation_id}")
+                return new_summary_text
+            else:
+                logger.error(f"❌ Không thể lưu tóm tắt cho conversation_id={conversation_id} - giữ nguyên tóm tắt cũ")
+                return previous_summary_text
+
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi tạo tóm tắt tăng dần cho conversation_id={conversation_id}: {str(e)}", exc_info=True)
+            # Fallback: trả về tóm tắt cũ nếu có lỗi
+            return self.repository.get_latest_summary(conversation_id)
+
+    def _build_response_payload(self, conversation_id: int, message_content: str, langgraph_result: Dict[str, Any], current_summary: Optional[str]) -> Dict[str, Any]:
         """
-        Tạo tóm tắt cho tin nhắn mới nhất của cuộc trò chuyện
+        Xây dựng response payload hoàn chỉnh.
         
         Args:
-            conversation_id: ID của cuộc trò chuyện
-            message_id: ID của tin nhắn cần tóm tắt
+            conversation_id: ID cuộc trò chuyện
+            message_content: Nội dung tin nhắn user gốc
+            langgraph_result: Kết quả từ LangGraph
+            current_summary: Tóm tắt hiện tại
+            
+        Returns:
+            Dict response hoàn chỉnh
         """
-        try:
-            # Lấy tất cả tin nhắn của cuộc trò chuyện (không giới hạn số lượng)
-            messages = self.repository.get_messages(conversation_id, limit=0)
-            
-            if not messages:
-                logger.warning(f"Không có tin nhắn nào để tóm tắt cho cuộc trò chuyện ID={conversation_id}")
-                return
-                
-            # Tạo tóm tắt bằng Gemini API
-            summary = await self.summary_service.summarize_conversation(messages)
-            
-            if not summary:
-                logger.warning(f"Không tạo được tóm tắt cho tin nhắn ID={message_id}")
-                return
-                
-            # Cập nhật tóm tắt vào cơ sở dữ liệu
-            self.repository.update_message_summary(message_id, summary)
-            logger.info(f"Đã tóm tắt thành công cho tin nhắn ID={message_id}: {summary[:50]}...")
-            
-        except Exception as e:
-            logger.error(f"Lỗi khi tạo tóm tắt cho tin nhắn ID={message_id}: {str(e)}")
-    
-    def create_new_chat(self, user_id: int) -> Dict[str, Any]:
-        """Tạo cuộc trò chuyện mới"""
-        conversation = self.repository.create_conversation(user_id)
+        response_payload = {
+            "conversation_id": conversation_id,
+            "user_message": langgraph_result.get("user_message", {"role": "user", "content": message_content}),
+            "assistant_message": langgraph_result.get("assistant_message", {
+                "role": "assistant", 
+                "content": langgraph_result.get("final_response", "")
+            }),
+            "current_summary": current_summary
+        }
         
-        # Thêm lời chào khi bắt đầu cuộc trò chuyện mới
-        try:
-            welcome_message = asyncio.run(self.gemini_service.generate_welcome_message())
-            self.repository.add_message(conversation.conversation_id, "assistant", welcome_message)
-        except Exception as e:
-            logger.error(f"Lỗi khi tạo lời chào: {str(e)}")
-            # Sử dụng lời chào mặc định nếu có lỗi
-            welcome_message = "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp gì cho bạn hôm nay?"
-            self.repository.add_message(conversation.conversation_id, "assistant", welcome_message)
+        # Thêm các metadata từ LangGraph
+        metadata_keys = [
+            "is_valid_scope", "need_more_info", "is_food_related", 
+            "user_rejected_info", "suggest_general_options", 
+            "limit_reached", "message_count"
+        ]
         
+        for key in metadata_keys:
+            if key in langgraph_result:
+                response_payload[key] = langgraph_result[key]
+        
+        return response_payload
+
+    async def _handle_error_response(self, conversation_id: Optional[int], message_content: str, error: Exception) -> Dict[str, Any]:
+        """
+        Xử lý response khi có lỗi nghiêm trọng.
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện (có thể None)
+            message_content: Nội dung tin nhắn user
+            error: Exception đã xảy ra
+            
+        Returns:
+            Dict error response an toàn
+        """
+        error_response_content = "Xin lỗi, hệ thống gặp lỗi khi xử lý yêu cầu của bạn. Vui lòng thử lại sau."
+        
+        # Cố gắng lưu error message vào DB nếu có conversation_id
+        try:
+            if conversation_id:
+                self.repository.add_message(conversation_id, "assistant", error_response_content)
+        except Exception as db_error:
+            logger.error(f"💥 Lỗi khi lưu error message vào DB: {db_error}")
+
+        # Lấy tóm tắt cũ nhất nếu có thể
+        current_summary = None
+        try:
+            if conversation_id:
+                current_summary = self.repository.get_latest_summary(conversation_id)
+        except Exception as summary_error:
+            logger.error(f"💥 Không thể lấy tóm tắt trong error handler: {summary_error}")
+
         return {
-            "conversation_id": conversation.conversation_id,
-            "created_at": conversation.created_at,
-            "welcome_message": welcome_message
+            "conversation_id": conversation_id,
+            "user_message": {"role": "user", "content": message_content},
+            "assistant_message": {"role": "assistant", "content": error_response_content},
+            "current_summary": current_summary,
+            "error": "Lỗi hệ thống - vui lòng thử lại",
+            "error_details": str(error) if settings.DEBUG else None
         }
-    
+
+    def create_new_chat(self, user_id: int) -> Dict[str, Any]:
+        """
+        Tạo cuộc trò chuyện mới với welcome message.
+        
+        Args:
+            user_id: ID người dùng
+            
+        Returns:
+            Dict với thông tin conversation mới
+        """
+        try:
+            conversation = self.repository.create_conversation(user_id)
+            conversation_id = conversation.conversation_id
+            
+            # Tạo welcome message
+            try:
+                welcome_message = asyncio.run(self.gemini_service.generate_welcome_message())
+            except Exception as e:
+                logger.error(f"💥 Lỗi khi tạo welcome message với Gemini: {str(e)}")
+                welcome_message = "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp gì cho bạn hôm nay?"
+            
+            # Lưu welcome message
+            self.repository.add_message(conversation_id, "assistant", welcome_message)
+            
+            logger.info(f"🆕 Tạo chat mới thành công: conversation_id={conversation_id}, user_id={user_id}")
+            
+            return {
+                "conversation_id": conversation_id,
+                "created_at": conversation.created_at.isoformat(),
+                "welcome_message": welcome_message,
+                "current_summary": None  # Chat mới chưa có tóm tắt
+            }
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi tạo chat mới cho user_id={user_id}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Không thể tạo cuộc trò chuyện mới")
+
     def get_chat_content(self, user_id: int, conversation_id: Optional[int] = None) -> Dict[str, Any]:
-        """Lấy nội dung cuộc trò chuyện"""
-        if conversation_id:
-            # Kiểm tra người dùng có quyền truy cập cuộc trò chuyện không
-            if not self.repository.is_user_owner_of_conversation(user_id, conversation_id):
-                raise HTTPException(status_code=403, detail="Không có quyền truy cập cuộc trò chuyện này")
+        """
+        Lấy nội dung cuộc trò chuyện bao gồm tóm tắt hiện tại.
+        
+        Args:
+            user_id: ID người dùng
+            conversation_id: ID cuộc trò chuyện (optional - lấy latest nếu None)
             
-            # Kiểm tra xem cuộc trò chuyện có tồn tại không
-            conversation = self.repository.get_conversation_by_id(conversation_id)
-            if not conversation:
-                raise HTTPException(status_code=404, detail="Cuộc trò chuyện không tồn tại")
-        else:
-            # Lấy cuộc trò chuyện mới nhất
-            conversation = self.repository.get_latest_conversation(user_id)
+        Returns:
+            Dict với messages, summary và health_data
+        """
+        try:
+            # Xác định conversation
+            if conversation_id:
+                # Kiểm tra quyền truy cập
+                if not self.repository.is_user_owner_of_conversation(user_id, conversation_id):
+                    raise HTTPException(status_code=403, detail="Không có quyền truy cập cuộc trò chuyện này")
+                
+                conversation = self.repository.get_conversation_by_id(conversation_id)
+                if not conversation:
+                    raise HTTPException(status_code=404, detail="Cuộc trò chuyện không tồn tại")
+            else:
+                # Lấy conversation gần nhất
+                conversation = self.repository.get_latest_conversation(user_id)
+                if not conversation:
+                    return {
+                        "conversation_id": None,
+                        "messages": [],
+                        "current_summary": None,
+                        "health_data": None
+                    }
+
+            # Lấy dữ liệu conversation
+            messages_from_db = self.repository.get_messages(conversation.conversation_id)
+            current_summary_text = self.repository.get_latest_summary(conversation.conversation_id)
+            health_data_db = self.repository.get_health_data(conversation.conversation_id)
             
-            if not conversation:
-                # Nếu chưa có cuộc trò chuyện nào, tạo mới
-                conversation = self.repository.create_conversation(user_id)
-                messages = []
-                return {
-                    "conversation_id": conversation.conversation_id,
-                    "messages": messages
-                }
-        
-        # Lấy tin nhắn từ cuộc trò chuyện hiện có (giới hạn tin nhắn)
-        messages = self.repository.get_messages(conversation.conversation_id)
-        
-        # Tìm tin nhắn gần nhất có summary
-        summarized_message = self.db.query(Message).filter(
-            Message.conversation_id == conversation.conversation_id,
-            Message.summary.isnot(None),
-            Message.summary != ""
-        ).order_by(Message.created_at.desc()).first()
-        
-        # Lấy thông tin sức khỏe nếu có
-        health_data = self.repository.get_health_data(conversation.conversation_id)
-        
-        # Thêm thông tin tóm tắt nếu có
-        result = {
-            "conversation_id": conversation.conversation_id,
-            "messages": messages
-        }
-        
-        if summarized_message:
-            result["has_summary"] = True
-            result["summary"] = summarized_message.summary
-        else:
-            result["has_summary"] = False
-        
-        # Thêm thông tin sức khỏe nếu có
-        if health_data:
-            result["health_data"] = health_data
-        
-        return result 
+            logger.debug(f"📖 Lấy chat content: conversation_id={conversation.conversation_id}, messages={len(messages_from_db)}, summary={'Có' if current_summary_text else 'Không'}")
+            
+            result = {
+                "conversation_id": conversation.conversation_id,
+                "messages": messages_from_db,
+                "current_summary": current_summary_text,
+                "health_data": health_data_db if health_data_db else None  # Đã là dict từ repository
+            }
+            
+            return result
+            
+        except HTTPException:
+            # Re-raise HTTPException để FastAPI xử lý
+            raise
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi lấy chat content cho user_id={user_id}, conversation_id={conversation_id}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Không thể lấy nội dung cuộc trò chuyện") 

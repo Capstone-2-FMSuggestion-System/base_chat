@@ -1,62 +1,111 @@
-from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import User
 from app.config import settings
+import httpx
+from pydantic import BaseModel
+import logging
+
+# Thiết lập logger
+logger = logging.getLogger(__name__)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="http://localhost:8000/api/auth/login")
 
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+class VerifiedUserInfo(BaseModel):
+    user_id: int
+    username: str
+    role: str
+    email: Optional[str] = None
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Tạo JWT token"""
-    to_encode = data.copy()
-    
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    
-    return encoded_jwt
-
-
-def get_current_user_id(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> int:
-    """Xác định người dùng hiện tại từ token JWT"""
+async def get_verified_user_from_backend(token: str = Depends(oauth2_scheme)) -> VerifiedUserInfo:
+    """
+    Xác thực token bằng cách gọi API của backend và trả về thông tin người dùng.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Không thể xác thực thông tin đăng nhập",
+        detail="Không thể xác thực thông tin đăng nhập. Token không hợp lệ hoặc đã hết hạn.",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
-    try:
-        # Giải mã token
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-        
-        # Kiểm tra người dùng có tồn tại không
-        user = db.query(User).filter(User.user_id == int(user_id)).first()
-        if not user:
-            raise credentials_exception
-        
-        # Kiểm tra trạng thái người dùng
-        if user.status != "active":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tài khoản đã bị vô hiệu hóa"
+    service_unavailable_exception = HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Dịch vụ xác thực tạm thời không khả dụng. Vui lòng thử lại sau.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    internal_server_error_exception = HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Lỗi máy chủ nội bộ trong quá trình xác thực.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if not token:
+        logger.warning("Token không được cung cấp")
+        raise credentials_exception
+
+    async with httpx.AsyncClient(timeout=settings.API_TIMEOUT) as client:
+        try:
+            logger.debug(f"Gửi yêu cầu xác thực đến {settings.BACKEND_AUTH_VERIFY_URL}")
+            response = await client.get(
+                settings.BACKEND_AUTH_VERIFY_URL,
+                headers={"Authorization": f"Bearer {token}"}
             )
             
-        return int(user_id)
-        
-    except JWTError:
-        raise credentials_exception 
+            # Kiểm tra lỗi xác thực rõ ràng
+            if response.status_code == 401:
+                logger.warning("Lỗi xác thực: Token không hợp lệ hoặc đã hết hạn")
+                raise credentials_exception
+            
+            if response.status_code == 403:
+                logger.warning("Lỗi xác thực: Không có quyền truy cập")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Không có quyền truy cập vào tài nguyên này.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            
+            # Kiểm tra lỗi khác
+            if response.status_code >= 400:
+                logger.error(f"Lỗi từ backend: {response.status_code} - {response.text}")
+                raise service_unavailable_exception
+            
+            user_data = response.json()
+            
+            if not isinstance(user_data, dict) or not all(key in user_data for key in ["user_id", "username", "role"]):
+                logger.error(f"Backend auth response có cấu trúc không đúng: {user_data}")
+                raise internal_server_error_exception
+            
+            logger.debug(f"Xác thực thành công cho người dùng: {user_data['username']}")
+            return VerifiedUserInfo(**user_data)
+            
+        except httpx.HTTPStatusError as exc:
+            error_msg = f"Backend auth verification failed: {exc.response.status_code} - {exc.response.text}"
+            logger.error(error_msg)
+            
+            if exc.response.status_code == 401:
+                raise credentials_exception
+            elif exc.response.status_code == 403:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Không có quyền truy cập vào tài nguyên này.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            else:
+                raise service_unavailable_exception
+            
+        except httpx.RequestError as exc:
+            error_msg = f"Error connecting to backend auth service: {str(exc)}"
+            logger.error(error_msg)
+            raise service_unavailable_exception
+            
+        except Exception as e:
+            error_msg = f"An unexpected error occurred during backend auth verification: {str(e)}"
+            logger.exception(error_msg)
+            # Lỗi không mong muốn sẽ trả về 401 thay vì 500 để tránh lộ thông tin lỗi nội bộ
+            # và giúp client biết họ cần đăng nhập lại
+            raise credentials_exception

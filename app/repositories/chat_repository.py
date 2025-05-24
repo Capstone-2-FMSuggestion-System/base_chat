@@ -5,8 +5,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from sqlalchemy import desc, func
 
-from app.db.models import Conversation, Message, User, HealthData
-from app.db.database import redis_client
+from app.db.models import Conversation, Message, User, HealthData, Menu, MenuItem
+from app.services.cache_service import CacheService, invalidate_cache_on_update
 from app.config import settings
 
 
@@ -16,430 +16,452 @@ logger = logging.getLogger(__name__)
 class ChatRepository:
     def __init__(self, db: Session):
         self.db = db
-    
+
     def create_conversation(self, user_id: int, title: str = None) -> Conversation:
         """Tạo cuộc trò chuyện mới"""
         conversation = Conversation(user_id=user_id, title=title)
         self.db.add(conversation)
         self.db.commit()
         self.db.refresh(conversation)
-        
-        # Lưu conversation mới vào Redis
-        self._cache_conversation_metadata(conversation)
-        
+
+        CacheService.cache_conversation_metadata(
+            conversation.conversation_id,
+            user_id,
+            title,
+            conversation.created_at,
+            conversation.updated_at
+        )
         return conversation
-    
-    def add_message(self, conversation_id: int, role: str, content: str) -> Message:
-        """Thêm tin nhắn mới vào cuộc trò chuyện"""
+
+    def add_message(self, conversation_id: int, role: str, content: str, is_summarized: bool = False) -> Message:
+        """
+        Thêm tin nhắn mới vào cuộc trò chuyện.
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            role: Vai trò (user/assistant/system)
+            content: Nội dung tin nhắn
+            is_summarized: Mặc định False - chỉ True nếu tin nhắn này TỰ NÓ là một bản tóm tắt
+            
+        Returns:
+            Message object đã được tạo
+            
+        Note:
+            - Trường 'summary' luôn được đặt là None khi tạo tin nhắn mới
+            - Việc cập nhật summary sẽ được thực hiện riêng bởi save_conversation_summary()
+            - is_summarized=False đảm bảo tin nhắn sẽ được xem xét cho việc tóm tắt sau này
+        """
         message = Message(
             conversation_id=conversation_id,
             role=role,
-            content=content
+            content=content,
+            is_summarized=False,  # Luôn False cho tin nhắn mới - sẽ được cập nhật khi có tóm tắt
+            summary=None  # Luôn None ban đầu - sẽ được cập nhật bởi save_conversation_summary
         )
         self.db.add(message)
-        
-        # Cập nhật thời gian cập nhật cuộc trò chuyện
+
+        # Cập nhật timestamp cuộc trò chuyện
         conversation = self.get_conversation_by_id(conversation_id)
         if conversation:
             conversation.updated_at = datetime.now()
-        
+
         self.db.commit()
         self.db.refresh(message)
+
+        # Invalidate caches liên quan để đảm bảo consistency
+        self._rebuild_messages_cache(conversation_id)
+        self._sync_related_caches(conversation_id)
         
-        # Cập nhật cache
-        self._update_conversation_cache(conversation_id)
-        
+        # Invalidate cache tóm tắt vì có tin nhắn mới
+        summary_cache_key = CacheService._get_cache_key(
+            CacheService.CONVERSATION_METADATA, 
+            conversation_id=f"{conversation_id}_latest_summary"
+        )
+        CacheService.delete_cache(summary_cache_key)
+
         return message
-    
-    def update_message_summary(self, message_id: int, summary: str) -> bool:
-        """Cập nhật tóm tắt cho tin nhắn"""
-        message = self.db.query(Message).filter(Message.message_id == message_id).first()
-        if not message:
-            logger.error(f"Không tìm thấy tin nhắn ID={message_id} để cập nhật tóm tắt")
-            return False
-            
-        try:
-            message.summary = summary
-            message.is_summarized = True
-            
-            self.db.commit()
-            
-            # Cập nhật cache
-            self._update_conversation_cache(message.conversation_id)
-            
-            logger.info(f"Đã cập nhật tóm tắt cho tin nhắn ID={message_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Lỗi khi cập nhật tóm tắt: {str(e)}")
-            self.db.rollback()
-            return False
-    
-    def get_conversation_by_id(self, conversation_id: int) -> Optional[Conversation]:
-        """Lấy thông tin cuộc trò chuyện theo ID"""
-        return self.db.query(Conversation).filter(Conversation.conversation_id == conversation_id).first()
-    
-    def get_latest_conversation(self, user_id: int) -> Optional[Conversation]:
-        """Lấy cuộc trò chuyện mới nhất của người dùng"""
-        # Kiểm tra trong Redis trước
-        cached_id = redis_client.get(f"user:{user_id}:latest_conversation")
+
+    def get_latest_summary(self, conversation_id: int) -> Optional[str]:
+        """
+        Lấy bản tóm tắt "cuộn" gần nhất của cuộc trò chuyện.
         
-        if cached_id:
-            conversation = self.get_conversation_by_id(int(cached_id))
+        Logic:
+        1. Thử lấy từ Redis cache trước (O(1))
+        2. Nếu cache miss: Query DB tìm assistant message gần nhất có summary
+        3. Cache kết quả để tối ưu cho lần sau
+        4. Nếu không tìm thấy: cache empty string với TTL ngắn để tránh query liên tục
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            
+        Returns:
+            Bản tóm tắt cuối cùng hoặc None nếu chưa có tóm tắt nào
+        """
+        # Tạo cache key nhất quán cho latest summary
+        cache_key = CacheService._get_cache_key(
+            CacheService.CONVERSATION_METADATA, 
+            conversation_id=f"{conversation_id}_latest_summary"
+        )
+
+        # Bước 1: Thử lấy từ cache trước
+        cached_summary = CacheService.get_cache(cache_key, expected_type=str)
+        if cached_summary is not None:
+            logger.debug(f"✅ Cache hit - Lấy tóm tắt từ cache cho conversation_id={conversation_id}")
+            # Trả về None nếu cache chứa empty string (đánh dấu không có tóm tắt)
+            return cached_summary if cached_summary else None
+
+        # Bước 2: Cache miss - Query DB để tìm assistant message gần nhất có summary
+        logger.debug(f"🔍 Cache miss - Query DB tìm tóm tắt cho conversation_id={conversation_id}")
+        
+        latest_assistant_message_with_summary = self.db.query(Message)\
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+                Message.summary.isnot(None),
+                Message.summary != ""
+            )\
+            .order_by(desc(Message.created_at))\
+            .first()
+
+        if latest_assistant_message_with_summary:
+            summary_text = latest_assistant_message_with_summary.summary
+            logger.info(f"📝 Tìm thấy tóm tắt từ DB cho conversation_id={conversation_id} (message_id={latest_assistant_message_with_summary.message_id})")
+            
+            # Bước 3: Cache kết quả với TTL medium
+            CacheService.set_cache(cache_key, summary_text, ttl=CacheService.TTL_MEDIUM)
+            return summary_text
+        
+        # Bước 4: Không tìm thấy tóm tắt - cache empty string với TTL ngắn
+        logger.debug(f"❌ Không tìm thấy tóm tắt cho conversation_id={conversation_id}")
+        CacheService.set_cache(cache_key, "", ttl=CacheService.TTL_SHORT)
+        return None
+
+    def save_conversation_summary(self, conversation_id: int, assistant_message_id: int, summary_text: str) -> bool:
+        """
+        Lưu bản tóm tắt tăng dần vào trường summary của tin nhắn assistant.
+        Đảm bảo tính nhất quán giữa DB và cache.
+        
+        Logic:
+        1. Tìm assistant message theo ID và conversation_id
+        2. Cập nhật summary và đánh dấu is_summarized=True cho assistant message
+        3. Tìm user message ngay trước đó và đánh dấu is_summarized=True
+        4. Commit DB transaction
+        5. Cập nhật cache với summary mới
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            assistant_message_id: ID tin nhắn assistant cần lưu tóm tắt
+            summary_text: Nội dung tóm tắt
+            
+        Returns:
+            True nếu thành công, False nếu có lỗi
+        """
+        try:
+            # Bước 1: Tìm assistant message
+            assistant_message = self.db.query(Message).filter(
+                Message.message_id == assistant_message_id,
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant"
+            ).first()
+
+            if not assistant_message:
+                logger.error(f"❌ Không tìm thấy assistant_message_id={assistant_message_id} trong conversation_id={conversation_id}")
+                return False
+
+            # Bước 2: Cập nhật summary cho assistant message
+            assistant_message.summary = summary_text
+            assistant_message.is_summarized = True
+            assistant_message.updated_at = datetime.now()
+            
+            # Bước 3: Tìm và đánh dấu user message ngay trước đó
+            user_message_before_assistant = self.db.query(Message).filter(
+                Message.conversation_id == conversation_id,
+                Message.role == "user",
+                Message.created_at < assistant_message.created_at
+            ).order_by(desc(Message.created_at)).first()
+
+            if user_message_before_assistant and not user_message_before_assistant.is_summarized:
+                user_message_before_assistant.is_summarized = True
+                user_message_before_assistant.updated_at = datetime.now()
+                logger.debug(f"✅ Đánh dấu user_message_id={user_message_before_assistant.message_id} đã được tóm tắt")
+
+            # Bước 4: Commit transaction
+            self.db.commit()
+            logger.info(f"💾 Đã lưu tóm tắt cho assistant_message_id={assistant_message_id}, độ dài: {len(summary_text)} ký tự")
+
+            # Bước 5: Cập nhật cache
+            cache_key = CacheService._get_cache_key(
+                CacheService.CONVERSATION_METADATA, 
+                conversation_id=f"{conversation_id}_latest_summary"
+            )
+            cache_success = CacheService.set_cache(cache_key, summary_text, ttl=CacheService.TTL_MEDIUM)
+            
+            if cache_success:
+                logger.debug(f"🔄 Đã cập nhật cache tóm tắt cho conversation_id={conversation_id}")
+            else:
+                logger.warning(f"⚠️ Không thể cập nhật cache tóm tắt - DB đã lưu thành công")
+            
+            # Invalidate các cache liên quan
+            self._invalidate_summary_related_caches(conversation_id)
+            
+            return True
+
+        except Exception as e:
+            # Rollback transaction nếu có lỗi
+            self.db.rollback()
+            logger.error(f"💥 Lỗi khi lưu tóm tắt cho assistant_message_id={assistant_message_id}: {str(e)}", exc_info=True)
+            return False
+
+    def get_messages_for_summary_context(self, conversation_id: int, limit: int = 3) -> List[Dict[str, str]]:
+        """
+        Lấy tin nhắn gần nhất để làm ngữ cảnh cho việc tạo tóm tắt tăng dần.
+        
+        Logic:
+        1. Lấy limit*2 tin nhắn cuối cùng từ DB (để đảm bảo có đủ cả user và assistant)
+        2. Sắp xếp theo thứ tự thời gian tăng dần (giữ đúng flow hội thoại)
+        3. Giới hạn kết quả theo limit
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            limit: Số lượng tin nhắn tối đa cần lấy
+            
+        Returns:
+            List các dict {"role": "...", "content": "..."} theo thứ tự thời gian
+        """
+        try:
+            # Lấy limit*2 tin nhắn cuối để đảm bảo có đủ context
+            messages_db = self.db.query(Message)\
+                .filter(Message.conversation_id == conversation_id)\
+                .order_by(desc(Message.created_at))\
+                .limit(limit * 2)\
+                .all()
+            
+            if not messages_db:
+                logger.debug(f"Không có tin nhắn nào cho conversation_id={conversation_id}")
+                return []
+
+            # Đảo ngược để có thứ tự thời gian tăng dần (đúng flow hội thoại)
+            formatted_messages = []
+            for msg in reversed(messages_db):
+                formatted_messages.append({
+                    "role": msg.role, 
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat() if hasattr(msg, 'created_at') else None
+                })
+
+            # Giới hạn kết quả theo limit
+            result = formatted_messages[-limit:] if len(formatted_messages) > limit else formatted_messages
+            
+            logger.debug(f"📋 Lấy {len(result)} tin nhắn context cho conversation_id={conversation_id}")
+            return result
+
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi lấy tin nhắn context cho conversation_id={conversation_id}: {str(e)}", exc_info=True)
+            return []
+
+    def get_conversation_by_id(self, conversation_id: int) -> Optional[Conversation]:
+        cached_metadata = CacheService.get_conversation_metadata(conversation_id)
+        if cached_metadata:
+            try:
+                conv = Conversation()
+                for key, value in cached_metadata.items():
+                    if hasattr(conv, key) and value is not None:
+                        if key in ['created_at', 'updated_at']:
+                            setattr(conv, key, datetime.fromisoformat(value))
+                        else:
+                            setattr(conv, key, value)
+                return conv
+            except (KeyError, ValueError, TypeError) as e:
+                logger.error(f"Lỗi parse conversation cache: {str(e)}")
+                CacheService.delete_cache(CacheService._get_cache_key(CacheService.CONVERSATION_METADATA, conversation_id=conversation_id))
+
+        conversation = self.db.query(Conversation).filter(Conversation.conversation_id == conversation_id).first()
+        if conversation:
+            CacheService.cache_conversation_metadata(
+                conversation.conversation_id, conversation.user_id, conversation.title,
+                conversation.created_at, conversation.updated_at
+            )
+        return conversation
+
+    def get_latest_conversation(self, user_id: int) -> Optional[Conversation]:
+        cached_conversation_id = CacheService.get_latest_conversation_id(user_id)
+        if cached_conversation_id:
+            conversation = self.get_conversation_by_id(cached_conversation_id)
             if conversation:
                 return conversation
-        
-        # Nếu không có trong cache, truy vấn từ DB
+
         conversation = self.db.query(Conversation).filter(
             Conversation.user_id == user_id
-        ).order_by(Conversation.updated_at.desc()).first()
-        
-        # Cập nhật cache nếu tìm thấy
+        ).order_by(desc(Conversation.updated_at)).first()
+
         if conversation:
-            redis_client.set(f"user:{user_id}:latest_conversation", conversation.conversation_id, ex=3600)  # TTL 1 giờ
-        
+            CacheService.cache_conversation_metadata(
+                conversation.conversation_id,
+                user_id,
+                conversation.title,
+                conversation.created_at,
+                conversation.updated_at
+            )
         return conversation
-    
+
     def get_messages(self, conversation_id: int, limit: int = None) -> List[Dict[str, str]]:
-        """
-        Lấy tất cả tin nhắn của một cuộc trò chuyện
-        
-        Args:
-            conversation_id: ID của cuộc trò chuyện
-            limit: Số lượng tin nhắn tối đa cần lấy (nếu None, sử dụng giá trị từ cấu hình)
-            
-        Returns:
-            Danh sách tin nhắn theo định dạng cho LLM
-        """
         if limit is None:
             limit = settings.MAX_HISTORY_MESSAGES
+
+        cache_key = CacheService._get_cache_key(CacheService.CONVERSATION_MESSAGES, conversation_id=conversation_id)
+
+        def rebuild_messages_from_db():
+            logger.debug(f"Rebuilding messages từ DB cho conversation_id={conversation_id}")
+            messages_query = self.db.query(Message).filter(
+                Message.conversation_id == conversation_id
+            ).order_by(Message.created_at)
             
-        # Kiểm tra cache trước
-        cache_key = f"conversation:{conversation_id}:messages"
-        cached_messages = redis_client.get(cache_key)
-        
-        if cached_messages:
-            try:
-                messages = json.loads(cached_messages)
-                logger.debug(f"Lấy {len(messages)} tin nhắn từ cache cho conversation_id={conversation_id}")
-                
-                # Nếu số lượng tin nhắn vượt quá giới hạn, áp dụng giới hạn
-                if limit > 0 and len(messages) > limit:
-                    # Đảm bảo giữ lại system message
-                    system_messages = [msg for msg in messages if msg.get("role") == "system"]
-                    non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
-                    
-                    # Lấy n tin nhắn gần nhất
-                    limited_non_system = non_system_messages[-limit:] if len(non_system_messages) > limit else non_system_messages
-                    
-                    # Kết hợp lại
-                    messages = system_messages + limited_non_system
-                    logger.info(f"Đã giới hạn xuống {len(messages)} tin nhắn từ cache")
-                
-                # Kiểm tra cấu trúc tin nhắn
-                self._validate_messages(messages)
-                return messages
-                
-            except json.JSONDecodeError:
-                logger.error(f"Lỗi giải mã JSON từ cache: {cached_messages[:100]}...")
-                # Tiếp tục để lấy từ DB
-            except Exception as e:
-                logger.error(f"Lỗi xử lý tin nhắn từ cache: {str(e)}")
-                # Tiếp tục để lấy từ DB
-        
-        # Nếu không có trong cache, truy vấn từ DB
-        messages_query = self.db.query(Message).filter(
-            Message.conversation_id == conversation_id
-        ).order_by(Message.created_at)
-        
-        # Đếm tổng số tin nhắn
-        total_messages = messages_query.count()
-        logger.info(f"Tổng số tin nhắn trong DB: {total_messages} cho conversation_id={conversation_id}")
-        
-        # Tải tất cả tin nhắn
-        all_messages = messages_query.all()
-        
-        # Tách system messages
-        system_messages = [msg for msg in all_messages if msg.role == "system"]
-        non_system_messages = [msg for msg in all_messages if msg.role != "system"]
-        
-        # Giới hạn số lượng tin nhắn non-system
-        if limit > 0 and len(non_system_messages) > limit:
-            non_system_messages = non_system_messages[-limit:]
-            logger.info(f"Đã giới hạn xuống {len(non_system_messages)} tin nhắn non-system + {len(system_messages)} system messages")
-        
-        # Kết hợp lại
-        limited_messages = system_messages + non_system_messages
-        
-        # Sắp xếp theo thời gian
-        limited_messages.sort(key=lambda msg: msg.created_at)
-        
-        # Format lại kết quả cho phù hợp với định dạng của LLM
-        formatted_messages = [
-            {"role": msg.role, "content": msg.content} 
-            for msg in limited_messages
-        ]
-        
-        # Kiểm tra và log dữ liệu
-        logger.info(f"Trả về {len(formatted_messages)} tin nhắn cho conversation_id={conversation_id}")
-        
-        # Kiểm tra cấu trúc tin nhắn
-        self._validate_messages(formatted_messages)
-        
-        # Cập nhật cache
-        try:
-            redis_client.set(cache_key, json.dumps(formatted_messages), ex=3600)  # TTL 1 giờ
-        except Exception as e:
-            logger.error(f"Lỗi lưu cache: {str(e)}")
-        
-        return formatted_messages
-    
+            all_messages_db = messages_query.all()
+            formatted_msgs = [{"role": msg.role, "content": msg.content} for msg in all_messages_db]
+            logger.info(f"Đã rebuild {len(formatted_msgs)} tin nhắn từ DB")
+            return formatted_msgs
+
+        all_cached_messages = CacheService.get_or_rebuild_cache(
+            key=cache_key,
+            rebuild_func=rebuild_messages_from_db,
+            expected_type=list,
+            ttl=CacheService.TTL_MEDIUM
+        )
+
+        if not all_cached_messages:
+            return []
+
+        if limit > 0 and len(all_cached_messages) > limit:
+            return all_cached_messages[-limit:]
+        return all_cached_messages
+
     def get_messages_with_summary(self, conversation_id: int, limit: int = None) -> List[Dict[str, str]]:
         """
-        Lấy tin nhắn của cuộc trò chuyện với tóm tắt nếu cần
+        Đơn giản hóa - chỉ trả về tin nhắn thô.
+        ChatService sẽ chịu trách nhiệm kết hợp tin nhắn và tóm tắt nếu cần.
         
-        Args:
-            conversation_id: ID của cuộc trò chuyện
-            limit: Số lượng tin nhắn tối đa cần lấy (nếu None, sử dụng giá trị từ cấu hình)
-            
-        Returns:
-            Danh sách tin nhắn, có bao gồm tóm tắt nếu cần
+        Note: Hàm này được giữ lại để tương thích ngược,
+        nhưng logic tóm tắt tăng dần được xử lý bởi ChatService.
         """
-        if limit is None:
-            limit = settings.MAX_HISTORY_MESSAGES
-            
-        # Lấy tổng số tin nhắn non-system
-        total_messages = self.db.query(func.count(Message.message_id)).filter(
-            Message.conversation_id == conversation_id,
-            Message.role != "system"
-        ).scalar()
-        
-        # Kiểm tra xem có cần tóm tắt không
-        need_summary = (total_messages > settings.SUMMARY_THRESHOLD)
-        
-        # Tìm tin nhắn gần nhất có summary
-        summarized_message = self.db.query(Message).filter(
-            Message.conversation_id == conversation_id,
-            Message.summary.isnot(None),
-            Message.summary != ""
-        ).order_by(Message.created_at.desc()).first()
-        
-        has_summary = summarized_message is not None
-        
-        # Kiểm tra xem có tin nhắn mới chưa được tóm tắt
-        has_new_messages = self.db.query(func.count(Message.message_id)).filter(
-            Message.conversation_id == conversation_id,
-            Message.is_summarized == False,
-            Message.role != "system"
-        ).scalar() > 0
-        
-        # Cần tạo tóm tắt mới nếu: 
-        # - Số tin nhắn vượt ngưỡng VÀ
-        # - (Chưa có tóm tắt HOẶC Có tin nhắn mới chưa được tóm tắt)
-        need_new_summary = need_summary and (not has_summary or has_new_messages)
-        
-        logger.info(f"Kiểm tra tóm tắt: total_msgs={total_messages}, need_summary={need_summary}, has_summary={has_summary}, need_new={need_new_summary}")
-        
-        # Lấy messages thông thường (có giới hạn)
-        messages = self.get_messages(conversation_id, limit)
-        
-        # Nếu có tóm tắt và cần sử dụng, thêm tóm tắt vào đầu danh sách
-        if has_summary and need_summary and not need_new_summary:
-            system_messages = [msg for msg in messages if msg["role"] == "system"]
-            non_system_messages = [msg for msg in messages if msg["role"] != "system"]
-            
-            # Tạo tin nhắn tóm tắt
-            summary_message = {
-                "role": "system",
-                "content": f"TÓM TẮT CUỘC TRÒ CHUYỆN TRƯỚC ĐÂY: {summarized_message.summary}"
-            }
-            
-            # Ghép lại, đảm bảo tóm tắt nằm sau system message gốc nhưng trước các tin nhắn user/assistant
-            result_messages = system_messages + [summary_message] + non_system_messages
-            
-            logger.info(f"Đã thêm tóm tắt vào tin nhắn, tổng cộng {len(result_messages)} tin nhắn")
-            return result_messages
-            
-        # Trả về tin nhắn đã lấy, không có tóm tắt
-        return messages
-    
+        return self.get_messages(conversation_id, limit)
+
     def get_unsummarized_conversation_ids(self, threshold: int = None) -> List[int]:
-        """
-        Lấy danh sách các cuộc trò chuyện cần được tóm tắt
-        
-        Args:
-            threshold: Ngưỡng số lượng tin nhắn để cần tóm tắt
-            
-        Returns:
-            Danh sách ID của các cuộc trò chuyện cần tóm tắt
-        """
         if threshold is None:
             threshold = settings.SUMMARY_THRESHOLD
             
-        # Lấy các cuộc trò chuyện có nhiều hơn threshold tin nhắn chưa được tóm tắt
-        conversation_ids = self.db.query(Message.conversation_id).filter(
-            Message.is_summarized == False,
-            Message.role != "system"
-        ).group_by(Message.conversation_id).having(
-            func.count(Message.message_id) > threshold
-        ).all()
+        cached_result = CacheService.get_unsummarized_conversations(threshold)
+        if cached_result is not None:
+            return cached_result
         
-        return [conv_id[0] for conv_id in conversation_ids]
-    
-    def is_user_owner_of_conversation(self, user_id: int, conversation_id: int) -> bool:
-        """Kiểm tra xem người dùng có phải là chủ của cuộc trò chuyện không"""
-        conversation = self.get_conversation_by_id(conversation_id)
-        return conversation is not None and conversation.user_id == user_id
-    
-    def save_health_data(self, 
-                        conversation_id: int, 
-                        user_id: int, 
-                        health_condition: str = None, 
-                        medical_history: str = None,
-                        allergies: str = None,
-                        dietary_habits: str = None,
-                        health_goals: str = None,
-                        additional_info: Dict = None) -> HealthData:
-        """
-        Lưu thông tin sức khỏe người dùng vào cơ sở dữ liệu
-        
-        Args:
-            conversation_id: ID của cuộc trò chuyện
-            user_id: ID của người dùng
-            health_condition: Tình trạng sức khỏe hiện tại
-            medical_history: Bệnh lý đã biết
-            allergies: Dị ứng
-            dietary_habits: Thói quen ăn uống
-            health_goals: Mục tiêu sức khỏe
-            additional_info: Thông tin bổ sung dạng dict
-            
-        Returns:
-            HealthData object đã được tạo
-        """
         try:
-            # Ghi log các thông tin sức khỏe được lưu
-            logger.info(f"Lưu thông tin sức khỏe: condition={health_condition}, allergies={allergies}, goals={health_goals}")
+            conversation_ids_query = self.db.query(Message.conversation_id).filter(
+                Message.is_summarized == False,
+                Message.role != "system"
+            ).group_by(Message.conversation_id).having(
+                func.count(Message.message_id) >= threshold
+            )
+            conversation_ids = conversation_ids_query.all()
+            result = [conv_id[0] for conv_id in conversation_ids]
+        except Exception as e:
+            logger.error(f"Lỗi query unsummarized conversations: {e}")
+            all_convs_with_unsummarized = self.db.query(Message.conversation_id).filter(
+                Message.is_summarized == False, Message.role != "system"
+            ).distinct().all()
+            result = []
+            for conv_id_tuple in all_convs_with_unsummarized:
+                conv_id = conv_id_tuple[0]
+                count = self.db.query(func.count(Message.message_id)).filter(
+                    Message.conversation_id == conv_id,
+                    Message.is_summarized == False,
+                    Message.role != "system"
+                ).scalar()
+                if count >= threshold:
+                    result.append(conv_id)
+
+        CacheService.cache_unsummarized_conversations(threshold, result)
+        return result
+
+    def is_user_owner_of_conversation(self, user_id: int, conversation_id: int) -> bool:
+        cached_owner = CacheService.get_conversation_owner(conversation_id)
+        if cached_owner is not None:
+            return cached_owner == user_id
             
-            # Kiểm tra xem đã có dữ liệu cho cuộc trò chuyện này chưa
-            existing_data = self.db.query(HealthData).filter(
-                HealthData.conversation_id == conversation_id
-            ).first()
+        conversation = self.db.query(Conversation).filter(Conversation.conversation_id == conversation_id).first()
+        if conversation:
+            CacheService.cache_conversation_metadata(
+                conversation.conversation_id, conversation.user_id, conversation.title,
+                conversation.created_at, conversation.updated_at
+            )
+            return conversation.user_id == user_id
+        return False
+
+    def save_health_data(self, conversation_id: int, user_id: int, health_condition: str = None, 
+                        medical_history: str = None, allergies: str = None, dietary_habits: str = None, 
+                        health_goals: str = None, additional_info: Dict = None) -> HealthData:
+        try:
+            logger.info(f"Lưu thông tin sức khỏe: conv_id={conversation_id}")
+            existing_data = self.db.query(HealthData).filter(HealthData.conversation_id == conversation_id).first()
             
             if existing_data:
-                # Cập nhật thông tin vào bản ghi đã có
-                if health_condition and health_condition.strip():
+                if health_condition is not None:
                     existing_data.health_condition = health_condition
-                    logger.info(f"Cập nhật health_condition: {health_condition}")
-                if medical_history and medical_history.strip():
+                if medical_history is not None:
                     existing_data.medical_history = medical_history
-                    logger.info(f"Cập nhật medical_history: {medical_history}")
-                if allergies and allergies.strip():
+                if allergies is not None:
                     existing_data.allergies = allergies
-                    logger.info(f"Cập nhật allergies: {allergies}")
-                if dietary_habits and dietary_habits.strip():
+                if dietary_habits is not None:
                     existing_data.dietary_habits = dietary_habits
-                    logger.info(f"Cập nhật dietary_habits: {dietary_habits}")
-                if health_goals and health_goals.strip():
+                if health_goals is not None:
                     existing_data.health_goals = health_goals
-                    logger.info(f"Cập nhật health_goals: {health_goals}")
-                
-                # Cập nhật thông tin bổ sung nếu có
                 if additional_info:
                     if existing_data.additional_info:
-                        # Nếu đã có dữ liệu, merge thêm dữ liệu mới
-                        current_data = existing_data.additional_info
-                        current_data.update(additional_info)
-                        existing_data.additional_info = current_data
+                        existing_data.additional_info.update(additional_info)
                     else:
                         existing_data.additional_info = additional_info
-                
-                # Cập nhật thời gian
                 existing_data.updated_at = datetime.now()
-                
                 self.db.commit()
-                logger.info(f"Đã cập nhật thông tin sức khỏe cho conversation_id={conversation_id}")
                 
+                health_data_dict = self._format_health_data_for_cache(existing_data)
+                CacheService.cache_health_data(conversation_id, health_data_dict)
                 return existing_data
             else:
-                # Tạo bản ghi mới
                 health_data = HealthData(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    health_condition=health_condition,
-                    medical_history=medical_history,
-                    allergies=allergies,
-                    dietary_habits=dietary_habits,
-                    health_goals=health_goals,
-                    additional_info=additional_info or {}
+                    conversation_id=conversation_id, user_id=user_id,
+                    health_condition=health_condition, medical_history=medical_history,
+                    allergies=allergies, dietary_habits=dietary_habits,
+                    health_goals=health_goals, additional_info=additional_info or {}
                 )
-                
                 self.db.add(health_data)
                 self.db.commit()
                 self.db.refresh(health_data)
                 
-                logger.info(f"Đã thêm mới thông tin sức khỏe cho conversation_id={conversation_id}")
-                
-                # Lưu thông tin vào Redis cache
-                cache_key = f"session:{conversation_id}:health_data"
-                cache_data = {
-                    "user_id": user_id,
-                    "health_condition": health_condition,
-                    "medical_history": medical_history,
-                    "allergies": allergies,
-                    "dietary_habits": dietary_habits,
-                    "health_goals": health_goals,
-                    "additional_info": additional_info or {},
-                    "timestamp": datetime.now().isoformat()
-                }
-                
-                try:
-                    redis_client.set(
-                        cache_key,
-                        json.dumps(cache_data),
-                        ex=86400  # Hết hạn sau 24h
-                    )
-                except Exception as e:
-                    logger.error(f"Lỗi khi lưu thông tin sức khỏe vào cache: {str(e)}")
-                
+                health_data_dict = self._format_health_data_for_cache(health_data)
+                CacheService.cache_health_data(conversation_id, health_data_dict)
                 return health_data
                 
         except Exception as e:
-            logger.error(f"Lỗi khi lưu thông tin sức khỏe: {str(e)}")
+            logger.error(f"Lỗi khi lưu thông tin sức khỏe: {str(e)}", exc_info=True)
             self.db.rollback()
             raise
-    
+
     def get_health_data(self, conversation_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Lấy thông tin sức khỏe của một cuộc trò chuyện
-        
-        Args:
-            conversation_id: ID của cuộc trò chuyện
-            
-        Returns:
-            Dict chứa thông tin sức khỏe hoặc None nếu không tìm thấy
-        """
-        # Kiểm tra cache trước
-        cache_key = f"session:{conversation_id}:health_data"
-        cached_data = redis_client.get(cache_key)
-        
+        cached_data = CacheService.get_health_data(conversation_id)
         if cached_data:
-            try:
-                return json.loads(cached_data)
-            except json.JSONDecodeError:
-                logger.error(f"Lỗi giải mã JSON từ cache: {cached_data[:100]}...")
-            except Exception as e:
-                logger.error(f"Lỗi xử lý thông tin sức khỏe từ cache: {str(e)}")
-        
-        # Nếu không có trong cache, lấy từ DB
+            return cached_data
+            
         health_data = self.db.query(HealthData).filter(
             HealthData.conversation_id == conversation_id
-        ).order_by(HealthData.updated_at.desc()).first()
+        ).order_by(desc(HealthData.updated_at)).first()
         
         if not health_data:
             return None
             
-        # Format dữ liệu trả về
-        result = {
+        result = self._format_health_data_for_cache(health_data)
+        CacheService.cache_health_data(conversation_id, result)
+        return result
+
+    def _format_health_data_for_cache(self, health_data: HealthData) -> Dict[str, Any]:
+        return {
             "user_id": health_data.user_id,
             "health_condition": health_data.health_condition,
             "medical_history": health_data.medical_history,
@@ -450,56 +472,255 @@ class ChatRepository:
             "created_at": health_data.created_at.isoformat() if health_data.created_at else None,
             "updated_at": health_data.updated_at.isoformat() if health_data.updated_at else None
         }
+
+    def _rebuild_messages_cache(self, conversation_id: int) -> bool:
+        """
+        Rebuild cache tin nhắn từ DB để đảm bảo consistency.
         
-        # Cập nhật cache
-        try:
-            redis_client.set(
-                cache_key,
-                json.dumps(result),
-                ex=3600  # TTL 1 giờ
-            )
-        except Exception as e:
-            logger.error(f"Lỗi lưu thông tin sức khỏe vào cache: {str(e)}")
-        
-        return result
-    
-    def _cache_conversation_metadata(self, conversation: Conversation):
-        """Lưu metadata của cuộc trò chuyện vào Redis"""
-        user_id = conversation.user_id
-        conversation_id = conversation.conversation_id
-        
-        # Lưu conversation ID mới nhất của user
-        redis_client.set(f"user:{user_id}:latest_conversation", conversation_id, ex=3600)  # TTL 1 giờ
-    
-    def _update_conversation_cache(self, conversation_id: int):
-        """Cập nhật cache khi có tin nhắn mới"""
-        # Xóa cache cũ để buộc cập nhật mới khi get lần sau
-        cache_key = f"conversation:{conversation_id}:messages"
-        redis_client.delete(cache_key) 
-    
-    def _validate_messages(self, messages: List[Dict[str, str]]) -> None:
-        """Kiểm tra tính hợp lệ của danh sách tin nhắn"""
-        if not isinstance(messages, list):
-            logger.error(f"Kiểu dữ liệu không hợp lệ: {type(messages)}, mong đợi kiểu list")
-            raise ValueError("Định dạng tin nhắn không hợp lệ: mong đợi một danh sách")
-        
-        for i, msg in enumerate(messages):
-            if not isinstance(msg, dict):
-                logger.error(f"Tin nhắn {i} không phải kiểu dict: {type(msg)}")
-                raise ValueError(f"Tin nhắn {i} không có định dạng đúng")
+        Args:
+            conversation_id: ID cuộc trò chuyện cần rebuild cache
             
-            if "role" not in msg:
-                logger.error(f"Tin nhắn {i} thiếu trường 'role'")
-                raise ValueError(f"Tin nhắn {i} thiếu thông tin role")
-                
-            if "content" not in msg:
-                logger.error(f"Tin nhắn {i} thiếu trường 'content'")
-                raise ValueError(f"Tin nhắn {i} thiếu nội dung")
-                
-            if msg["role"] not in ["system", "user", "assistant"]:
-                logger.warning(f"Tin nhắn {i} có role không chuẩn: {msg['role']}")
+        Returns:
+            True nếu rebuild thành công, False nếu có lỗi
+        """
+        try:
+            # Query tất cả tin nhắn từ DB theo thứ tự thời gian
+            messages_query = self.db.query(Message).filter(
+                Message.conversation_id == conversation_id
+            ).order_by(Message.created_at)
+            
+            all_messages_db = messages_query.all()
+            formatted_messages = [
+                {"role": msg.role, "content": msg.content} 
+                for msg in all_messages_db
+            ]
+            
+            # Cache với key nhất quán
+            cache_key = CacheService._get_cache_key(
+                CacheService.CONVERSATION_MESSAGES, 
+                conversation_id=conversation_id
+            )
+            success = CacheService.set_cache(cache_key, formatted_messages, CacheService.TTL_MEDIUM)
+            
+            if success:
+                logger.debug(f"🔄 Đã rebuild messages cache cho conversation_id={conversation_id} ({len(formatted_messages)} tin nhắn)")
+                return True
+            else:
+                logger.error(f"❌ Lỗi set cache khi rebuild cho conversation_id={conversation_id}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi rebuild cache tin nhắn cho conversation_id={conversation_id}: {str(e)}", exc_info=True)
+            return False
+
+    def _sync_related_caches(self, conversation_id: int) -> None:
+        """
+        Đồng bộ các cache liên quan khi có thay đổi conversation.
         
-        # Kiểm tra xem có ít nhất một tin nhắn người dùng
-        user_messages = [msg for msg in messages if msg.get("role") == "user"]
-        if not user_messages:
-            logger.warning("Không có tin nhắn nào từ người dùng trong cuộc trò chuyện") 
+        Args:
+            conversation_id: ID cuộc trò chuyện cần sync cache
+        """
+        try:
+            conversation = self.db.query(Conversation).filter(
+                Conversation.conversation_id == conversation_id
+            ).first()
+            
+            if conversation:
+                # Cache conversation metadata
+                CacheService.cache_conversation_metadata(
+                    conversation.conversation_id, conversation.user_id, conversation.title,
+                    conversation.created_at, conversation.updated_at
+                )
+                
+                # Cache latest conversation cho user
+                latest_key = CacheService._get_cache_key(
+                    CacheService.USER_LATEST_CONVERSATION, 
+                    user_id=conversation.user_id
+                )
+                CacheService.set_cache(latest_key, conversation_id, CacheService.TTL_MEDIUM)
+                
+                logger.debug(f"🔄 Đã sync related caches cho conversation_id={conversation_id}")
+            else:
+                logger.warning(f"⚠️ Không tìm thấy conversation_id={conversation_id} để sync cache")
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi sync related caches cho conversation_id={conversation_id}: {str(e)}", exc_info=True)
+
+    @invalidate_cache_on_update(["recent_recipes:*", "recipe:*:details"])
+    def save_recipe_to_menu(self, recipe_name: str, recipe_description: str, 
+                           ingredients_with_products: List[Dict[str, Any]]) -> Optional[int]:
+        try:
+            menu = Menu(name=recipe_name, description=recipe_description)
+            self.db.add(menu)
+            self.db.flush()
+            
+            menu_id = menu.menu_id
+            logger.info(f"Đã tạo menu '{recipe_name}' với ID={menu_id}")
+            
+            menu_items_data = []
+            for ing in ingredients_with_products:
+                if ing.get('product_id'):
+                    menu_item = MenuItem(
+                        menu_id=menu_id,
+                        product_id=ing['product_id'],
+                        quantity=ing.get('quantity', 1)
+                    )
+                    self.db.add(menu_item)
+                    menu_items_data.append({
+                        'product_id': ing['product_id'],
+                        'quantity': ing.get('quantity', 1),
+                        'ingredient_name': ing.get('ingredient_name', '')
+                    })
+                    
+            self.db.commit()
+            
+            recipe_data_cache = {
+                'menu_id': menu_id,
+                'name': recipe_name,
+                'description': recipe_description,
+                'created_at': datetime.now().isoformat(),
+                'ingredients': menu_items_data
+            }
+            CacheService.cache_recipe_data(menu_id, recipe_data_cache)
+            
+            logger.info(f"Đã lưu công thức '{recipe_name}' với {len(ingredients_with_products)} nguyên liệu")
+            return menu_id
+            
+        except Exception as e:
+            logger.error(f"Lỗi khi lưu công thức '{recipe_name}': {str(e)}", exc_info=True)
+            self.db.rollback()
+            return None
+
+    def save_multiple_recipes_to_menu(self, recipes_data: List[Dict[str, Any]], 
+                                     product_mapping: Dict[str, Any]) -> List[int]:
+        created_menu_ids = []
+        if not recipes_data:
+            return created_menu_ids
+            
+        ingredient_to_product = {}
+        if product_mapping and product_mapping.get('ingredient_mapping_results'):
+            for mapping in product_mapping['ingredient_mapping_results']:
+                name_low = mapping.get('requested_ingredient', '').lower().strip()
+                pid = mapping.get('product_id')
+                if name_low and pid:
+                    ingredient_to_product[name_low] = {
+                        'product_id': int(pid),
+                        'product_name': mapping.get('product_name', '')
+                    }
+        
+        for recipe in recipes_data:
+            try:
+                name = recipe.get('name', 'Món ăn không tên')
+                ing_sum = recipe.get('ingredients_summary', '')
+                url = recipe.get('url', '')
+                
+                desc_parts = []
+                if ing_sum:
+                    desc_parts.append(f"Nguyên liệu: {ing_sum}")
+                if url:
+                    desc_parts.append(f"Nguồn: {url}")
+                    
+                recipe_desc = "\n".join(desc_parts)
+                ings_with_prods = []
+                
+                if ing_sum:
+                    for ing_item_str in ing_sum.split(','):
+                        ing_clean = ing_item_str.strip()
+                        if ing_clean:
+                            ing_low = ing_clean.lower()
+                            prod_info = None
+                            
+                            if ing_low in ingredient_to_product:
+                                prod_info = ingredient_to_product[ing_low]
+                            else:
+                                for mapped_ing, info_map in ingredient_to_product.items():
+                                    if mapped_ing in ing_low or ing_low in mapped_ing:
+                                        prod_info = info_map
+                                        break
+                                        
+                            if prod_info:
+                                ings_with_prods.append({
+                                    'ingredient_name': ing_clean,
+                                    'product_id': prod_info['product_id'],
+                                    'quantity': 1
+                                })
+                
+                menu_id = self.save_recipe_to_menu(name, recipe_desc, ings_with_prods)
+                if menu_id:
+                    created_menu_ids.append(menu_id)
+                else:
+                    logger.warning(f"Không thể lưu recipe '{name}' từ batch")
+                    
+            except Exception as e:
+                logger.error(f"Lỗi khi xử lý recipe '{recipe.get('name', 'Unknown')}': {str(e)}", exc_info=True)
+                continue
+        
+        if created_menu_ids:
+            batch_data_cache = {
+                'menu_ids': created_menu_ids,
+                'recipes_count': len(recipes_data),
+                'recipes_summary': [
+                    {
+                        'name': r.get('name', ''),
+                        'menu_id': created_menu_ids[i] if i < len(created_menu_ids) else None
+                    }
+                    for i, r in enumerate(recipes_data)
+                ]
+            }
+            CacheService.cache_batch_operation("batch_recipe_save", batch_data_cache)
+            
+        logger.info(f"Đã lưu {len(created_menu_ids)}/{len(recipes_data)} recipes vào database")
+        return created_menu_ids
+
+    def get_cached_recipes(self, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
+        cache_key = CacheService._get_cache_key(CacheService.RECENT_RECIPES, limit=limit)
+        return CacheService.get_cache(cache_key, list)
+
+    def get_recipe_by_id(self, menu_id: int) -> Optional[Dict[str, Any]]:
+        cached_recipe = CacheService.get_recipe_data(menu_id)
+        if cached_recipe:
+            return cached_recipe
+            
+        menu = self.db.query(Menu).filter(Menu.menu_id == menu_id).first()
+        if not menu:
+            return None
+            
+        menu_items_db = self.db.query(MenuItem).filter(MenuItem.menu_id == menu_id).all()
+        recipe_data_db = {
+            'menu_id': menu.menu_id,
+            'name': menu.name,
+            'description': menu.description,
+            'created_at': menu.created_at.isoformat() if menu.created_at else None,
+            'ingredients': [
+                {
+                    'product_id': item.product_id,
+                    'quantity': item.quantity
+                }
+                for item in menu_items_db
+            ]
+        }
+        
+        CacheService.cache_recipe_data(menu_id, recipe_data_db)
+        return recipe_data_db 
+
+    def _invalidate_summary_related_caches(self, conversation_id: int) -> None:
+        """
+        Invalidate các cache liên quan đến tóm tắt khi có thay đổi.
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+        """
+        try:
+            # Invalidate cache unsummarized conversations
+            CacheService.delete_pattern("unsummarized_conversations:*")
+            
+            # Invalidate conversation metadata nếu cần
+            metadata_key = CacheService._get_cache_key(
+                CacheService.CONVERSATION_METADATA, 
+                conversation_id=conversation_id
+            )
+            
+            logger.debug(f"🗑️ Invalidated summary-related caches cho conversation_id={conversation_id}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Lỗi khi invalidate summary caches: {str(e)}") 
