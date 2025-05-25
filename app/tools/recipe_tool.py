@@ -36,11 +36,11 @@ TOTAL_DOCS_IN_PINECONE = 2351
 
 # ⭐ Dynamic batching constants - ưu tiên character count
 MAX_CHAR_PER_BATCH = 350000  # ~116k tokens (giả sử 3 chars = 1 token), an toàn cho gemini-1.5-flash
-MAX_SAFE_BATCH_SIZE = 80     # Fallback limit nếu dynamic batching fails
+MAX_SAFE_BATCH_SIZE = 100     # Fallback limit nếu dynamic batching fails
 MIN_BATCH_SIZE = 20          # Minimum documents per batch
 
 # ⭐ CONCURRENCY CONTROL: Giới hạn số lượng Gemini API calls đồng thời
-MAX_CONCURRENT_GEMINI_CALLS = 4  # Bắt đầu với 4 calls đồng thời để an toàn
+MAX_CONCURRENT_GEMINI_CALLS = 7  # Bắt đầu với 4 calls đồng thời để an toàn
 
 # Cờ để bật/tắt việc làm sạch văn bản
 SANITIZE_INPUT_TEXT = True
