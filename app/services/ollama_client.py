@@ -8,11 +8,12 @@ logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = None, target_model: str = None, timeout: float = 180.0):
+    def __init__(self, base_url: str = None, target_model: str = None, timeout: float = None):
         self.base_url = base_url or settings.OLLAMA_URL
         self.chat_endpoint = f"{self.base_url}/api/chat"  # Ollama native endpoint
         self.target_model = target_model or settings.MEDICHAT_MODEL
-        self.timeout = timeout
+        # ⭐ TIMEOUT LINH HOẠT - sử dụng từ settings hoặc giá trị mặc định lớn hơn
+        self.timeout = timeout or getattr(settings, "OLLAMA_TIMEOUT_SECONDS", 300.0)
         logger.info(f"Khởi tạo OllamaClient với model: {self.target_model}, URL cơ sở: {self.base_url}")
         
     async def check_model_availability(self, model_name: str = None) -> tuple[bool, str]:
@@ -89,26 +90,17 @@ class OllamaClient:
                 }
                 messages = [system_message] + messages
             
-            # Cắt giảm nội dung tin nhắn nếu quá dài
-            truncated_messages = []
-            for msg in messages:
-                content = msg.get("content", "")
-                # Giới hạn nội dung mỗi tin nhắn tối đa 1000 ký tự
-                if len(content) > 1000:
-                    truncated_content = content[:997] + "..."
-                    logger.warning(f"Tin nhắn đã bị cắt từ {len(content)} xuống còn 1000 ký tự")
-                    msg = {**msg, "content": truncated_content}
-                truncated_messages.append(msg)
-            
-            logger.debug(f"Gửi yêu cầu không streaming đến Ollama với {len(truncated_messages)} tin nhắn")
+            # ⭐ BỎ LOGIC CẮT NGẮN TIN NHẮN - sử dụng prompt đầy đủ từ Gemini
+            # Tin tưởng rằng GeminiPromptService đã tạo prompt phù hợp với giới hạn từ
+            logger.debug(f"Gửi yêu cầu không streaming đến Ollama với {len(messages)} tin nhắn (không cắt ngắn)")
             
             # Kiểm tra và đảm bảo có dữ liệu người dùng trong messages
-            if len(truncated_messages) < 2:  # Phải có ít nhất system message và user message
+            if len(messages) < 2:  # Phải có ít nhất system message và user message
                 logger.error("Không đủ tin nhắn để tạo hội thoại")
                 return "Xin lỗi, không thể xử lý yêu cầu vì thiếu thông tin. Vui lòng nhập câu hỏi của bạn."
                 
             # Kiểm tra xem tin nhắn cuối cùng có nội dung không
-            last_user_msg = next((msg for msg in reversed(truncated_messages) if msg.get("role") == "user"), None)
+            last_user_msg = next((msg for msg in reversed(messages) if msg.get("role") == "user"), None)
             if last_user_msg is None or not last_user_msg.get("content", "").strip():
                 logger.error("Tin nhắn người dùng trống hoặc không tồn tại")
                 return "Xin lỗi, vui lòng nhập nội dung câu hỏi của bạn."
@@ -120,7 +112,7 @@ class OllamaClient:
                     url=self.chat_endpoint,
                     json={
                         "model": self.target_model,
-                        "messages": truncated_messages,
+                        "messages": messages,
                         "stream": False,
                         "options": {
                             "temperature": 0.7,

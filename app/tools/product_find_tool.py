@@ -46,6 +46,30 @@ if not api_key_manager.is_healthy():
 
 logger.info(f"✅ Product Find Tool đã khởi tạo với {len(api_key_manager.get_all_keys())} API keys có sẵn")
 
+def get_embedding_model():
+    """⭐ Lấy embedding model từ global cache hoặc tạo mới nếu cần"""
+    try:
+        # Import function để lấy global embedding model
+        from main import get_global_embedding_model
+        global_model = get_global_embedding_model()
+        
+        if global_model is not None:
+            logger.info("✅ Sử dụng pre-loaded embedding model từ global cache")
+            return global_model
+        else:
+            logger.warning("⚠️ Global embedding model chưa được load, tạo mới...")
+            return HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+    except ImportError:
+        logger.warning("⚠️ Không thể import global embedding model, tạo mới...")
+        return HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
 
 def init_services():
     """Khởi tạo kết nối Pinecone và embedding model."""
@@ -61,13 +85,13 @@ def init_services():
         pinecone_index = pc.Index(PINECONE_INDEX_NAME)
         logger.info(f"Đã tạo đối tượng Index cho: {PINECONE_INDEX_NAME}")
 
-        logger.info(f"Đang tải mô hình embedding từ {EMBEDDING_MODEL_NAME}...")
-        embeddings_model = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        logger.info("Đã tải thành công mô hình embedding.")
+        # ⭐ SỬ DỤNG GLOBAL EMBEDDING MODEL
+        embeddings_model = get_embedding_model()
+        if embeddings_model:
+            logger.info("✅ Đã sử dụng embedding model (pre-loaded hoặc mới tạo)")
+        else:
+            logger.error("❌ Không thể tạo embedding model")
+            raise ValueError("Không thể tạo embedding model")
 
         return pinecone_index, embeddings_model
     except Exception as e:

@@ -455,6 +455,31 @@ def response_cleanup_node_wrapper(state: ChatState, repository) -> ChatState:
                     "role": "assistant",
                     "content": result_state['final_response']
                 }
+                
+                # ⭐ CHỈ LƯU RECIPES ĐÃ ĐƯỢC HIỂN THỊ TRONG PHẢN HỒI CUỐI CÙNG
+                if (result_state.get('is_food_related') and 
+                    result_state.get('recipe_results') and 
+                    result_state.get('product_results')):
+                    
+                    try:
+                        # ⭐ TRÍCH XUẤT CHỈ NHỮNG RECIPES ĐÃ ĐƯỢC HIỂN THỊ (TỐI ĐA 5 RECIPES THEO LOGIC HIỂN THỊ)
+                        recipes_to_save = result_state['recipe_results'][:5]  # Chỉ lấy 5 recipes đầu tiên đã được hiển thị
+                        
+                        if recipes_to_save:
+                            saved_menu_ids = repository.save_multiple_recipes_to_menu(
+                                recipes_to_save,
+                                result_state['product_results']
+                            )
+                            
+                            if saved_menu_ids:
+                                logger.info(f"💾 Đã lưu {len(saved_menu_ids)} công thức món ăn vào database: {saved_menu_ids}")
+                                # Log tên các recipes đã lưu để dễ theo dõi
+                                saved_recipe_names = [recipe.get('name', 'N/A') for recipe in recipes_to_save]
+                                logger.info(f"📋 Tên các recipes đã lưu: {saved_recipe_names}")
+                        else:
+                            logger.info("⚠️ Không có recipes nào để lưu sau khi filter")
+                    except Exception as recipe_save_error:
+                        logger.error(f"💥 Lỗi khi lưu recipes: {recipe_save_error}")
         except Exception as e:
             logger.error(f"💥 Lỗi khi xử lý phản hồi: {str(e)}", exc_info=True)
             result_state['error'] = f"Lỗi khi xử lý phản hồi: {str(e)}"
@@ -609,18 +634,10 @@ async def recipe_search_logic(state: ChatState) -> List[Dict[str, Any]]:
             recipes = []
 
         if recipes:
-            # Lọc trùng lặp bằng Gemini (hàm này là async)
-            try:
-                filtered_recipes = await gemini_service.filter_duplicate_recipes(recipes)
-                final_recipes = filtered_recipes[:10]  # Giới hạn 10 recipes tốt nhất
-                logger.info(f"✅ Recipe logic: Đã lọc từ {len(recipes)} xuống {len(filtered_recipes)} recipes, trả về {len(final_recipes)} recipes")
-                return final_recipes
-            except Exception as filter_error:
-                logger.error(f"💥 Lỗi khi lọc recipes: {str(filter_error)}")
-                # Fallback: sử dụng recipes chưa lọc, giới hạn 10
-                final_recipes = recipes[:10]
-                logger.info(f"✅ Recipe logic: Sử dụng {len(final_recipes)} recipes chưa lọc (fallback)")
-                return final_recipes
+            # ⭐ BỎ VIỆC LỌC TRÙNG LẶP - ĐƯA TOÀN BỘ KẾT QUẢ TỪ TOOL VÀO STATE
+            # Tool đã tự lọc trùng lặp bằng tên chuẩn hóa, không cần lọc lại
+            logger.info(f"✅ Recipe logic: Nhận được {len(recipes)} recipes đã được tool lọc trùng lặp, đưa toàn bộ vào state")
+            return recipes  # Trả về TOÀN BỘ recipes từ tool
         else:
             logger.info("❌ Recipe logic: Không tìm thấy công thức món ăn phù hợp sau khi parse.")
             return []
@@ -1098,19 +1115,28 @@ Trả về ngay câu trả lời, không giải thích."""
                     "content": result_state['final_response']
                 }
                 
-                # Lưu công thức món ăn vào database nếu có food-related results
+                # ⭐ CHỈ LƯU RECIPES ĐÃ ĐƯỢC HIỂN THỊ TRONG PHẢN HỒI CUỐI CÙNG
                 if (result_state.get('is_food_related') and 
                     result_state.get('recipe_results') and 
                     result_state.get('product_results')):
                     
                     try:
-                        saved_menu_ids = repository.save_multiple_recipes_to_menu(
-                            result_state['recipe_results'],
-                            result_state['product_results']
-                        )
+                        # ⭐ TRÍCH XUẤT CHỈ NHỮNG RECIPES ĐÃ ĐƯỢC HIỂN THỊ (TỐI ĐA 5 RECIPES THEO LOGIC HIỂN THỊ)
+                        recipes_to_save = result_state['recipe_results'][:5]  # Chỉ lấy 5 recipes đầu tiên đã được hiển thị
                         
-                        if saved_menu_ids:
-                            logger.info(f"💾 Đã lưu {len(saved_menu_ids)} công thức món ăn vào database: {saved_menu_ids}")
+                        if recipes_to_save:
+                            saved_menu_ids = repository.save_multiple_recipes_to_menu(
+                                recipes_to_save,
+                                result_state['product_results']
+                            )
+                            
+                            if saved_menu_ids:
+                                logger.info(f"💾 Đã lưu {len(saved_menu_ids)} công thức món ăn vào database: {saved_menu_ids}")
+                                # Log tên các recipes đã lưu để dễ theo dõi
+                                saved_recipe_names = [recipe.get('name', 'N/A') for recipe in recipes_to_save]
+                                logger.info(f"📋 Tên các recipes đã lưu: {saved_recipe_names}")
+                        else:
+                            logger.info("⚠️ Không có recipes nào để lưu sau khi filter")
                     except Exception as recipe_save_error:
                         logger.error(f"💥 Lỗi khi lưu recipes: {recipe_save_error}")
         except Exception as e:

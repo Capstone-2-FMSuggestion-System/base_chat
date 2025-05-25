@@ -637,18 +637,27 @@ class ChatRepository:
             logger.info(f"Đã tạo menu '{recipe_name}' với ID={menu_id}")
             
             menu_items_data = []
+            ingredients_saved_count = 0
+            
+            # ⭐ LƯU TẤT CẢ NGUYÊN LIỆU, PRODUCT_ID CÓ THỂ NULL
             for ing in ingredients_with_products:
-                if ing.get('product_id'):
+                ingredient_name = ing.get('ingredient_name', '').strip()
+                product_id = ing.get('product_id')
+                quantity = ing.get('quantity', 1)
+                
+                if ingredient_name:  # Chỉ cần có tên nguyên liệu
                     menu_item = MenuItem(
                         menu_id=menu_id,
-                        product_id=ing['product_id'],
-                        quantity=ing.get('quantity', 1)
+                        product_id=product_id,  # Có thể là None
+                        quantity=quantity
                     )
                     self.db.add(menu_item)
+                    ingredients_saved_count += 1
+                    
                     menu_items_data.append({
-                        'product_id': ing['product_id'],
-                        'quantity': ing.get('quantity', 1),
-                        'ingredient_name': ing.get('ingredient_name', '')
+                        'product_id': product_id,
+                        'quantity': quantity,
+                        'ingredient_name': ingredient_name
                     })
                     
             self.db.commit()
@@ -662,7 +671,7 @@ class ChatRepository:
             }
             CacheService.cache_recipe_data(menu_id, recipe_data_cache)
             
-            logger.info(f"Đã lưu công thức '{recipe_name}' với {len(ingredients_with_products)} nguyên liệu")
+            logger.info(f"Đã lưu công thức '{recipe_name}' với {ingredients_saved_count} nguyên liệu")
             return menu_id
             
         except Exception as e:
@@ -676,6 +685,7 @@ class ChatRepository:
         if not recipes_data:
             return created_menu_ids
             
+        # ⭐ XÂY DỰNG MAPPING TỪ NGUYÊN LIỆU ĐẾN PRODUCT_ID
         ingredient_to_product = {}
         if product_mapping and product_mapping.get('ingredient_mapping_results'):
             for mapping in product_mapping['ingredient_mapping_results']:
@@ -702,6 +712,7 @@ class ChatRepository:
                 recipe_desc = "\n".join(desc_parts)
                 ings_with_prods = []
                 
+                # ⭐ LƯU TẤT CẢ NGUYÊN LIỆU, KHÔNG CHỈ NHỮNG CÁI CÓ PRODUCT_ID
                 if ing_sum:
                     for ing_item_str in ing_sum.split(','):
                         ing_clean = ing_item_str.strip()
@@ -709,6 +720,7 @@ class ChatRepository:
                             ing_low = ing_clean.lower()
                             prod_info = None
                             
+                            # Tìm product_id nếu có
                             if ing_low in ingredient_to_product:
                                 prod_info = ingredient_to_product[ing_low]
                             else:
@@ -716,13 +728,13 @@ class ChatRepository:
                                     if mapped_ing in ing_low or ing_low in mapped_ing:
                                         prod_info = info_map
                                         break
-                                        
-                            if prod_info:
-                                ings_with_prods.append({
-                                    'ingredient_name': ing_clean,
-                                    'product_id': prod_info['product_id'],
-                                    'quantity': 1
-                                })
+                            
+                            # ⭐ LUÔN THÊM NGUYÊN LIỆU VÀO DANH SÁCH, PRODUCT_ID CÓ THỂ NULL
+                            ings_with_prods.append({
+                                'ingredient_name': ing_clean,
+                                'product_id': prod_info['product_id'] if prod_info else None,
+                                'quantity': 1
+                            })
                 
                 menu_id = self.save_recipe_to_menu(name, recipe_desc, ings_with_prods)
                 if menu_id:
@@ -765,18 +777,38 @@ class ChatRepository:
             return None
             
         menu_items_db = self.db.query(MenuItem).filter(MenuItem.menu_id == menu_id).all()
+        
+        # ⭐ TRÍCH XUẤT INGREDIENT_NAME TỪ DESCRIPTION NẾU CÓ
+        ingredients_list = []
+        ingredient_names_from_desc = []
+        
+        # Parse ingredient names từ description nếu có
+        if menu.description and "Nguyên liệu:" in menu.description:
+            desc_lines = menu.description.split('\n')
+            for line in desc_lines:
+                if line.startswith("Nguyên liệu:"):
+                    ingredients_text = line.replace("Nguyên liệu:", "").strip()
+                    ingredient_names_from_desc = [ing.strip() for ing in ingredients_text.split(',') if ing.strip()]
+                    break
+        
+        # Tạo danh sách ingredients với tên nếu có
+        for i, item in enumerate(menu_items_db):
+            ingredient_name = None
+            if i < len(ingredient_names_from_desc):
+                ingredient_name = ingredient_names_from_desc[i]
+            
+            ingredients_list.append({
+                'product_id': item.product_id,
+                'quantity': item.quantity,
+                'ingredient_name': ingredient_name
+            })
+        
         recipe_data_db = {
             'menu_id': menu.menu_id,
             'name': menu.name,
             'description': menu.description,
             'created_at': menu.created_at.isoformat() if menu.created_at else None,
-            'ingredients': [
-                {
-                    'product_id': item.product_id,
-                    'quantity': item.quantity
-                }
-                for item in menu_items_db
-            ]
+            'ingredients': ingredients_list
         }
         
         CacheService.cache_recipe_data(menu_id, recipe_data_db)

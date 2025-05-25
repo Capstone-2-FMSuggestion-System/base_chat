@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     LLM_SERVICE_TYPE: str
     LLM_MAX_TOKENS: int = 300
     MEDICHAT_MODEL: str = "monotykamary/medichat-llama3:8b_q4_K_M"
+    OLLAMA_TIMEOUT_SECONDS: float = 300.0  # ⭐ TIMEOUT LINH HOẠT CHO OLLAMA (5 phút)
     
     # Chat History Management
     MAX_HISTORY_MESSAGES: int = 30
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
     GEMINI_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
     GEMINI_MODEL: str = "gemini-2.0-flash-lite"
     GEMINI_MAX_PROMPT_LENGTH: int = 900  # Giới hạn độ dài prompt cho Medichat
+    GEMINI_MAX_PROMPT_WORDS_WITH_CONTEXT: int = 500  # ⭐ GIỚI HẠN TỪ CHO PROMPT MEDICHAT VỚI CONTEXT
     
     # Pinecone Vector Database
     PRODUCT_DB_PINECONE_API_KEY: str = ""

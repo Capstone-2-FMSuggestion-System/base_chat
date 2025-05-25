@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 # Khởi tạo LLM Service Factory
 llm_factory = LLMServiceFactory()
 
+# ⭐ GLOBAL EMBEDDING MODEL CACHE
+_global_embedding_model = None
+
+def get_global_embedding_model():
+    """Lấy global embedding model đã được pre-load"""
+    return _global_embedding_model
+
 # Tạo bảng trong cơ sở dữ liệu
 Base.metadata.create_all(bind=engine)
 
@@ -69,6 +76,7 @@ async def get_llm_status():
         status = {
             "llm_service": active_service,
             "service_available": active_service is not None,
+            "embedding_model_loaded": _global_embedding_model is not None,
         }
         
         # Thêm thông tin về mô hình nếu đang sử dụng Ollama
@@ -92,9 +100,31 @@ async def get_llm_status():
 @app.on_event("startup")
 async def startup_event():
     """Khởi động các dịch vụ và kiểm tra cấu hình khi ứng dụng khởi động"""
+    global _global_embedding_model
+    
     logger.info("Khởi động ứng dụng và kiểm tra các dịch vụ...")
+    
+    # ⭐ PRE-LOAD EMBEDDING MODEL
     try:
-        # Khởi tạo và kiểm tra dịch vụ LLM
+        logger.info("🔄 Đang pre-load mô hình embedding sentence-transformers/all-mpnet-base-v2...")
+        from langchain_huggingface import HuggingFaceEmbeddings
+        
+        _global_embedding_model = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-mpnet-base-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        
+        # Test embedding để đảm bảo model hoạt động
+        test_embedding = _global_embedding_model.embed_query("test")
+        logger.info(f"✅ Đã pre-load thành công mô hình embedding (dimension: {len(test_embedding)})")
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi pre-load embedding model: {str(e)}")
+        _global_embedding_model = None
+    
+    # Khởi tạo và kiểm tra dịch vụ LLM
+    try:
         active_service = await llm_factory.initialize()
         logger.info(f"Dịch vụ LLM đã khởi động: {active_service}")
         

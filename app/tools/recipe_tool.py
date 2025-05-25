@@ -12,6 +12,8 @@ from typing import Tuple, Optional
 
 # ⭐ IMPORT API KEY MANAGER để xoay vòng Gemini API keys
 from app.services.api_key_manager import get_api_key_manager
+# ⭐ IMPORT GEMINI MODEL POOL để thread-safe API access
+from app.tools.gemini_model_pool import get_gemini_model_pool
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,39 +25,111 @@ load_dotenv()
 PINECONE_API_KEY = os.getenv("RECIPE_DB_PINECONE_API_KEY")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# ⭐ KHỞI TẠO API KEY MANAGER
+# ⭐ KHỞI TẠO API KEY MANAGER VÀ GEMINI MODEL POOL
 api_key_manager = get_api_key_manager()
+gemini_model_pool = get_gemini_model_pool(GEMINI_MODEL_NAME)
 
 PINECONE_INDEX_NAME = "recipe-index"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 TEXT_KEY_IN_PINECONE = "text"
 
-# ⭐ TỐI ƯU HÓA: Giảm mạnh batch size để tránh lỗi token limit
-DOCUMENTS_PER_GEMINI_CALL = 120  # Giảm từ 500 xuống 120 để an toàn hơn
+# ⭐ TỐI ƯU HÓA MẠNH: Giảm đáng kể batch size để tránh lỗi token limit
+DOCUMENTS_PER_GEMINI_CALL = 80   # Giảm từ 120 xuống 80 để an toàn hơn
 TOTAL_DOCS_IN_PINECONE = 2351
 
-# ⭐ Dynamic batching constants - ưu tiên character count
-MAX_CHAR_PER_BATCH = 350000  # ~116k tokens (giả sử 3 chars = 1 token), an toàn cho gemini-1.5-flash
-MAX_SAFE_BATCH_SIZE = 100     # Fallback limit nếu dynamic batching fails
-MIN_BATCH_SIZE = 20          # Minimum documents per batch
+# ⭐ Dynamic batching constants - giảm mạnh để tránh lỗi JSON
+MAX_CHAR_PER_BATCH = 200000      # Giảm từ 350k xuống 200k (~67k tokens)
+MAX_SAFE_BATCH_SIZE = 60         # Giảm từ 100 xuống 60
+MIN_BATCH_SIZE = 15              # Giảm từ 20 xuống 15
 
-# ⭐ CONCURRENCY CONTROL: Giới hạn số lượng Gemini API calls đồng thời
-MAX_CONCURRENT_GEMINI_CALLS = 7  # Bắt đầu với 4 calls đồng thời để an toàn
+# ⭐ GEMINI OUTPUT TOKEN LIMIT - giảm để đảm bảo JSON response ổn định
+MAX_GEMINI_OUTPUT_TOKENS = 4096  # Giảm từ 8192 xuống 4096
 
-# Cờ để bật/tắt việc làm sạch văn bản
+# ⭐ WORKER POOL CONFIGURATION: Số lượng Gemini Worker để xử lý song song
+# Sẽ được tính động dựa trên số API key có sẵn, tối đa 7 worker
+MAX_GEMINI_WORKERS = 7
+
+# ⭐ CONFIGURATION CHO PARALLEL PROCESSING
+WORKER_SLEEP_BETWEEN_TASKS = 0.1
+WORKER_ERROR_SLEEP = 2
+WORKER_TIMEOUT_SECONDS = 120
+
+# ⭐ SANITIZATION CONFIGURATION
 SANITIZE_INPUT_TEXT = True
 
-# Kiểm tra API keys
-if not PINECONE_API_KEY:
-    logger.error("PINECONE_API_KEY không tìm thấy trong file .env")
-    raise ValueError("PINECONE_API_KEY không tìm thấy trong file .env")
+# ⭐ RETRY CONFIGURATION
+MAX_RETRIES_PER_BATCH = 3
+RETRY_DELAY_SECONDS = 2
 
-# ⭐ KIỂM TRA API KEY MANAGER
-if not api_key_manager.is_healthy():
-    logger.error("❌ KHÔNG CÓ GEMINI API KEY NÀO ĐƯỢC CẤU HÌNH! Recipe tool sẽ không hoạt động.")
-    logger.error("Vui lòng cấu hình ít nhất một API key trong .env file")
-else:
-    logger.info(f"✅ ApiKeyManager ready với {api_key_manager.total_keys()} API keys")
+# ⭐ LOGGING CONFIGURATION
+LOG_BATCH_DETAILS = True
+LOG_WORKER_DETAILS = True
+
+# ⭐ PERFORMANCE MONITORING
+ENABLE_PERFORMANCE_LOGGING = True
+
+def get_embedding_model():
+    """⭐ Lấy embedding model từ global cache hoặc tạo mới nếu cần"""
+    try:
+        # Import function để lấy global embedding model
+        from main import get_global_embedding_model
+        global_model = get_global_embedding_model()
+        
+        if global_model is not None:
+            logger.info("✅ Sử dụng pre-loaded embedding model từ global cache")
+            return global_model
+        else:
+            logger.warning("⚠️ Global embedding model chưa được load, tạo mới...")
+            return HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+    except ImportError:
+        logger.warning("⚠️ Không thể import global embedding model, tạo mới...")
+        return HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+
+def init_connections() -> Tuple[Optional[pinecone.Index], Optional[HuggingFaceEmbeddings]]:
+    """Khởi tạo kết nối với Pinecone client và embedding model. Gemini sẽ được config trong mỗi API call."""
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        try:
+            index_info = pc.describe_index(PINECONE_INDEX_NAME)
+            logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' đã tồn tại.")
+        except Exception as e:
+            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại: {str(e)}")
+            raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại.") from e
+
+        index = pc.Index(PINECONE_INDEX_NAME)
+        logger.info(f"Đã tạo đối tượng Index cho: {PINECONE_INDEX_NAME}")
+
+        # ⭐ SỬ DỤNG GLOBAL EMBEDDING MODEL
+        embeddings_model = get_embedding_model()
+        if embeddings_model:
+            logger.info("✅ Đã sử dụng embedding model (pre-loaded hoặc mới tạo)")
+        else:
+            logger.error("❌ Không thể tạo embedding model")
+            raise ValueError("Không thể tạo embedding model")
+
+        # ⭐ KIỂM TRA API KEY MANAGER READINESS
+        if api_key_manager.total_keys() == 0:
+            logger.error("❌ Không có API key nào của Gemini được cấu hình trong ApiKeyManager. Recipe tool có thể không hoạt động.")
+            # Có thể raise exception nếu muốn dừng hẳn
+        else:
+            logger.info(f"✅ Gemini integration ready - ApiKeyManager có {api_key_manager.total_keys()} keys")
+
+        return index, embeddings_model
+    except Exception as e:
+        logger.error(f"Lỗi khi khởi tạo kết nối: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 def sanitize_text_for_llm(text: str) -> str:
     """Làm sạch văn bản cải thiện để loại bỏ các ký tự có thể gây lỗi JSON."""
@@ -121,44 +195,6 @@ def create_dynamic_batches(matches: list) -> list:
         batches.append(current_batch)
     
     return batches
-
-def init_connections() -> Tuple[Optional[pinecone.Index], Optional[HuggingFaceEmbeddings]]:
-    """Khởi tạo kết nối với Pinecone client và embedding model. Gemini sẽ được config trong mỗi API call."""
-    try:
-        from pinecone import Pinecone
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        
-        try:
-            index_info = pc.describe_index(PINECONE_INDEX_NAME)
-            logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' đã tồn tại.")
-        except Exception as e:
-            logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại: {str(e)}")
-            raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại.") from e
-
-        index = pc.Index(PINECONE_INDEX_NAME)
-        logger.info(f"Đã tạo đối tượng Index cho: {PINECONE_INDEX_NAME}")
-
-        logger.info(f"Đang tải mô hình embedding từ {EMBEDDING_MODEL_NAME}...")
-        embeddings_model = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        logger.info("Đã tải thành công mô hình embedding.")
-
-        # ⭐ KIỂM TRA API KEY MANAGER READINESS
-        if api_key_manager.total_keys() == 0:
-            logger.error("❌ Không có API key nào của Gemini được cấu hình trong ApiKeyManager. Recipe tool có thể không hoạt động.")
-            # Có thể raise exception nếu muốn dừng hẳn
-        else:
-            logger.info(f"✅ Gemini integration ready - ApiKeyManager có {api_key_manager.total_keys()} keys")
-
-        return index, embeddings_model
-    except Exception as e:
-        logger.error(f"Lỗi khi khởi tạo kết nối: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
 
 def clean_json_response(response_text: str) -> str:
     """⭐ CẢI THIỆN: Làm sạch response từ Gemini trước khi parse JSON với nhiều fix patterns hơn"""
@@ -268,28 +304,28 @@ def parse_json_with_fallback(response_text: str) -> dict:
             "raw_response": response_text[:500]
         }
 
-async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
-    """⭐ ASYNC VERSION với API KEY ROTATION và cải thiện prompt engineering cho JSON"""
+async def call_gemini_api_async(prompt: str, api_key_for_this_call: str, task_description: str, max_retries: int = 3) -> str:
+    """⭐ ASYNC VERSION với API KEY được truyền vào từ Worker Pool - SỬ DỤNG MODEL POOL"""
     prompt_char_count = len(prompt)
     estimated_tokens = estimate_tokens(prompt)
     
-    # ⭐ LẤY API KEY TỪ KEY MANAGER
-    current_api_key = api_key_manager.get_next_key()
-    if current_api_key is None:
-        logger.error("❌ Không có API key Gemini khả dụng từ ApiKeyManager")
+    if not api_key_for_this_call:
+        logger.error("❌ Không có API key Gemini được truyền vào")
         return json.dumps({"error": "Không có API key Gemini khả dụng."})
     
     # Log key rotation (an toàn)
-    masked_key = f"{current_api_key[:8]}..." if len(current_api_key) > 8 else "***"
-    logger.info(f"🔍 Gọi Gemini ASYNC với key {masked_key} - Chars: {prompt_char_count:,}, Est. tokens: {estimated_tokens:,}")
+    masked_key = f"{api_key_for_this_call[:8]}..." if len(api_key_for_this_call) > 8 else "***"
+    logger.info(f"🔍 {task_description}: Gọi Gemini với key {masked_key} - Chars: {prompt_char_count:,}, Est. tokens: {estimated_tokens:,}")
     
     loop = asyncio.get_running_loop()
     
     for attempt in range(max_retries):
         try:
-            # ⭐ CẤU HÌNH GEMINI VỚI KEY HIỆN TẠI VÀ TẠO MODEL MỚI
-            genai.configure(api_key=current_api_key)
-            temp_gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+            # ⭐ SỬ DỤNG MODEL POOL THAY VÌ genai.configure() (thread-safe)
+            temp_gemini_model = gemini_model_pool.get_model_for_key(api_key_for_this_call)
+            if not temp_gemini_model:
+                logger.error(f"❌ Không tìm thấy model cho key {masked_key}")
+                return json.dumps({"error": "Không tìm thấy model cho API key"})
             
             # ⭐ CHẠY GEMINI TRONG EXECUTOR để không block event loop
             response = await loop.run_in_executor(
@@ -297,7 +333,7 @@ async def call_gemini_api_async(prompt: str, max_retries: int = 3) -> str:
                 lambda: temp_gemini_model.generate_content(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=8192,
+                        max_output_tokens=MAX_GEMINI_OUTPUT_TOKENS,
                         temperature=0.1
                     )
                 )
@@ -406,28 +442,20 @@ async def search_and_filter_recipes_async(user_query: str) -> str:
         dynamic_batches = create_dynamic_batches(retrieved_matches)
         logger.info(f"🔄 Chia thành {len(dynamic_batches)} dynamic batches")
 
-        # ⭐ KHỞI TẠO SEMAPHORE ĐỂ KIỂM SOÁT CONCURRENCY
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_GEMINI_CALLS)
-        logger.info(f"🚦 Khởi tạo semaphore với giới hạn {MAX_CONCURRENT_GEMINI_CALLS} concurrent calls")
+        # ⭐ KHỞI TẠO WORKER POOL CONFIGURATION
+        NUM_GEMINI_WORKERS = min(api_key_manager.total_keys(), MAX_GEMINI_WORKERS)
+        if NUM_GEMINI_WORKERS == 0: 
+            NUM_GEMINI_WORKERS = 1  # Ít nhất 1 worker nếu có key
         
-        # ⭐ HÀM WRAPPER VỚI SEMAPHORE CONTROL
-        async def process_batch_with_semaphore(batch_prompt: str, batch_num_for_log: int) -> str:
-            async with semaphore:
-                logger.info(f"🚦 Batch {batch_num_for_log}: Bắt đầu xử lý (semaphore acquired, {MAX_CONCURRENT_GEMINI_CALLS - semaphore._value} slots used)")
-                try:
-                    result = await call_gemini_api_async(batch_prompt)
-                    # ⭐ TÙY CHỌN: Thêm delay nhỏ để giảm tải API thêm nữa
-                    await asyncio.sleep(0.1)  # 0.1 giây delay giữa các calls
-                    logger.info(f"🚦 Batch {batch_num_for_log}: Hoàn thành xử lý (semaphore released)")
-                    return result
-                except Exception as e:
-                    logger.error(f"🚦 Batch {batch_num_for_log}: Lỗi trong semaphore block - {str(e)}")
-                    return json.dumps({"error": f"Batch {batch_num_for_log} failed: {str(e)}"})
-
-        # ⭐ TẠO TASKS CHO TẤT CẢ BATCHES ĐỂ XỬ LÝ ĐỒNG THỜI VỚI SEMAPHORE
-        gemini_tasks = []
-        batch_prompts = []
+        logger.info(f"🤖 Khởi tạo Worker Pool với {NUM_GEMINI_WORKERS} workers (có {api_key_manager.total_keys()} API keys)")
+        logger.info(f"📊 Sẽ xử lý {len(dynamic_batches)} batches với worker pool parallelism")
         
+        # ⭐ KHỞI TẠO QUEUE VÀ RESULT STORAGE
+        work_queue = asyncio.Queue()
+        results_list = []  # Thread-safe với coroutine
+        error_reports_list = []
+        
+        # ⭐ TẠO CÁC TASK_DATA VÀ ĐƯA VÀO QUEUE
         for batch_idx, batch_matches in enumerate(dynamic_batches):
             logger.info(f"📦 Chuẩn bị batch {batch_idx + 1}/{len(dynamic_batches)} ({len(batch_matches)} docs)")
             
@@ -455,196 +483,185 @@ async def search_and_filter_recipes_async(user_query: str) -> str:
             # Kiểm tra an toàn token
             if estimated_tokens > 300000:  # 300k tokens limit cho an toàn
                 logger.error(f"⚠️ Batch {batch_idx + 1} quá lớn ({estimated_tokens:,} tokens), bỏ qua")
-                error_reports.append({
+                error_reports_list.append({
                     "error_batch": batch_idx + 1,
                     "message": f"Batch quá lớn: {estimated_tokens:,} tokens",
                     "doc_count": len(batch_matches)
                 })
                 continue
 
-            # ⭐ PROMPT TỐI ƯU HÓA CHO JSON - CẢI THIỆN THEO YÊU CẦU
-            optimized_prompt = f'''Bạn là AI chuyên gia ẩm thực. Phân tích query "{user_query}" và chọn các công thức phù hợp NHẤT.
+            # ⭐ PROMPT TỐI ƯU HÓA MẠNH CHO JSON - YÊU CẦU CỰC KỲ CHẶT CHẼ
+            optimized_prompt = f'''NHIỆM VỤ: Phân tích query "{user_query}" và chọn các công thức phù hợp NHẤT.
 
-⚠️ TUYỆT ĐỐI CHỈ TRẢ VỀ MỘT DANH SÁCH JSON (JSON ARRAY) HỢP LỆ. KHÔNG THÊM bất kỳ văn bản nào trước hoặc sau danh sách JSON.
+🚨 QUY TẮC TUYỆT ĐỐI:
+- CHỈ trả về JSON array hợp lệ
+- KHÔNG thêm text, giải thích, markdown
+- KHÔNG sử dụng dấu ngoặc kép thông minh (" ")
+- CHỈ sử dụng dấu ngoặc kép ASCII chuẩn (")
+- KHÔNG có trailing comma
+- Nếu không có kết quả: []
 
-📋 YÊU CẦU CHÍNH XÁC:
-1. Chỉ chọn công thức thực sự liên quan đến query
-2. Trích xuất: id, name, url, ingredients_summary  
-3. Đảm bảo tất cả các chuỗi trong JSON được đặt trong dấu ngoặc kép chuẩn (\")
-4. Đảm bảo không có dấu phẩy thừa ở cuối danh sách hoặc cuối đối tượng
-5. Nếu không có kết quả nào, trả về một danh sách JSON rỗng: []
+📋 ĐỊNH DẠNG BẮT BUỘC:
+[{{"id":"recipe_id","name":"tên công thức","url":"link hoặc null","ingredients_summary":"nguyên liệu chính"}}]
 
-✅ VÍ DỤ VỀ OUTPUT JSON HỢP LỆ:
-[
-  {{
-    "id": "recipe_123", 
-    "name": "Salad giảm cân với rau xanh",
-    "url": "https://example.com/recipe_123",
-    "ingredients_summary": "Rau xanh, cà chua, dưa chuột, dầu oliu"
-  }},
-  {{
-    "id": "recipe_456",
-    "name": "Sinh tố rau củ ít calo", 
-    "url": null,
-    "ingredients_summary": "Cải bó xôi, chuối, táo, nước"
-  }}
-]
+✅ VÍ DỤ CHÍNH XÁC:
+[{{"id":"recipe_123","name":"Salad giảm cân","url":"https://example.com","ingredients_summary":"Rau xanh, cà chua"}},{{"id":"recipe_456","name":"Sinh tố rau củ","url":null,"ingredients_summary":"Cải bó xôi, chuối"}}]
+
+❌ TUYỆT ĐỐI KHÔNG:
+- Không markdown: ```json
+- Không text thêm: "Dưới đây là..."
+- Không trailing comma: }},]
+- Không smart quotes: "text"
 
 DỮLIỆU CÔNG THỨC:
 {batch_context}
 
-🔥 CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH, KHÔNG MARKDOWN, KHÔNG VĂN BẢN THÊM:'''
+TRẢ VỀ JSON ARRAY:'''
 
-            # ⭐ THÊM TASK VÀO DANH SÁCH ĐỂ XỬ LÝ ĐỒNG THỜI VỚI SEMAPHORE CONTROL
+            # ⭐ ĐƯA TASK VÀO QUEUE
             if optimized_prompt.strip():
-                batch_number_for_logging = batch_idx + 1
-                gemini_tasks.append(process_batch_with_semaphore(optimized_prompt, batch_number_for_logging))
-                batch_prompts.append((batch_number_for_logging, len(batch_matches)))  # Track batch info
+                task_data = {
+                    "prompt": optimized_prompt,
+                    "batch_num": batch_idx + 1,
+                    "doc_count": len(batch_matches)
+                }
+                await work_queue.put(task_data)
 
-        # ⭐ XỬ LÝ TẤT CẢ BATCHES ĐỒNG THỜI với asyncio.gather VÀ SEMAPHORE CONTROL
-        if gemini_tasks:
-            logger.info(f"🚀 Bắt đầu xử lý {len(gemini_tasks)} batches với SEMAPHORE (max {MAX_CONCURRENT_GEMINI_CALLS} concurrent)...")
-            
-            # Gọi tất cả tasks đồng thời với return_exceptions=True
-            # Semaphore sẽ tự động kiểm soát số lượng calls thực sự được thực hiện đồng thời
-            gemini_responses_or_exceptions = await asyncio.gather(*gemini_tasks, return_exceptions=True)
-            
-            # ⭐ XỬ LÝ KẾT QUẢ TỪ asyncio.gather
-            for task_idx, (result, batch_info) in enumerate(zip(gemini_responses_or_exceptions, batch_prompts)):
-                batch_num, doc_count = batch_info
-                
-                # Kiểm tra xem result có phải là Exception không
-                if isinstance(result, Exception):
-                    logger.error(f"💥 Batch {batch_num} failed với exception: {str(result)}")
-                    error_reports.append({
-                        "error_batch": batch_num,
-                        "message": f"Task exception: {str(result)}",
-                        "doc_count": doc_count
-                    })
-                    continue
-                
-                # result là gemini_response_text thành công
-                gemini_response = result
-                
-                # ⭐ XỬ LÝ RESPONSE CẢI THIỆN VỚI ERROR_TOO_LARGE HANDLING
+        # ⭐ HÀM GEMINI WORKER
+        async def gemini_worker(worker_id: int):
+            logger.info(f"🤖 Worker {worker_id}: Bắt đầu hoạt động.")
+            while True:
                 try:
-                    # Kiểm tra error_too_large từ call_gemini_api_async trước
-                    if gemini_response.startswith('{"error_too_large":'):
-                        error_data = json.loads(gemini_response)
-                        logger.error(f"💥 Batch {batch_num} quá lớn cho Gemini: {error_data.get('estimated_tokens', 'unknown')} tokens")
-                        logger.warning(f"⚠️ Cần giảm MAX_CHAR_PER_BATCH hiện tại ({MAX_CHAR_PER_BATCH:,}) hoặc DOCUMENTS_PER_GEMINI_CALL hiện tại ({DOCUMENTS_PER_GEMINI_CALL})")
-                        error_reports.append({
-                            "error_batch": batch_num,
-                            "error_type": "batch_too_large",
-                            "message": f"Batch quá lớn: {error_data.get('estimated_tokens', 'unknown')} tokens",
-                            "doc_count": doc_count,
-                            "suggestion": "Giảm MAX_CHAR_PER_BATCH hoặc batch size"
-                        })
-                        continue
-                    
-                    # Kiểm tra các error responses khác từ call_gemini_api_async
-                    if gemini_response.startswith('{"error":'):
-                        error_data = json.loads(gemini_response)
-                        error_msg = error_data.get('error', 'Unknown Gemini error')
-                        logger.error(f"💥 Batch {batch_num} Gemini error: {error_msg}")
-                        error_reports.append({
-                            "error_batch": batch_num,
-                            "error_type": "gemini_api_error",
-                            "message": error_msg,
-                            "doc_count": doc_count
-                        })
-                        continue
-                    
-                    # Parse JSON với fallback handling
-                    parse_result = parse_json_with_fallback(gemini_response)
-                    
-                    if parse_result["success"]:
-                        batch_recipes = parse_result["data"]
-                        
-                        # ⭐ XỬ LÝ TRƯỜNG HỢP GEMINI TRẢ VỀ OBJECT THAY VÌ LIST
-                        if isinstance(batch_recipes, dict):
-                            logger.warning(f"⚠️ Batch {batch_num}: Gemini trả về object thay vì array")
-                            # Thử extract array từ object
-                            extracted_array = None
-                            for key, value in batch_recipes.items():
-                                if isinstance(value, list):
-                                    logger.info(f"✅ Batch {batch_num}: Extracted array từ key '{key}'")
-                                    extracted_array = value
-                                    break
-                            
-                            if extracted_array:
-                                batch_recipes = extracted_array
-                            else:
-                                logger.warning(f"⚠️ Batch {batch_num}: Không tìm thấy array trong object, bỏ qua")
-                                error_reports.append({
-                                    "error_batch": batch_num,
-                                    "error_type": "object_instead_of_array",
-                                    "message": "Gemini trả về object thay vì array và không có array con",
-                                    "doc_count": doc_count
-                                })
-                                continue
-                        
-                        if isinstance(batch_recipes, list):
-                            if batch_recipes:
-                                valid_recipes = [r for r in batch_recipes if isinstance(r, dict) and 'id' in r and 'name' in r]
-                                all_selected_recipes.extend(valid_recipes)
-                                logger.info(f"✅ Batch {batch_num}: {len(valid_recipes)} valid recipes từ {len(batch_recipes)} items")
-                            else:
-                                logger.info(f"📭 Batch {batch_num}: Không tìm thấy recipe phù hợp (empty array)")
-                        else:
-                            logger.warning(f"⚠️ Batch {batch_num}: Response vẫn không phải array sau xử lý: {type(batch_recipes)}")
-                            error_reports.append({
-                                "error_batch": batch_num,
-                                "error_type": "invalid_response_type",
-                                "message": f"Response type không hợp lệ: {type(batch_recipes)}",
-                                "doc_count": doc_count
-                            })
-                    else:
-                        # Parse failed với structured error
-                        logger.error(f"💥 Batch {batch_num} JSON parse failed: {parse_result.get('error')}")
-                        error_reports.append({
-                            "error_batch": batch_num,
-                            "error_type": "json_parse_failed",
-                            "message": parse_result.get('error', 'JSON parse failed'),
-                            "raw_snippet": parse_result.get('raw_response', '')[:200],
-                            "doc_count": doc_count
-                        })
+                    task_data = await work_queue.get()
+                    if task_data is None:  # Tín hiệu dừng
+                        work_queue.task_done()
+                        logger.info(f"🤖 Worker {worker_id}: Nhận tín hiệu dừng.")
+                        break
 
-                except json.JSONDecodeError as e:
-                    logger.error(f"💥 Batch {batch_num} Critical JSON decode error: {e}")
-                    logger.error(f"Raw response sample: {gemini_response[:300]}...")
-                    error_reports.append({
-                        "error_batch": batch_num,
-                        "error_type": "critical_json_error",
-                        "message": f"Critical JSON decode error: {str(e)}",
-                        "raw_snippet": gemini_response[:200],
-                        "doc_count": doc_count
-                    })
+                    prompt_to_process = task_data["prompt"]
+                    batch_num_log = task_data["batch_num"]
+                    doc_count_log = task_data["doc_count"]
+                    
+                    task_description = f"Worker {worker_id} - Batch {batch_num_log}"
+                    
+                    # Mỗi worker tự lấy key mới cho mỗi task nó xử lý
+                    api_key_for_call = api_key_manager.get_next_key()
+                    if not api_key_for_call:
+                        logger.error(f"🤖 Worker {worker_id}: Không có API key, bỏ qua batch {batch_num_log}")
+                        error_reports_list.append({
+                            "error_batch": batch_num_log, "error_type": "no_api_key",
+                            "message": "Không có API key khả dụng", "doc_count": doc_count_log
+                        })
+                        work_queue.task_done()
+                        continue
+
+                    logger.info(f"🤖 Worker {worker_id}: Đang xử lý Batch {batch_num_log} ({doc_count_log} docs) với key ...{api_key_for_call[-4:]}")
+                    
+                    # Gọi API Gemini
+                    gemini_response_text = await call_gemini_api_async(
+                        prompt_to_process, 
+                        api_key_for_call,
+                        task_description
+                    )
+                    
+                    # Xử lý response (parse JSON, v.v...)
+                    parse_attempt = parse_json_with_fallback(gemini_response_text)
+                    if parse_attempt["success"]:
+                        parsed_data = parse_attempt["data"]
+                        if isinstance(parsed_data, list):
+                            valid_items = [item for item in parsed_data if isinstance(item, dict) and "id" in item]
+                            if valid_items:
+                                results_list.extend(valid_items)
+                            logger.info(f"🤖 Worker {worker_id}: Batch {batch_num_log} thành công, {len(valid_items)} items.")
+                        else:
+                            logger.warning(f"🤖 Worker {worker_id}: Batch {batch_num_log} trả về định dạng không phải list: {type(parsed_data)}")
+                            error_reports_list.append({"error_batch": batch_num_log, "error_type": "invalid_gemini_response_format", "doc_count": doc_count_log})
+                    else:
+                        logger.error(f"🤖 Worker {worker_id}: Batch {batch_num_log} lỗi parse JSON: {parse_attempt.get('error')}")
+                        error_reports_list.append({
+                            "error_batch": batch_num_log, "error_type": "json_parse_failed", 
+                            "message": parse_attempt.get('error'), "doc_count": doc_count_log,
+                            "raw_snippet": parse_attempt.get('raw_response')
+                        })
+                    
+                    work_queue.task_done()
+                    # Thời gian nghỉ nhỏ sau mỗi batch của một worker
+                    await asyncio.sleep(WORKER_SLEEP_BETWEEN_TASKS)
+
+                except asyncio.CancelledError:
+                    logger.info(f"🤖 Worker {worker_id}: Bị cancel.")
+                    break
                 except Exception as e:
-                    logger.error(f"💥 Batch {batch_num} Unexpected error: {e}")
-                    error_reports.append({
-                        "error_batch": batch_num,
-                        "error_type": "unexpected_error",
-                        "message": f"Unexpected error: {str(e)}",
-                        "doc_count": doc_count
-                    })
-        
-        # ⭐ TRẢ VỀ KẾT QUẢ THÔNG MINH
-        logger.info(f"🎯 FINAL RESULT: {len(all_selected_recipes)} recipes, {len(error_reports)} errors")
-        
-        if not all_selected_recipes and error_reports:
+                    logger.error(f"🤖 Worker {worker_id}: Lỗi không mong muốn: {e}", exc_info=True)
+                    if 'task_data' in locals() and task_data and 'batch_num' in task_data:
+                         error_reports_list.append({"error_batch": task_data['batch_num'], "error_type": "worker_exception", "message": str(e), "doc_count": task_data.get('doc_count',0)})
+                    if 'task_data' in locals() and task_data is not None:
+                         work_queue.task_done()
+                    await asyncio.sleep(WORKER_ERROR_SLEEP)
+
+        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER
+        worker_tasks = []
+        for i in range(NUM_GEMINI_WORKERS):
+            worker_tasks.append(asyncio.create_task(gemini_worker(i + 1)))
+
+        # Chờ tất cả các item trong queue được xử lý
+        await work_queue.join()
+
+        # Gửi tín hiệu dừng cho tất cả worker
+        for _ in range(NUM_GEMINI_WORKERS):
+            await work_queue.put(None)
+
+        # Chờ tất cả worker hoàn thành
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả...")
+
+        # ⭐ LỌC TRÙNG LẶP BẰNG TÊN CHUẨN HÓA
+        def normalize_recipe_name(name: str) -> str:
+            """Chuẩn hóa tên recipe để so sánh trùng lặp"""
+            if not name:
+                return ""
+            # Chuyển về lowercase, loại bỏ dấu cách, dấu gạch ngang, ký tự đặc biệt
+            import unicodedata
+            normalized = unicodedata.normalize('NFD', str(name).lower())
+            normalized = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')  # Loại bỏ dấu
+            normalized = re.sub(r'[^a-z0-9]', '', normalized)  # Chỉ giữ chữ và số
+            return normalized
+
+        if results_list:
+            logger.info(f"🔄 Bắt đầu lọc trùng lặp từ {len(results_list)} recipes...")
+            
+            final_unique_recipes = []
+            seen_normalized_names = set()
+            
+            for recipe_item in results_list:
+                if not isinstance(recipe_item, dict) or not recipe_item.get("name"):
+                    continue
+                    
+                normalized_name = normalize_recipe_name(recipe_item["name"])
+                if normalized_name and normalized_name not in seen_normalized_names:
+                    final_unique_recipes.append(recipe_item)
+                    seen_normalized_names.add(normalized_name)
+                else:
+                    logger.debug(f"Đã lọc recipe trùng lặp: {recipe_item.get('name', 'Unknown')}")
+            
+            results_list = final_unique_recipes
+            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} recipes duy nhất")
+
+        # ⭐ XỬ LÝ KẾT QUẢ CUỐI CÙNG
+        if not results_list and error_reports_list:
             return json.dumps({
-                "message": "Không tìm thấy recipe và có lỗi xảy ra",
-                "errors": error_reports[:3]  # Chỉ report 3 lỗi đầu
+                "message": "Không có công thức nào được chọn và có lỗi xảy ra trong quá trình xử lý.",
+                "errors": error_reports_list[:5]  # Giới hạn số lỗi hiển thị
             }, ensure_ascii=False, indent=2)
-        elif not all_selected_recipes:
+        elif not results_list:
             return json.dumps([])
-        elif error_reports:
+        elif error_reports_list:
             # Có recipes nhưng cũng có lỗi - chỉ trả về recipes
-            logger.warning(f"⚠️ Có {len(error_reports)} lỗi nhưng vẫn tìm được {len(all_selected_recipes)} recipes")
-            return json.dumps(all_selected_recipes, ensure_ascii=False, indent=2)
+            logger.warning(f"⚠️ Có {len(error_reports_list)} lỗi nhưng vẫn tìm được {len(results_list)} recipes")
+            return json.dumps(results_list, ensure_ascii=False, indent=2)
         else:
-            return json.dumps(all_selected_recipes, ensure_ascii=False, indent=2)
+            return json.dumps(results_list, ensure_ascii=False, indent=2)
 
     except Exception as e:
         logger.error(f"💥 Critical error trong search_and_filter_recipes_async: {str(e)}")

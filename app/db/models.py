@@ -78,7 +78,7 @@ class MenuItem(Base):
     
     menu_item_id = Column(Integer, primary_key=True, index=True)
     menu_id = Column(Integer, ForeignKey("menus.menu_id"), nullable=False)
-    product_id = Column(Integer, nullable=False)  # Product ID từ product database
+    product_id = Column(Integer, nullable=True)  # Product ID từ product database
     quantity = Column(Integer, nullable=False, default=1)  # Số lượng nguyên liệu cần
 
 

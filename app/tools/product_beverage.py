@@ -11,6 +11,8 @@ import numpy as np
 
 # ⭐ Import ApiKeyManager CHÍNH XÁC
 from app.services.api_key_manager import get_api_key_manager
+# ⭐ IMPORT GEMINI MODEL POOL để thread-safe API access
+from app.tools.gemini_model_pool import get_gemini_model_pool
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,26 +25,111 @@ load_dotenv()
 PINECONE_API_KEY = os.getenv("PRODUCT_DB_PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "product-index")
 EMBEDDING_MODEL_FOR_DIM_ONLY = "sentence-transformers/all-mpnet-base-v2"
+# ⭐ TỐI ƯU HÓA MẠNH: Giảm batch size để tránh lỗi JSON và token limit
 PRODUCTS_TO_FETCH_FROM_PINECONE = 1610
-PRODUCTS_PER_GEMINI_BATCH = 100
-MAX_GEMINI_OUTPUT_TOKENS = 8192
+PRODUCTS_PER_GEMINI_BATCH = 60           # Giảm từ 100 xuống 60
+MAX_GEMINI_OUTPUT_TOKENS = 4096          # Giảm từ 8192 xuống 4096
 
-# ⭐ CẤU HÌNH ASYNC VÀ CONCURRENCY - Đúng tên theo yêu cầu
-MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS = 3
+# ⭐ CẤU HÌNH ASYNC VÀ CONCURRENCY - Tăng để tận dụng tối đa API keys
+MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS = 7  # Tăng từ 6 lên 7 để match với số API keys
+
+# ⭐ DYNAMIC BATCHING CONSTANTS - thêm để tương đồng với recipe_tool
+MAX_CHAR_PER_BATCH = 150000              # Giới hạn ký tự cho mỗi batch
+MAX_SAFE_BATCH_SIZE = 50                 # Fallback limit nếu dynamic batching fails
+
+# ⭐ CONFIGURATION CHO PARALLEL PROCESSING
+WORKER_SLEEP_BETWEEN_TASKS = 0.1  # Giảm để tăng throughput
+WORKER_ERROR_SLEEP = 2  # Sleep khi có lỗi
 
 # ⭐ MODEL NAME CONSTANT
 GEMINI_MODEL_NAME = "gemini-2.0-flash-lite"
 
-# Kiểm tra API keys cơ bản
-if not PINECONE_API_KEY or not PINECONE_INDEX_NAME:
-    missing_keys = [
-        key for key, value in {
-            "PINECONE_API_KEY": PINECONE_API_KEY,
-            "PINECONE_INDEX_NAME": PINECONE_INDEX_NAME
-        }.items() if not value
-    ]
-    logger.error(f"Các biến môi trường sau không được thiết lập: {', '.join(missing_keys)}")
-    raise ValueError(f"Các biến môi trường sau không được thiết lập: {', '.join(missing_keys)}")
+# ⭐ KHỞI TẠO GEMINI MODEL POOL
+gemini_model_pool = get_gemini_model_pool(GEMINI_MODEL_NAME)
+
+def get_embedding_model_for_dimension():
+    """⭐ Lấy embedding model để xác định dimension vector"""
+    try:
+        # Import function để lấy global embedding model
+        from main import get_global_embedding_model
+        global_model = get_global_embedding_model()
+        
+        if global_model is not None:
+            logger.info("✅ Sử dụng pre-loaded embedding model để xác định dimension")
+            return global_model
+        else:
+            logger.warning("⚠️ Global embedding model chưa được load, tạo mới để xác định dimension...")
+            return HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_FOR_DIM_ONLY,
+                model_kwargs={'device': 'cpu'}
+            )
+    except ImportError:
+        logger.warning("⚠️ Không thể import global embedding model, tạo mới...")
+        return HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_FOR_DIM_ONLY,
+            model_kwargs={'device': 'cpu'}
+        )
+
+def init_services():
+    """⭐ Khởi tạo kết nối Pinecone và lấy dimension của vector. KHÔNG trả về gemini_model."""
+    try:
+        # ⭐ KIỂM TRA API KEY MANAGER
+        api_key_manager = get_api_key_manager()
+        if not api_key_manager.is_healthy():
+            logger.error("ApiKeyManager không khỏe mạnh hoặc không có API key")
+            raise ValueError("ApiKeyManager không khỏe mạnh")
+        logger.info(f"✅ ApiKeyManager đã được xác nhận khỏe mạnh với {api_key_manager.total_keys()} keys")
+        
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Cải thiện logic kiểm tra index
+        try:
+            index_list = pc.list_indexes()
+            index_names = []
+            
+            if hasattr(index_list, 'indexes') and isinstance(index_list.indexes, list):
+                index_names = [idx.get('name') for idx in index_list.indexes if isinstance(idx, dict) and idx.get('name')]
+            elif hasattr(index_list, 'names'):
+                if callable(index_list.names):
+                    index_names = index_list.names()
+                else:
+                    index_names = index_list.names
+            
+            if PINECONE_INDEX_NAME not in index_names:
+                logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại trong danh sách: {index_names}")
+                raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại.")
+                
+        except Exception as e_list:
+            logger.warning(f"Không thể kiểm tra danh sách index: {e_list}. Thử describe_index trực tiếp...")
+
+        index_description = pc.describe_index(PINECONE_INDEX_NAME)
+        logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' đã tồn tại. Thông tin: {index_description}")
+        pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+        vector_dimension = index_description.dimension
+        
+        if not vector_dimension:
+            logger.info("Không lấy được dimension từ describe_index, thử tải embedding model...")
+            try:
+                # ⭐ SỬ DỤNG GLOBAL EMBEDDING MODEL
+                temp_embeddings_model = get_embedding_model_for_dimension()
+                sample_embedding = temp_embeddings_model.embed_query("sample text")
+                vector_dimension = len(sample_embedding)
+                logger.info(f"Dimension của vector xác định từ embedding model: {vector_dimension}")
+            except Exception as e_embed:
+                logger.error(f"Không thể tự động xác định dimension: {e_embed}")
+                raise ValueError("Không thể xác định dimension của vector.") from e_embed
+        else:
+            logger.info(f"Dimension của vector từ Pinecone: {vector_dimension}")
+
+        logger.info(f"🚀 Đã khởi tạo Pinecone index với vector dimension: {vector_dimension}")
+        # ⭐ CHỈ TRẢ VỀ pinecone_index VÀ vector_dimension (KHÔNG TRẢ VỀ gemini_model)
+        return pinecone_index, vector_dimension
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi khởi tạo dịch vụ: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 def clean_json_response(response_text: str) -> str:
     """⭐ CẢI THIỆN: Làm sạch response từ Gemini trước khi parse JSON với nhiều fix patterns hơn"""
@@ -152,74 +239,14 @@ def parse_json_with_fallback(response_text: str) -> dict:
             "raw_response": response_text[:500]
         }
 
-def init_services():
-    """⭐ Khởi tạo kết nối Pinecone và lấy dimension của vector. KHÔNG trả về gemini_model."""
-    try:
-        # ⭐ KIỂM TRA API KEY MANAGER
-        api_key_manager = get_api_key_manager()
-        if not api_key_manager.is_healthy():
-            logger.error("ApiKeyManager không khỏe mạnh hoặc không có API key")
-            raise ValueError("ApiKeyManager không khỏe mạnh")
-        logger.info(f"✅ ApiKeyManager đã được xác nhận khỏe mạnh với {api_key_manager.total_keys()} keys")
-        
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        
-        # Cải thiện logic kiểm tra index
-        try:
-            index_list = pc.list_indexes()
-            index_names = []
-            
-            if hasattr(index_list, 'indexes') and isinstance(index_list.indexes, list):
-                index_names = [idx.get('name') for idx in index_list.indexes if isinstance(idx, dict) and idx.get('name')]
-            elif hasattr(index_list, 'names'):
-                if callable(index_list.names):
-                    index_names = index_list.names()
-                else:
-                    index_names = index_list.names
-            
-            if PINECONE_INDEX_NAME not in index_names:
-                logger.error(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại trong danh sách: {index_names}")
-                raise ValueError(f"Pinecone index '{PINECONE_INDEX_NAME}' không tồn tại.")
-                
-        except Exception as e_list:
-            logger.warning(f"Không thể kiểm tra danh sách index: {e_list}. Thử describe_index trực tiếp...")
-
-        index_description = pc.describe_index(PINECONE_INDEX_NAME)
-        logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' đã tồn tại. Thông tin: {index_description}")
-        pinecone_index = pc.Index(PINECONE_INDEX_NAME)
-        vector_dimension = index_description.dimension
-        
-        if not vector_dimension:
-            logger.info("Không lấy được dimension từ describe_index, thử tải embedding model...")
-            try:
-                temp_embeddings_model = HuggingFaceEmbeddings(
-                    model_name=EMBEDDING_MODEL_FOR_DIM_ONLY, model_kwargs={'device': 'cpu'}
-                )
-                sample_embedding = temp_embeddings_model.embed_query("sample text")
-                vector_dimension = len(sample_embedding)
-                logger.info(f"Dimension của vector xác định từ embedding model: {vector_dimension}")
-            except Exception as e_embed:
-                logger.error(f"Không thể tự động xác định dimension: {e_embed}")
-                raise ValueError("Không thể xác định dimension của vector.") from e_embed
-        else:
-            logger.info(f"Dimension của vector từ Pinecone: {vector_dimension}")
-
-        logger.info(f"🚀 Đã khởi tạo Pinecone index với vector dimension: {vector_dimension}")
-        # ⭐ CHỈ TRẢ VỀ pinecone_index VÀ vector_dimension (KHÔNG TRẢ VỀ gemini_model)
-        return pinecone_index, vector_dimension
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi khởi tạo dịch vụ: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-
-async def call_gemini_api_batch_classification_async(products_batch: list[dict], max_retries: int = 2) -> list[dict]:
+async def call_gemini_api_batch_classification_async(products_batch: list[dict], api_key_for_this_call: str, task_description: str, max_retries: int = 2) -> list[dict]:
     """
-    ⭐ ASYNC VERSION: Gửi một lô sản phẩm đến Gemini để phân loại và trả về danh sách đồ uống.
+    ⭐ ASYNC VERSION với API KEY được truyền vào từ Worker Pool
     
     Args:
         products_batch: list of {"id": "product_id", "name": "product_name"}
+        api_key_for_this_call: API key được truyền từ worker
+        task_description: Mô tả task để logging
         max_retries: Số lần thử lại tối đa
         
     Returns: 
@@ -229,10 +256,8 @@ async def call_gemini_api_batch_classification_async(products_batch: list[dict],
     if not products_batch:
         return []
 
-    # ⭐ LẤY API KEY MANAGER
-    api_key_manager = get_api_key_manager()
-    if not api_key_manager.is_healthy():
-        logger.error("ApiKeyManager không khỏe mạnh, không thể gọi Gemini API")
+    if not api_key_for_this_call:
+        logger.error("❌ Không có API key Gemini được truyền vào")
         return []
 
     # Xây dựng phần danh sách sản phẩm cho prompt
@@ -242,63 +267,54 @@ async def call_gemini_api_batch_classification_async(products_batch: list[dict],
         safe_name = json.dumps(p_data['name'], ensure_ascii=False)
         product_list_str += f'{i+1}. ID: {safe_id}, Tên: {safe_name}\n'
 
-    # ⭐ PROMPT TỐI ƯU HÓA CHO JSON - CẢI THIỆN THEO YÊU CẦU
-    prompt = f"""Bạn được cung cấp một danh sách các sản phẩm. Hãy phân loại CHỈ những sản phẩm thực sự là ĐỒ UỐNG hoặc NGUYÊN LIỆU CHÍNH để pha chế đồ uống.
+    # ⭐ PROMPT TỐI ƯU HÓA MẠNH CHO JSON - YÊU CẦU CỰC KỲ CHẶT CHẼ
+    prompt = f"""NHIỆM VỤ: Phân loại CHỈ những sản phẩm thực sự là ĐỒ UỐNG hoặc NGUYÊN LIỆU PHA CHẾ.
 
-⚠️ TUYỆT ĐỐI CHỈ TRẢ VỀ MỘT DANH SÁCH JSON (JSON ARRAY) HỢP LỆ. KHÔNG THÊM bất kỳ văn bản nào trước hoặc sau danh sách JSON.
+🚨 QUY TẮC TUYỆT ĐỐI:
+- CHỈ trả về JSON array hợp lệ
+- KHÔNG thêm text, giải thích, markdown
+- KHÔNG sử dụng dấu ngoặc kép thông minh (" ")
+- CHỈ sử dụng dấu ngoặc kép ASCII chuẩn (")
+- KHÔNG có trailing comma
+- Nếu không có kết quả: []
 
-📋 TIÊU CHÍ PHÂN LOẠI:
-⭐ CHỈ CHỌN CÁC SẢN PHẨM SAU:
-- ĐỒ UỐNG SẴN SÀNG: nước giải khát, trà, cà phê pha sẵn, sữa, nước ép, sinh tố, bia, rượu vang, nước lọc
-- NGUYÊN LIỆU PHA CHẾ CHÍNH: bột cà phê, trà túi lọc, trà lá, siro pha chế, sữa đặc, bột cacao, matcha, coffee bean
+📋 ĐỊNH DẠNG BẮT BUỘC:
+[{{"product_id":"id","product_name":"tên"}}]
 
-⭐ TUYỆT ĐỐI KHÔNG CHỌN:
-- Gia vị nấu ăn: nước màu dừa, nước tương, dấm, muối
-- Thực phẩm khô: bánh kẹo, snack, mì tôm
-- Đường phèn (trừ khi có bối cảnh "Trà đường phèn" hoặc đồ uống cụ thể)
-- Nguyên liệu nấu ăn khác: hành tây, tỏi, gia vị
+⭐ CHỈ CHỌN:
+- Đồ uống sẵn sàng: nước, trà, cà phê, sữa, nước ép
+- Nguyên liệu pha chế: bột cà phê, trà lá, siro, matcha
 
-📋 YÊU CẦU JSON FORMAT:
-1. Đảm bảo tất cả các chuỗi trong JSON được đặt trong dấu ngoặc kép chuẩn (\")
-2. Đảm bảo không có dấu phẩy thừa ở cuối danh sách hoặc cuối đối tượng
-3. Mỗi product_id trong danh sách JSON trả về phải là DUY NHẤT - KHÔNG lặp lại sản phẩm
-4. Mỗi object phải có đúng 2 trường: "product_id" và "product_name"
-5. ID và name phải khớp chính xác với input
-6. Nếu không có đồ uống nào, trả về một danh sách JSON rỗng: []
+❌ TUYỆT ĐỐI KHÔNG CHỌN:
+- Gia vị nấu ăn: nước tương, dấm, muối
+- Thực phẩm khô: bánh, kẹo, snack
+- Nguyên liệu nấu ăn: hành, tỏi, gia vị
 
-✅ VÍ DỤ VỀ OUTPUT JSON HỢP LỆ (nếu sản phẩm 1 và 3 là đồ uống):
-[
-  {{
-    "product_id": "ID_SAN_PHAM_1",
-    "product_name": "TEN_SAN_PHAM_1"
-  }},
-  {{
-    "product_id": "ID_SAN_PHAM_3", 
-    "product_name": "TEN_SAN_PHAM_3"
-  }}
-]
+✅ VÍ DỤ CHÍNH XÁC:
+[{{"product_id":"123","product_name":"Trà xanh"}},{{"product_id":"456","product_name":"Cà phê đen"}}]
+
+❌ TUYỆT ĐỐI KHÔNG:
+- Không markdown: ```json
+- Không text thêm: "Dưới đây là..."
+- Không trailing comma: }},]
+- Không smart quotes: "text"
 
 DANH SÁCH SẢN PHẨM:
 {product_list_str}
 
-🔥 CHỈ TRẢ VỀ JSON ARRAY - KHÔNG GIẢI THÍCH, KHÔNG MARKDOWN, KHÔNG VĂN BẢN THÊM:"""
-    task_desc = f"Phân loại lô {len(products_batch)} sản phẩm (async)"
+TRẢ VỀ JSON ARRAY:"""
+
+    # Log key rotation (an toàn)
+    masked_key = f"{api_key_for_this_call[:8]}..." if len(api_key_for_this_call) > 8 else "***"
+    logger.info(f"🔍 {task_description}: Gọi Gemini với key {masked_key} - {len(products_batch)} sản phẩm")
 
     for attempt in range(max_retries):
         try:
-            # ⭐ LẤY API KEY TỪ API_KEY_MANAGER
-            api_key = api_key_manager.get_next_key()
-            if not api_key:
-                logger.error("Không thể lấy API key từ api_key_manager")
+            # ⭐ SỬ DỤNG MODEL POOL THAY VÌ genai.configure() (thread-safe)
+            temp_gemini_model = gemini_model_pool.get_model_for_key(api_key_for_this_call)
+            if not temp_gemini_model:
+                logger.error(f"❌ Không tìm thấy model cho key {masked_key}")
                 return []
-
-            # ⭐ LOG API KEY USAGE (AN TOÀN)
-            key_info = f"...{api_key[-6:]}" if len(api_key) > 6 else "short_key"
-            logger.debug(f"🔑 Đang sử dụng API key kết thúc bằng {key_info} cho {task_desc}")
-
-            # ⭐ CẤU HÌNH GEMINI VỚI API KEY MỚI CHO MỖI CALL
-            genai.configure(api_key=api_key)
-            temp_gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
             # ⭐ CHẠY GENERATE_CONTENT TRONG EXECUTOR
             loop = asyncio.get_event_loop()
@@ -321,26 +337,26 @@ DANH SÁCH SẢN PHẨM:
                     
                     # ⭐ XỬ LÝ TRƯỜNG HỢP GEMINI TRẢ VỀ OBJECT THAY VÌ LIST
                     if isinstance(classified_drinks, dict):
-                        logger.warning(f"⚠️ {task_desc}: Gemini trả về object thay vì array")
+                        logger.warning(f"⚠️ {task_description}: Gemini trả về object thay vì array")
                         # Thử extract array từ object
                         extracted_array = None
                         for key, value in classified_drinks.items():
                             if isinstance(value, list):
-                                logger.info(f"✅ {task_desc}: Extracted array từ key '{key}'")
+                                logger.info(f"✅ {task_description}: Extracted array từ key '{key}'")
                                 extracted_array = value
                                 break
                         
                         if extracted_array:
                             classified_drinks = extracted_array
                         else:
-                            logger.warning(f"⚠️ {task_desc}: Không tìm thấy array trong object, retry")
+                            logger.warning(f"⚠️ {task_description}: Không tìm thấy array trong object, retry")
                             if attempt < max_retries - 1:
                                 await asyncio.sleep(5 + attempt * 5)
                                 continue
                             return []
                     
                     if not isinstance(classified_drinks, list):
-                        logger.warning(f"⚠️ {task_desc}: Response vẫn không phải list sau xử lý: {type(classified_drinks)}")
+                        logger.warning(f"⚠️ {task_description}: Response vẫn không phải list sau xử lý: {type(classified_drinks)}")
                         if attempt < max_retries - 1:
                             await asyncio.sleep(5 + attempt * 5)
                             continue
@@ -384,14 +400,14 @@ DANH SÁCH SẢN PHẨM:
                             final_unique_drinks.append(drink_item)
                             final_seen_ids.add(drink_item['product_id'])
                     
-                    logger.info(f"✅ {task_desc}: Thành công phân loại được {len(final_unique_drinks)} đồ uống từ {len(products_batch)} sản phẩm")
+                    logger.info(f"✅ {task_description}: Thành công phân loại được {len(final_unique_drinks)} đồ uống từ {len(products_batch)} sản phẩm")
                     return final_unique_drinks
                     
                 else:
                     # Parse failed với structured error
-                    logger.error(f"💥 {task_desc} JSON parse failed: {parse_result.get('error')}")
+                    logger.error(f"💥 {task_description} JSON parse failed: {parse_result.get('error')}")
                     if attempt < max_retries - 1:
-                        logger.info(f"🔄 Retry {task_desc} attempt {attempt + 1}/{max_retries} due to JSON parse error")
+                        logger.info(f"🔄 Retry {task_description} attempt {attempt + 1}/{max_retries} due to JSON parse error")
                         await asyncio.sleep(10 + attempt * 10)
                         continue
                     return []
@@ -399,21 +415,21 @@ DANH SÁCH SẢN PHẨM:
         except Exception as e:
             error_str = str(e).lower()
             if "token" in error_str or "size limit" in error_str or "request payload" in error_str or "too large" in error_str:
-                logger.error(f"💥 Lỗi kích thước prompt/request khi gọi Gemini ({task_desc}): {str(e)}. "
+                logger.error(f"💥 Lỗi kích thước prompt/request khi gọi Gemini ({task_description}): {str(e)}. "
                              f"Lô hiện tại có {len(products_batch)} sản phẩm. Hãy thử giảm PRODUCTS_PER_GEMINI_BATCH.")
                 logger.warning(f"⚠️ Cần giảm PRODUCTS_PER_GEMINI_BATCH hiện tại ({PRODUCTS_PER_GEMINI_BATCH}) để tránh lỗi này")
                 return [{"error_too_large": True, "batch_size": len(products_batch), "suggestion": "Giảm PRODUCTS_PER_GEMINI_BATCH"}]
 
             if "429" in error_str or "resource_exhausted" in error_str or "too many requests" in error_str or "quota" in error_str:
                 retry_delay = 15 + attempt * 10
-                logger.warning(f"⚠️ Lỗi quota/rate limit Gemini ({task_desc}), thử lại sau {retry_delay} giây...")
+                logger.warning(f"⚠️ Lỗi quota/rate limit Gemini ({task_description}), thử lại sau {retry_delay} giây...")
                 await asyncio.sleep(retry_delay)
             elif "500" in error_str or "internal server error" in error_str or "service temporarily unavailable" in error_str:
                 retry_delay = 20 + attempt * 10
-                logger.warning(f"⚠️ Lỗi server Gemini (5xx) ({task_desc}), thử lại sau {retry_delay} giây...")
+                logger.warning(f"⚠️ Lỗi server Gemini (5xx) ({task_description}), thử lại sau {retry_delay} giây...")
                 await asyncio.sleep(retry_delay)
             else:
-                logger.error(f"💥 Lỗi không xác định khi gọi API Gemini ({task_desc}) (Lần {attempt+1}/{max_retries}): {str(e)}")
+                logger.error(f"💥 Lỗi không xác định khi gọi API Gemini ({task_description}) (Lần {attempt+1}/{max_retries}): {str(e)}")
                 if attempt == max_retries - 1:
                     break
                 await asyncio.sleep(15 + attempt * 5)
@@ -465,76 +481,188 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
 
         logger.info(f"📦 Lấy được {len(products_from_pinecone)} sản phẩm từ Pinecone.")
         
-        # ⭐ CHIA THÀNH CÁC LÔ VÀ XỬ LÝ BẰNG ASYNCIO.GATHER VỚI SEMAPHORE
+        # ⭐ KHỞI TẠO WORKER POOL CONFIGURATION
+        api_key_manager = get_api_key_manager()
+        NUM_GEMINI_WORKERS = min(api_key_manager.total_keys(), MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS)
+        if NUM_GEMINI_WORKERS == 0: 
+            NUM_GEMINI_WORKERS = 1  # Ít nhất 1 worker nếu có key
+        
+        logger.info(f"🤖 Khởi tạo Worker Pool với {NUM_GEMINI_WORKERS} workers (có {api_key_manager.total_keys()} API keys)")
+        
+        # Tính toán số batches sẽ được tạo
+        total_batches = (len(products_from_pinecone) + PRODUCTS_PER_GEMINI_BATCH - 1) // PRODUCTS_PER_GEMINI_BATCH
+        logger.info(f"📊 Sẽ xử lý {total_batches} batches với worker pool parallelism")
+        
+        # ⭐ KHỞI TẠO QUEUE VÀ RESULT STORAGE
+        work_queue = asyncio.Queue()
+        results_list = []  # Thread-safe với coroutine
+        error_reports_list = []
+        
+        # ⭐ CHIA THÀNH CÁC LÔ VÀ ĐƯA VÀO QUEUE
         current_batch_size = PRODUCTS_PER_GEMINI_BATCH
-        batch_tasks = []
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS)
         
-        async def process_beverage_classification_batch_with_semaphore(products_in_batch, batch_num_log):
-            """⭐ Hàm xử lý một batch với semaphore control"""
-            async with semaphore:
-                logger.info(f"🥤 Batch {batch_num_log}: Đang xử lý {len(products_in_batch)} sản phẩm với Gemini...")
-                start_time = asyncio.get_event_loop().time()
-                
-                classified_drinks = await call_gemini_api_batch_classification_async(products_in_batch)
-                
-                end_time = asyncio.get_event_loop().time()
-                elapsed = end_time - start_time
-                
-                # ⭐ XỬ LÝ TRƯỜNG HỢP PROMPT QUÁ LỚN VỚI LOGGING RÕ RÀNG HỢN
-                if classified_drinks and isinstance(classified_drinks[0], dict) and classified_drinks[0].get("error_too_large"):
-                    error_info = classified_drinks[0]
-                    batch_size = error_info.get("batch_size", len(products_in_batch))
-                    suggestion = error_info.get("suggestion", "Giảm batch size")
-                    
-                    logger.error(f"💥 Batch {batch_num_log}: Lô quá lớn cho Gemini API")
-                    logger.error(f"   - Batch size hiện tại: {batch_size} sản phẩm")
-                    logger.error(f"   - PRODUCTS_PER_GEMINI_BATCH hiện tại: {PRODUCTS_PER_GEMINI_BATCH}")
-                    logger.error(f"   - Gợi ý: {suggestion}")
-                    logger.warning(f"⚠️ Cần điều chỉnh cấu hình để tránh lỗi này tiếp tục xảy ra")
-                    return []
-                
-                if classified_drinks:
-                    logger.info(f"✅ Batch {batch_num_log}: Xác định được {len(classified_drinks)} đồ uống trong {elapsed:.2f}s")
-                else:
-                    logger.info(f"⚪ Batch {batch_num_log}: Không có đồ uống nào hoặc có lỗi ({elapsed:.2f}s)")
-                
-                return classified_drinks
-        
-        # ⭐ TẠO TASKS CHO TẤT CẢ CÁC BATCH
         for i in range(0, len(products_from_pinecone), current_batch_size):
             batch_to_send = products_from_pinecone[i : i + current_batch_size]
             if batch_to_send:
                 batch_num = i // current_batch_size + 1
-                task = process_beverage_classification_batch_with_semaphore(batch_to_send, batch_num)
-                batch_tasks.append(task)
+                task_data = {
+                    "products_batch": batch_to_send,
+                    "batch_num": batch_num,
+                    "batch_size": len(batch_to_send)
+                }
+                await work_queue.put(task_data)
+
+        # ⭐ HÀM GEMINI WORKER
+        async def gemini_worker(worker_id: int):
+            logger.info(f"🤖 Worker {worker_id}: Bắt đầu hoạt động.")
+            while True:
+                try:
+                    task_data = await work_queue.get()
+                    if task_data is None:  # Tín hiệu dừng
+                        work_queue.task_done()
+                        logger.info(f"🤖 Worker {worker_id}: Nhận tín hiệu dừng.")
+                        break
+
+                    products_batch = task_data["products_batch"]
+                    batch_num_log = task_data["batch_num"]
+                    batch_size_log = task_data["batch_size"]
+                    
+                    task_description = f"Worker {worker_id} - Batch {batch_num_log}"
+                    
+                    # Mỗi worker tự lấy key mới cho mỗi task nó xử lý
+                    api_key_for_call = api_key_manager.get_next_key()
+                    if not api_key_for_call:
+                        logger.error(f"🤖 Worker {worker_id}: Không có API key, bỏ qua batch {batch_num_log}")
+                        error_reports_list.append({
+                            "error_batch": batch_num_log, "error_type": "no_api_key",
+                            "message": "Không có API key khả dụng", "batch_size": batch_size_log
+                        })
+                        work_queue.task_done()
+                        continue
+
+                    logger.info(f"🤖 Worker {worker_id}: Đang xử lý Batch {batch_num_log} ({batch_size_log} sản phẩm) với key ...{api_key_for_call[-4:]}")
+                    
+                    start_time = asyncio.get_event_loop().time()
+                    
+                    # Gọi API Gemini
+                    classified_drinks = await call_gemini_api_batch_classification_async(
+                        products_batch, 
+                        api_key_for_call,
+                        task_description
+                    )
+                    
+                    end_time = asyncio.get_event_loop().time()
+                    elapsed = end_time - start_time
+                    
+                    # ⭐ XỬ LÝ TRƯỜNG HỢP PROMPT QUÁ LỚN VỚI LOGGING RÕ RÀNG HỢN
+                    if classified_drinks and isinstance(classified_drinks[0], dict) and classified_drinks[0].get("error_too_large"):
+                        error_info = classified_drinks[0]
+                        logger.error(f"💥 Batch {batch_num_log}: Lô quá lớn cho Gemini API")
+                        logger.error(f"   - Batch size hiện tại: {batch_size_log} sản phẩm")
+                        logger.error(f"   - PRODUCTS_PER_GEMINI_BATCH hiện tại: {PRODUCTS_PER_GEMINI_BATCH}")
+                        logger.warning(f"⚠️ Cần điều chỉnh cấu hình để tránh lỗi này tiếp tục xảy ra")
+                        error_reports_list.append({
+                            "error_batch": batch_num_log, "error_type": "batch_too_large",
+                            "message": "Batch quá lớn cho Gemini", "batch_size": batch_size_log
+                        })
+                    elif classified_drinks:
+                        results_list.extend(classified_drinks)
+                        logger.info(f"✅ Worker {worker_id}: Batch {batch_num_log} xác định được {len(classified_drinks)} đồ uống trong {elapsed:.2f}s")
+                    else:
+                        logger.info(f"⚪ Worker {worker_id}: Batch {batch_num_log} không có đồ uống hoặc có lỗi ({elapsed:.2f}s)")
+                        error_reports_list.append({
+                            "error_batch": batch_num_log, "error_type": "empty_result",
+                            "message": "Không có kết quả", "batch_size": batch_size_log
+                        })
+                    
+                    work_queue.task_done()
+                    # Thời gian nghỉ nhỏ sau mỗi batch của một worker
+                    await asyncio.sleep(WORKER_SLEEP_BETWEEN_TASKS)
+
+                except asyncio.CancelledError:
+                    logger.info(f"🤖 Worker {worker_id}: Bị cancel.")
+                    break
+                except Exception as e:
+                    logger.error(f"🤖 Worker {worker_id}: Lỗi không mong muốn: {e}", exc_info=True)
+                    if 'task_data' in locals() and task_data and 'batch_num' in task_data:
+                         error_reports_list.append({"error_batch": task_data['batch_num'], "error_type": "worker_exception", "message": str(e), "batch_size": task_data.get('batch_size',0)})
+                    if 'task_data' in locals() and task_data is not None:
+                         work_queue.task_done()
+                    await asyncio.sleep(WORKER_ERROR_SLEEP)
+
+        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER
+        worker_tasks = []
+        for i in range(NUM_GEMINI_WORKERS):
+            worker_tasks.append(asyncio.create_task(gemini_worker(i + 1)))
+
+        # Chờ tất cả các item trong queue được xử lý
+        await work_queue.join()
+
+        # Gửi tín hiệu dừng cho tất cả worker
+        for _ in range(NUM_GEMINI_WORKERS):
+            await work_queue.put(None)
+
+        # Chờ tất cả worker hoàn thành
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả...")
         
-        # ⭐ CHẠY TẤT CẢ BATCH ĐỒNG THỜI VỚI ASYNCIO.GATHER
-        if batch_tasks:
-            total_batches = len(batch_tasks)
-            logger.info(f"🚀 Đang xử lý {total_batches} batch đồng thời với giới hạn {MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS} batch cùng lúc...")
+        # ⭐ LỌC TRÙNG LẶP BẰNG TÊN CHUẨN HÓA
+        def normalize_product_name(name: str) -> str:
+            """Chuẩn hóa tên sản phẩm để so sánh trùng lặp"""
+            if not name:
+                return ""
+            # Chuyển về lowercase, loại bỏ dấu cách, dấu gạch ngang, ký tự đặc biệt
+            import unicodedata
+            normalized = unicodedata.normalize('NFD', str(name).lower())
+            normalized = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')  # Loại bỏ dấu
+            normalized = re.sub(r'[^a-z0-9]', '', normalized)  # Chỉ giữ chữ và số
+            return normalized
+
+        if results_list:
+            logger.info(f"🔄 Bắt đầu lọc trùng lặp từ {len(results_list)} beverages...")
             
-            start_gather_time = asyncio.get_event_loop().time()
-            results_from_gather = await asyncio.gather(*batch_tasks, return_exceptions=True)
-            end_gather_time = asyncio.get_event_loop().time()
+            final_unique_beverages = []
+            seen_normalized_names = set()
+            seen_product_ids = set()
             
-            logger.info(f"⚡ Hoàn thành tất cả {total_batches} batch trong {end_gather_time - start_gather_time:.2f}s")
-            
-            # ⭐ XỬ LÝ KẾT QUẢ TỪ GATHER
-            successful_batches = 0
-            failed_batches = 0
-            for i, result in enumerate(results_from_gather):
-                if isinstance(result, Exception):
-                    logger.error(f"❌ Lỗi trong batch {i+1}: {str(result)}")
-                    failed_batches += 1
-                elif isinstance(result, list):
-                    identified_drinks_overall.extend(result)
-                    successful_batches += 1
+            for beverage_item in results_list:
+                if not isinstance(beverage_item, dict):
+                    continue
+                    
+                product_id = beverage_item.get("product_id")
+                product_name = beverage_item.get("product_name")
+                
+                if not product_id or not product_name:
+                    continue
+                
+                # Lọc theo ID trước (ưu tiên cao nhất)
+                if product_id in seen_product_ids:
+                    logger.debug(f"Đã lọc beverage trùng ID: {product_id}")
+                    continue
+                
+                # Lọc theo tên chuẩn hóa
+                normalized_name = normalize_product_name(product_name)
+                if normalized_name and normalized_name not in seen_normalized_names:
+                    final_unique_beverages.append(beverage_item)
+                    seen_normalized_names.add(normalized_name)
+                    seen_product_ids.add(product_id)
                 else:
-                    logger.warning(f"⚠️ Kết quả không mong đợi từ batch {i+1}: {type(result)}")
-                    failed_batches += 1
+                    logger.debug(f"Đã lọc beverage trùng tên: {product_name}")
             
-            logger.info(f"📊 Kết quả: {successful_batches} batch thành công, {failed_batches} batch thất bại")
+            results_list = final_unique_beverages
+            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} beverages duy nhất")
+
+        # ⭐ XỬ LÝ KẾT QUẢ CUỐI CÙNG
+        identified_drinks_overall.extend(results_list)
+        
+        if error_reports_list:
+            logger.warning(f"⚠️ Có {len(error_reports_list)} batch lỗi nhưng vẫn tìm được {len(results_list)} đồ uống")
+            # Log một số lỗi đầu
+            for error in error_reports_list[:3]:
+                logger.warning(f"   - Batch {error['error_batch']}: {error['message']}")
+        
+        logger.info(f"📊 Kết quả: {len(results_list)} đồ uống được tìm thấy, {len(error_reports_list)} batch lỗi")
         
     except Exception as e:
         logger.error(f"💥 Lỗi khi query Pinecone hoặc xử lý lô sản phẩm: {str(e)}")
