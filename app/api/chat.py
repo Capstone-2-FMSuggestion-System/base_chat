@@ -35,7 +35,7 @@ async def chat(
     # Xử lý message với background DB operations
     result, background_task_ids = await chat_service.process_message_with_background(
         user_id=verified_user.user_id,
-        message=request.message,
+        message_content=request.message,
         conversation_id=request.conversation_id
     )
     
@@ -210,10 +210,83 @@ async def get_chat_content(
     verified_user: VerifiedUserInfo = Depends(get_verified_user_from_backend),
     db: Session = Depends(get_db)
 ):
-    """Lấy nội dung cuộc trò chuyện"""
+    """Lấy nội dung cuộc trò chuyện bao gồm sản phẩm có sẵn"""
     chat_service = ChatService(db)
-    result = chat_service.get_chat_content(verified_user.user_id, conversation_id)
+    result = await chat_service.get_chat_content(verified_user.user_id, conversation_id)
     return result
+
+
+# Endpoint test không yêu cầu authentication
+@router.get("/test-chatContent")
+async def test_get_chat_content(
+    conversation_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Endpoint test để lấy nội dung cuộc trò chuyện mà không cần authentication, bao gồm sản phẩm có sẵn"""
+    chat_service = ChatService(db)
+    
+    if not conversation_id:
+        return {
+            "conversation_id": None,
+            "user_id": None,
+            "created_at": None,
+            "messages": [],
+            "available_products": [],
+            "error": "Cần cung cấp conversation_id"
+        }
+    
+    try:
+        # Lấy conversation mà không kiểm tra user ownership
+        conversation = chat_service.repository.get_conversation_by_id(conversation_id)
+        if not conversation:
+            return {
+                "conversation_id": conversation_id,
+                "user_id": None,
+                "created_at": None,
+                "messages": [],
+                "available_products": [],
+                "error": "Cuộc trò chuyện không tồn tại"
+            }
+        
+        messages = chat_service.repository.get_messages(conversation_id)
+        logger.info(f"Retrieved {len(messages)} messages for conversation {conversation_id}")
+        
+        # Lấy sản phẩm có sẵn
+        available_products = await chat_service._get_available_products_for_conversation(conversation_id)
+        logger.info(f"Retrieved {len(available_products)} available products for conversation {conversation_id}")
+        
+        formatted_messages = []
+        for i, msg in enumerate(messages):
+            try:
+                formatted_msg = {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                    "timestamp": None  # get_messages không trả về timestamp
+                }
+                formatted_messages.append(formatted_msg)
+            except Exception as msg_error:
+                logger.error(f"Error formatting message {i}: {msg_error}, msg type: {type(msg)}, msg: {msg}")
+                continue
+        
+        return {
+            "conversation_id": conversation.conversation_id,
+            "user_id": conversation.user_id,
+            "created_at": conversation.created_at.isoformat() if conversation.created_at else None,
+            "messages": formatted_messages,
+            "available_products": available_products
+        }
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy chat content: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {
+            "conversation_id": conversation_id,
+            "user_id": None,
+            "created_at": None,
+            "messages": [],
+            "available_products": [],
+            "error": f"Lỗi server: {str(e)}"
+        }
 
 
 @router.get("/background-task-status/{task_id}")

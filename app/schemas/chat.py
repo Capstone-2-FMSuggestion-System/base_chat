@@ -22,6 +22,7 @@ class ChatResponse(BaseModel):
     health_data: Optional[Dict[str, Any]] = None
     limit_reached: bool = False
     message_count: int = 0
+    available_products: Optional[List[Dict[str, Any]]] = []
 
 
 class NewChatResponse(BaseModel):
@@ -38,6 +39,7 @@ class ChatContentResponse(BaseModel):
     messages: List[MessageModel] 
     has_summary: Optional[bool] = False
     summary: Optional[str] = None
+    available_products: Optional[List[Dict[str, Any]]] = []
 
     class Config:
         orm_mode = True 

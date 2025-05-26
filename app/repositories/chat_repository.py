@@ -627,9 +627,9 @@ class ChatRepository:
 
     @invalidate_cache_on_update(["recent_recipes:*", "recipe:*:details"])
     def save_recipe_to_menu(self, recipe_name: str, recipe_description: str, 
-                           ingredients_with_products: List[Dict[str, Any]]) -> Optional[int]:
+                           ingredients_with_products: List[Dict[str, Any]], conversation_id: Optional[int] = None) -> Optional[int]:
         try:
-            menu = Menu(name=recipe_name, description=recipe_description)
+            menu = Menu(name=recipe_name, description=recipe_description, conversation_id=conversation_id)
             self.db.add(menu)
             self.db.flush()
             
@@ -667,7 +667,8 @@ class ChatRepository:
                 'name': recipe_name,
                 'description': recipe_description,
                 'created_at': datetime.now().isoformat(),
-                'ingredients': menu_items_data
+                'ingredients': menu_items_data,
+                'available_products': []  # Sẽ được cập nhật bởi ProductService
             }
             CacheService.cache_recipe_data(menu_id, recipe_data_cache)
             
@@ -680,7 +681,7 @@ class ChatRepository:
             return None
 
     def save_multiple_recipes_to_menu(self, recipes_data: List[Dict[str, Any]], 
-                                     product_mapping: Dict[str, Any]) -> List[int]:
+                                     product_mapping: Dict[str, Any], conversation_id: Optional[int] = None) -> List[int]:
         created_menu_ids = []
         if not recipes_data:
             return created_menu_ids
@@ -736,7 +737,7 @@ class ChatRepository:
                                 'quantity': 1
                             })
                 
-                menu_id = self.save_recipe_to_menu(name, recipe_desc, ings_with_prods)
+                menu_id = self.save_recipe_to_menu(name, recipe_desc, ings_with_prods, conversation_id)
                 if menu_id:
                     created_menu_ids.append(menu_id)
                 else:
@@ -808,7 +809,8 @@ class ChatRepository:
             'name': menu.name,
             'description': menu.description,
             'created_at': menu.created_at.isoformat() if menu.created_at else None,
-            'ingredients': ingredients_list
+            'ingredients': ingredients_list,
+            'available_products': []  # Sẽ được cập nhật bởi ProductService
         }
         
         CacheService.cache_recipe_data(menu_id, recipe_data_db)
@@ -1001,4 +1003,40 @@ class ChatRepository:
         CacheService.delete_cache(health_cache_key)
         
         logger.debug(f"✅ Committed and refreshed health_data id={health_data.id}")
-        return health_data 
+        return health_data
+
+    def get_menu_data_by_conversation(self, conversation_id: int) -> List[Dict[str, Any]]:
+        """
+        Lấy tất cả menu data đã được tạo trong conversation.
+        
+        Args:
+            conversation_id: ID cuộc trò chuyện
+            
+        Returns:
+            List các menu data dictionary
+        """
+        try:
+            from app.db.models import Menu
+            
+            # Query tất cả menu được tạo trong conversation này
+            menus = self.db.query(Menu).filter(
+                Menu.conversation_id == conversation_id
+            ).order_by(Menu.created_at.desc()).all()
+            
+            menu_data_list = []
+            for menu in menus:
+                menu_data = {
+                    'menu_id': menu.menu_id,
+                    'conversation_id': menu.conversation_id,
+                    'name': menu.name,
+                    'description': menu.description,
+                    'created_at': menu.created_at.isoformat() if menu.created_at else None,
+                }
+                menu_data_list.append(menu_data)
+            
+            logger.debug(f"📋 Tìm thấy {len(menu_data_list)} menu cho conversation_id={conversation_id}")
+            return menu_data_list
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi lấy menu data cho conversation_id={conversation_id}: {str(e)}", exc_info=True)
+            return [] 

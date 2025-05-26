@@ -68,6 +68,7 @@ class Menu(Base):
     __tablename__ = "menus"
     
     menu_id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.conversation_id"), nullable=True)  # Liên kết với conversation
     name = Column(String(100), nullable=False)  # Tên công thức món ăn
     description = Column(String(500), nullable=True)  # Mô tả công thức
     created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))

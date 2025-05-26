@@ -277,8 +277,8 @@ class GeminiPromptService:
                         # Giữ lại phần sau pattern cuối cùng
                         polished_response = parts[-1].strip()
             
-            # Xử lý trường hợp có định dạng số thứ tự và đánh dấu
-            if polished_response.strip().startswith("1.") or polished_response.strip().startswith("*"):
+            # Xử lý trường hợp có định dạng số thứ tự và đánh dấu - CHỈ XỬ LÝ DEBUG, KHÔNG STRIP MARKDOWN
+            if any(pattern.lower() in polished_response.lower() for pattern in debug_patterns):
                 lines = polished_response.split("\n")
                 filtered_lines = []
                 in_debug_section = False
@@ -302,7 +302,7 @@ class GeminiPromptService:
                     if not in_debug_section:
                         filtered_lines.append(line)
                 
-                # Kết hợp các dòng đã lọc
+                # Kết hợp các dòng đã lọc - GIỮ NGUYÊN MARKDOWN FORMATTING
                 polished_response = "\n".join(filtered_lines).strip()
             
             # Loại bỏ phần đánh dấu còn sót
@@ -549,77 +549,83 @@ Viết bằng tiếng Việt, trực tiếp phản hồi không có giải thíc
             total_chars += len(msg_text)
         
         # Tạo prompt
-        prompt = f"""Bạn là một chuyên viên phân tích y tế thông minh và tinh tế. Nhiệm vụ của bạn là phân tích CUỘC TRÒ CHUYỆN dưới đây để hiểu rõ ý định của người dùng, trích xuất thông tin và xác định các bước tiếp theo.
+        prompt = f"""**NHIỆM VỤ CỦA BẠN:**
+Bạn là một CHUYÊN VIÊN PHÂN TÍCH YÊU CẦU NGƯỜI DÙNG SIÊU CẤP, cực kỳ thông minh, tinh tế và có khả năng suy luận logic mạnh mẽ cho một chatbot tư vấn y tế, dinh dưỡng và ẩm thực. Nhiệm vụ của bạn là PHÂN TÍCH KỸ LƯỠNG TOÀN BỘ CUỘC TRÒ CHUYỆN (LỊCH SỬ và TIN NHẮN MỚI NHẤT), sau đó trả về một đối tượng JSON DUY NHẤT với cấu trúc được định nghĩa nghiêm ngặt ở cuối.
 
-PHẠM VI HỖ TRỢ CỦA TRỢ LÝ: 
-Tư vấn dinh dưỡng, sức khỏe, gợi ý món ăn và đồ uống phù hợp với tình trạng sức khỏe người dùng (nếu được cung cấp). Trợ lý có thể:
-- Tư vấn món ăn, đồ uống tốt cho sức khỏe
-- Gợi ý công thức nấu ăn phù hợp với tình trạng bệnh lý
-- Tư vấn dinh dưỡng cho từng đối tượng (trẻ em, người cao tuổi, người bệnh)
-- Tư vấn thực phẩm nên tránh với các bệnh lý cụ thể
-- Gợi ý nguyên liệu và cách chế biến món ăn
-- Tư vấn chế độ ăn uống khoa học
+**PHẠM VI TƯ VẤN CỦA CHATBOT:**
+(Giữ nguyên phần này)
+- Tư vấn dinh dưỡng, sức khỏe tổng quát.
+- Gợi ý món ăn và đồ uống phù hợp với tình trạng sức khỏe người dùng (nếu được cung cấp).
+- Công thức nấu ăn/pha chế phù hợp bệnh lý.
+- Dinh dưỡng cho các đối tượng đặc biệt.
+- Thực phẩm nên dùng/tránh với các bệnh.
+- Tư vấn chế độ ăn uống khoa học.
 
-LỊCH SỬ CHAT GẦN ĐÂY:
+**THÔNG TIN ĐẦU VÀO ĐỂ PHÂN TÍCH:**
+
+LỊCH SỬ CHAT GẦN ĐÂY (nếu có):
 {history_text}
 
-TIN NHẮN NGƯỜI DÙNG MỚI NHẤT:
-{user_message}
+TIN NHẮN NGƯỜI DÙNG MỚI NHẤT CẦN PHÂN TÍCH:
+Người dùng: {user_message}
 
-YÊU CẦU PHÂN TÍCH CHI TIẾT:
+**YÊU CẦU PHÂN TÍCH CHI TIẾT (TUÂN THỦ TUYỆT ĐỐI CÁC QUY TẮC LOGIC SAU):**
 
-1. Xác định Phạm vi Yêu cầu:
-   - is_valid_scope: (boolean) Yêu cầu có nằm trong PHẠM VI HỖ TRỢ không? Chỉ đặt false nếu yêu cầu hoàn toàn không liên quan đến dinh dưỡng, sức khỏe, món ăn, đồ uống.
-   - is_food_related: (boolean) Yêu cầu có cụ thể về món ăn, đồ uống, công thức, nguyên liệu hoặc tư vấn dinh dưỡng không? (Cờ tổng quan cho cả ẩm thực nói chung)
-   - requests_food: (boolean) Người dùng có cụ thể hỏi về món ăn, công thức nấu ăn, thực đơn món ăn không?
-   - requests_beverage: (boolean) Người dùng có cụ thể hỏi về đồ uống, nước uống, công thức pha chế, trà, cà phê, nước ép, sinh tố không?
+**1. PHÂN TÍCH PHẠM VI VÀ LOẠI YÊU CẦU (TỪ TIN NHẮN MỚI NHẤT):**
+   - `is_valid_scope` (boolean): Yêu cầu có nằm trong PHẠM VI TƯ VẤN không? (Mặc định `true` trừ khi hoàn toàn không liên quan).
+   - `is_food_related` (boolean): Yêu cầu có liên quan đến ẩm thực (món ăn, đồ uống, công thức, dinh dưỡng cụ thể) không?
+   - `requests_food` (boolean): Người dùng có cụ thể hỏi MÓN ĂN không? (Ví dụ: "món ăn", "thực đơn", "công thức nấu ăn").
+   - `requests_beverage` (boolean): Người dùng có cụ thể hỏi ĐỒ UỐNG không? (Ví dụ: "nước uống", "thức uống", "nước ép", "sinh tố").
+   *Logic cho cờ `request_...`*:
+     - Nếu người dùng nói "món ăn và đồ uống", đặt cả hai là `true`.
+     - Nếu người dùng nói "ăn uống gì đó", và ngữ cảnh trước đó có nhắc đến loại cụ thể, hãy theo ngữ cảnh đó. Nếu không, có thể đặt `is_food_related=true` và cả `requests_food`, `requests_beverage` là `false` (để chatbot hỏi làm rõ).
+     - `is_food_related` là `true` nếu `requests_food` hoặc `requests_beverage` là `true`.
 
-HƯỚNG DẪN CHI TIẾT CHO VIỆC ĐẶT CÁC CỜ:
-- Nếu người dùng hỏi 'món ăn cho người tiểu đường', 'công thức phở bò', 'thực đơn bữa tối', 'cách nấu canh chua', đặt requests_food = true và requests_beverage = false (trừ khi họ cũng hỏi đồ uống).
-- Nếu người dùng hỏi 'nước ép tốt cho da', 'cách pha trà gừng', 'đồ uống giải nhiệt', 'nước detox', 'sinh tố dinh dưỡng', đặt requests_beverage = true và requests_food = false (trừ khi họ cũng hỏi món ăn).
-- Nếu người dùng hỏi 'gợi ý món ăn và đồ uống cho bữa tiệc', 'thực đơn đầy đủ cho ngày hôm nay', đặt cả requests_food = true và requests_beverage = true.
-- Nếu người dùng hỏi chung chung 'tôi nên ăn uống gì hôm nay?' mà không rõ ràng món ăn hay đồ uống, dựa vào ngữ cảnh trước đó. Nếu không có ngữ cảnh rõ ràng, có thể đặt cả hai là false và dựa vào suggest_general_options hoặc follow_up_question.
-- Cờ is_food_related sẽ là true nếu requests_food hoặc requests_beverage là true, hoặc nếu yêu cầu liên quan đến tư vấn dinh dưỡng nói chung.
+**2. TRÍCH XUẤT THÔNG TIN NGƯỜI DÙNG (Từ TOÀN BỘ LỊCH SỬ và TIN NHẮN MỚI NHẤT - TÍCH LŨY THÔNG TIN):**
+   - `collected_info` (object):
+     - `health_condition` (string): Liệt kê TẤT CẢ tình trạng sức khỏe, bệnh lý (ví dụ: "tiểu đường, béo phì"). GHI NHẬN VÀ GIỮ LẠI thông tin này qua các lượt.
+     - `medical_history` (string): (Tương tự `health_condition`)
+     - `allergies` (string): (Tương tự `health_condition`)
+     - `dietary_habits` (string): Các thói quen đặc biệt ("ăn chay", "ăn kiêng low-carb"). Nếu người dùng nói "bình thường", "không có gì đặc biệt" hoặc không cung cấp, để trống.
+     - `food_preferences` (string): Sở thích cụ thể ("thích đồ ngọt", "thích món cay", "cần món giải nhiệt"). Nếu người dùng nói "gì cũng được", "tùy bạn" hoặc không cung cấp, để trống.
+     - `food_dislikes` (string): Không thích/kiêng cữ ("không ăn hành", "không uống đồ có cồn", "tránh đồ nhiều dầu mỡ"). GHI NHẬN CẨN THẬN CÁC YÊU CẦU LOẠI TRỪ.
+     - `health_goals` (string): (Tương tự `health_condition`)
+   *QUAN TRỌNG*:
+     - Các thông tin cốt lõi như `health_condition`, `allergies`, `health_goals` một khi đã được cung cấp phải được GIỮ LẠI trong `collected_info` qua các lượt phân tích sau, trừ khi người dùng nói rõ là thông tin đó đã thay đổi.
+     - Đối với `dietary_habits`, `food_preferences`, `food_dislikes`: Nếu người dùng ở lượt TRƯỚC đã cung cấp, nhưng ở TIN NHẮN MỚI NHẤT lại nói "ăn gì cũng được", "bình thường", thì các trường này trong `collected_info` nên được làm rỗng hoặc phản ánh sự không chắc chắn đó, và đây là một tín hiệu cho `user_rejected_info`.
 
-2. Trích xuất Thông tin Sức khỏe và Yêu cầu:
-   - collected_info: (object) {{
-       "health_condition": "string (ví dụ: 'tiểu đường type 2', 'cao huyết áp', 'bệnh tim', để trống nếu không có)",
-       "medical_history": "string (ví dụ: 'từng phẫu thuật dạ dày', 'có tiền sử dị ứng', để trống nếu không có)",
-       "allergies": "string (ví dụ: 'hải sản', 'đậu phộng', 'gluten', để trống nếu không có)",
-       "dietary_habits": "string (ví dụ: 'ăn chay', 'thích đồ ngọt', 'ăn ít muối', 'không uống sữa', để trống nếu không có)",
-       "food_preferences": "string (ví dụ: 'thích ăn cá', 'thích vị ngọt', 'cần món nước', 'muốn món dễ làm', 'cần món nhanh gọn', 'thích món truyền thống', để trống nếu không có)",
-       "food_dislikes": "string (ví dụ: 'không ăn được hành', 'ghét sầu riêng', 'không thích đồ chua', để trống nếu không có)",
-       "health_goals": "string (ví dụ: 'giảm cân', 'kiểm soát đường huyết', 'hạ nhiệt', 'tăng cường miễn dịch', để trống nếu không có)"
-     }}
+**3. ĐÁNH GIÁ THÁI ĐỘ NGƯỜI DÙNG VÀ QUYẾT ĐỊNH HƯỚNG HÀNH XỬ CỦA CHATBOT:**
+   - `user_rejected_info` (boolean): Phân tích TIN NHẮN MỚI NHẤT. Người dùng có đang từ chối (rõ ràng hoặc ngầm) cung cấp THÊM THÔNG TIN CHI TIẾT về sở thích/thói quen, SAU KHI chatbot đã đặt câu hỏi gợi ý không?
+     *   Các ví dụ từ chối bao gồm: "tôi không muốn nói", "tôi không rõ", "tôi không biết", "sao cũng được", "gì cũng được", "tùy bạn", "bạn cứ gợi ý đi", "cho tôi ví dụ", "gia đình tôi ăn uống bình thường", "không có yêu cầu gì đặc biệt", "không có sở thích cụ thể".
+     *   **ĐẶC BIỆT QUAN TRỌNG**: Nếu chatbot hỏi "Bạn thích loại A, B, hay C?" và người dùng trả lời "Loại nào cũng được nhưng trừ X" hoặc "Tôi không biết chọn loại nào, bạn gợi ý đi", thì `user_rejected_info` (cho việc chọn loại cụ thể A,B,C) là `true`.
+   - `suggest_general_options` (boolean): Đặt `true` NẾU ĐỒNG THỜI CÁC ĐIỀU KIỆN SAU ĐÚNG:
+     *   a) `is_valid_scope` là true, VÀ
+     *   b) `is_food_related` là true (người dùng quan tâm đến món ăn/đồ uống), VÀ
+     *   c) ( `user_rejected_info` là `true` (người dùng không muốn/không thể cung cấp thêm chi tiết về SỞ THÍCH/THÓI QUEN ĂN UỐNG CỤ THỂ)
+           HOẶC (thông tin về `dietary_habits`, `food_preferences`, `food_dislikes` trong `collected_info` là RẤT ÍT hoặc KHÔNG CÓ, VÀ người dùng không cung cấp thêm chi tiết khi được hỏi ở lượt trước) ), VÀ
+     *   d) Thông tin về SỞ THÍCH CÁ NHÂN cụ thể (ngoài các điều kiện như "không cồn") là KHÔNG ĐỦ để cá nhân hóa sâu sắc gợi ý món ăn/đồ uống, **ngay cả khi đã biết các `health_condition`**.
+     *Khi `suggest_general_options` là `true`, chatbot sẽ không hỏi thêm về sở thích chung nữa, mà sẽ đưa ra gợi ý dựa trên các tiêu chí phổ biến và các `health_condition` + `food_dislikes` (ví dụ "không cồn") đã biết.*
+   - `need_more_info` (boolean):
+     *   **QUY TẮC THÉP 1: NẾU `user_rejected_info` là `true`, thì `need_more_info` PHẢI LÀ `FALSE`.**
+     *   **QUY TẮC THÉP 2: NẾU `suggest_general_options` là `true`, thì `need_more_info` PHẢI LÀ `FALSE`.**
+     *   Chỉ đặt `true` nếu cả hai quy tắc trên không áp dụng VÀ thông tin hiện tại THỰC SỰ QUÁ MƠ HỒ hoặc THIẾU CỐT LÕI (ví dụ: thiếu hoàn toàn thông tin về tình trạng sức khỏe khi người dùng muốn tư vấn theo bệnh, hoặc chỉ nói "tôi muốn ăn" mà không có bất kỳ yêu cầu nào khác) để có thể đưa ra bất kỳ loại tư vấn nào (kể cả tư vấn chung có xem xét bệnh lý).
+   - `follow_up_question` (string | null):
+     *   **QUY TẮC THÉP: Chỉ được tạo khi `need_more_info` là `true`.** (Điều này đảm bảo các quy tắc thép của `need_more_info` được tuân thủ).
+     *   Nếu tạo, câu hỏi phải TẬP TRUNG vào thông tin CÒN THIẾU QUAN TRỌNG NHẤT và CHƯA BỊ TỪ CHỐI.
+     *   Nếu chatbot đã hỏi về sở thích A, B, C và người dùng nói "gì cũng được", thì `follow_up_question` tiếp theo KHÔNG ĐƯỢC hỏi lại về A, B, C.
+     *   Ví dụ tình huống:
+         - User: "Gợi ý món cho người tiểu đường."
+         - Bot: "Bạn có sở thích cụ thể nào không (cay, ngọt, mặn)?"
+         - User: "Tôi không có sở thích cụ thể, chỉ cần tốt cho người tiểu đường."
+         - Phân tích cho lượt cuối của user: `user_rejected_info=true` (cho sở thích), `suggest_general_options=true`, `need_more_info=false`, `follow_up_question=null`. `collected_info.health_condition="tiểu đường"`.
+     *   Ví dụ tình huống (cần hỏi thêm):
+         - User: "Tôi muốn món ăn tốt cho sức khỏe."
+         - Phân tích: `is_valid_scope=true`, `is_food_related=true`. `collected_info` rỗng. `user_rejected_info=false`, `suggest_general_options=false`. => `need_more_info=true`.
+         - `follow_up_question`: "Tuyệt vời! Để tôi có thể gợi ý chính xác hơn, bạn có thể chia sẻ thêm về mục tiêu sức khỏe cụ thể của mình (ví dụ: giảm cân, tăng cường năng lượng) hoặc bạn có tình trạng sức khỏe nào cần lưu ý không ạ?"
+     *   Nếu không cần hỏi thêm, PHẢI là `null`.
 
-3. Đánh giá Thái độ Từ chối và Gợi ý Chung:
-   - user_rejected_info: (boolean) Người dùng có đang TỪ CHỐI RÕ RÀNG HOẶC NGẦM cung cấp thêm thông tin không? 
-     Các ví dụ từ chối bao gồm:
-     + Rõ ràng: "tôi không muốn nói", "tôi không thể cung cấp thông tin này", "tôi từ chối trả lời"
-     + Ngầm: "tôi không biết nữa", "bạn cứ gợi ý đi", "cho tôi vài ví dụ", "tôi không rõ", "bạn chọn giúp tôi", "tùy bạn", "gì cũng được"
-     
-   - suggest_general_options: (boolean) Đặt TRUE khi:
-     + is_valid_scope là true VÀ 
-     + is_food_related là true VÀ
-     + (user_rejected_info là true HOẶC thông tin trong collected_info + user_message quá ít để đưa ra gợi ý cá nhân hóa) VÀ
-     + KHÔNG CÓ đủ thông tin cụ thể từ người dùng về tình trạng sức khỏe/sở thích cá nhân
-     Khi TRUE: Trợ lý sẽ gợi ý dựa trên tiêu chí chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít gây dị ứng, dễ chế biến)
-
-4. Đánh giá Nhu cầu Thông tin Bổ sung:
-   - need_more_info: (boolean)
-     + **QUY TẮC QUAN TRỌNG: Nếu user_rejected_info là true, thì need_more_info PHẢI LÀ FALSE.**
-     + **QUY TẮC QUAN TRỌNG: Nếu suggest_general_options là true, thì need_more_info PHẢI LÀ FALSE.**
-     + Nếu cả hai điều kiện trên là false, và thông tin trong collected_info + user_message QUÁ ÍT để đưa ra bất kỳ gợi ý nào (kể cả gợi ý chung), thì đặt là true.
-     
-   - follow_up_question: (string | null)
-     + **QUAN TRỌNG: Chỉ tạo khi need_more_info là true VÀ user_rejected_info là false VÀ suggest_general_options là false**
-     + Nếu cần tạo: Tạo câu hỏi NGẮN GỌN, LỊCH SỰ, CỤ THỂ và TRÁNH HỎI LẠI câu hỏi tương tự đã hỏi trước đó
-     + Nếu người dùng không biết chọn gì, đưa ra 2-3 LỰA CHỌN CỤ THỂ để họ chọn
-     + Ví dụ tốt: "Để gợi ý phù hợp, bạn có muốn thử: 1) Đồ uống giải khát (nước ép, trà thảo mộc), 2) Món ăn nhẹ (chè, bánh), hay 3) Món ăn chính (cơm, phở) không ạ?"
-     + Nếu không cần hỏi thêm, trường này PHẢI là null
-
-HÃY TRẢ VỀ KẾT QUẢ DƯỚI DẠNG MỘT ĐỐI TƯỢNG JSON DUY NHẤT, TUÂN THỦ NGHIÊM NGẶT CẤU TRÚC SAU. KHÔNG THÊM BẤT KỲ GIẢI THÍCH HAY VĂN BẢN NÀO BÊN NGOÀI CẤU TRÚC JSON:
-
+**CẤU TRÚC JSON OUTPUT (TUYỆT ĐỐI CHỈ TRẢ VỀ JSON NÀY, KHÔNG THÊM BẤT KỲ GIẢI THÍCH NÀO):**
+```json
 {{
   "is_valid_scope": boolean,
   "is_food_related": boolean,
@@ -627,18 +633,19 @@ HÃY TRẢ VỀ KẾT QUẢ DƯỚI DẠNG MỘT ĐỐI TƯỢNG JSON DUY NHẤT
   "requests_beverage": boolean,
   "user_rejected_info": boolean,
   "need_more_info": boolean,
-  "suggest_general_options": boolean, 
+  "suggest_general_options": boolean,
   "follow_up_question": string | null,
   "collected_info": {{
     "health_condition": "string",
-    "medical_history": "string", 
+    "medical_history": "string",
     "allergies": "string",
     "dietary_habits": "string",
     "food_preferences": "string",
     "food_dislikes": "string",
     "health_goals": "string"
   }}
-}}"""
+}}
+```"""
         
         return prompt
     

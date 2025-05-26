@@ -65,6 +65,9 @@ class ChatState(TypedDict):
     # ID của tin nhắn trong database (để ChatService có thể truy cập)
     user_message_id_db: Optional[int] # ID của tin nhắn người dùng trong DB
     assistant_message_id_db: Optional[int] # ID của tin nhắn trợ lý trong DB
+    
+    # Menu IDs đã được lưu vào database (để lấy sản phẩm có sẵn)
+    menu_ids: Optional[List[int]] # Danh sách ID của menu đã được lưu
 
 # Các node xử lý
 async def check_scope_node(state: ChatState) -> ChatState:
@@ -468,7 +471,8 @@ def response_cleanup_node_wrapper(state: ChatState, repository) -> ChatState:
                         if recipes_to_save:
                             saved_menu_ids = repository.save_multiple_recipes_to_menu(
                                 recipes_to_save,
-                                result_state['product_results']
+                                result_state['product_results'],
+                                result_state.get('conversation_id')
                             )
                             
                             if saved_menu_ids:
@@ -476,6 +480,8 @@ def response_cleanup_node_wrapper(state: ChatState, repository) -> ChatState:
                                 # Log tên các recipes đã lưu để dễ theo dõi
                                 saved_recipe_names = [recipe.get('name', 'N/A') for recipe in recipes_to_save]
                                 logger.info(f"📋 Tên các recipes đã lưu: {saved_recipe_names}")
+                                # ⭐ THÊM MENU_IDS VÀO RESULT_STATE để ChatService có thể sử dụng
+                                result_state['menu_ids'] = saved_menu_ids
                         else:
                             logger.info("⚠️ Không có recipes nào để lưu sau khi filter")
                     except Exception as recipe_save_error:
@@ -1135,6 +1141,8 @@ Trả về ngay câu trả lời, không giải thích."""
                                 # Log tên các recipes đã lưu để dễ theo dõi
                                 saved_recipe_names = [recipe.get('name', 'N/A') for recipe in recipes_to_save]
                                 logger.info(f"📋 Tên các recipes đã lưu: {saved_recipe_names}")
+                                # ⭐ THÊM MENU_IDS VÀO RESULT_STATE để ChatService có thể sử dụng
+                                result_state['menu_ids'] = saved_menu_ids
                         else:
                             logger.info("⚠️ Không có recipes nào để lưu sau khi filter")
                     except Exception as recipe_save_error:

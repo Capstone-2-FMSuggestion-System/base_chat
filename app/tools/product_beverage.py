@@ -434,7 +434,7 @@ TRẢ VỀ JSON ARRAY:"""
                     break
                 await asyncio.sleep(15 + attempt * 5)
 
-    logger.error(f"❌ Vẫn gặp lỗi sau {max_retries} lần thử lại với Gemini ({task_desc}) hoặc không thể parse kết quả.")
+    logger.error(f"❌ Vẫn gặp lỗi sau {max_retries} lần thử lại với Gemini ({task_description}) hoặc không thể parse kết quả.")
     return []
 
 async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimension: int) -> list[dict]:

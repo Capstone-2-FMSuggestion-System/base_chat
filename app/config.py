@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     DEBUG_MODE: bool
     API_TIMEOUT: int
     
+    # Backend URL
+    BACKEND_URL: str = "http://localhost:8000"
+    
     def __init__(self, **data):
         super().__init__(**data)
         if not self.SQLALCHEMY_DATABASE_URL:
