@@ -663,7 +663,7 @@ Người dùng: {user_message}
         
         return prompt
     
-    def _create_medichat_prompt_template(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False) -> str:
+    def _create_medichat_prompt_template(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False, current_summary: Optional[str] = None) -> str:
         """
         Tạo template prompt để tóm tắt thông tin cho Medichat.
         Nếu có recipes hoặc beverages, đưa hết vào và giới hạn prompt tổng là 400 TỪ.
@@ -674,6 +674,7 @@ Người dùng: {user_message}
             recipes: Danh sách công thức món ăn (nếu có)
             beverages: Danh sách đồ uống (nếu có)
             suggest_general: True nếu cần Medichat gợi ý theo tiêu chí chung.
+            current_summary: Tóm tắt cuộc trò chuyện từ lượt trước (nếu có)
             
         Returns:
             Prompt cho Gemini để tạo prompt Medichat
@@ -681,31 +682,51 @@ Người dùng: {user_message}
         # Xác định giới hạn từ dựa trên có recipes/beverages hay không hoặc suggest_general
         word_limit = self.max_medichat_prompt_words_with_context if (recipes or beverages or suggest_general) else 900
         
-        # Chuyển đổi các tin nhắn thành văn bản - sử dụng toàn bộ lịch sử
-        # Nhưng tối ưu cho token - giảm độ dài nội dung nếu quá dài
+        # ⭐ XÂY DỰNG NGỮ CẢNH CUỘC TRÒ CHUYỆN DỰA TRÊN TÓM TẮT VÀ TIN NHẮN GẦN ĐÂY
+        context_for_gemini = ""
+        
+        if current_summary:
+            # Có tóm tắt từ lượt trước - sử dụng làm ngữ cảnh chính
+            context_for_gemini += f"BẢN TÓM TẮT CUỘC TRÒ CHUYỆN HIỆN TẠI (ƯU TIÊN SỬ DỤNG LÀM NGỮ CẢNH CHÍNH):\n{current_summary}\n\n"
+            context_for_gemini += "LỊCH SỬ CHAT CHI TIẾT GẦN ĐÂY (chỉ để tham khảo thêm hoặc làm rõ thông tin từ tóm tắt nếu cần, đặc biệt là tin nhắn mới nhất chưa có trong tóm tắt):\n"
+            
+            # Chỉ lấy vài tin nhắn cuối khi có tóm tắt
+            num_recent_messages = 3
+        else:
+            # Không có tóm tắt - sử dụng lịch sử chat như cũ
+            context_for_gemini += "LỊCH SỬ CHAT (vì chưa có tóm tắt, hãy dựa vào đây để lấy ngữ cảnh):\n"
+            num_recent_messages = 10
+        
+        # Xây dựng phần tin nhắn gần đây
         conversation_text = "\n\n"
         total_chars = 0
-        max_conversation_chars = 14000  # Giới hạn ký tự cho lịch sử chat
+        max_conversation_chars = 8000 if current_summary else 14000  # Giảm giới hạn khi có tóm tắt
         
-        # Sử dụng toàn bộ lịch sử chat
-        for msg in messages:
+        # Lấy N tin nhắn cuối cùng
+        recent_messages = messages[-num_recent_messages:] if len(messages) > num_recent_messages else messages
+        
+        for msg in recent_messages:
             if msg["role"] != "system":  # Bỏ qua system message
                 role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
                 content = msg['content']
                 
                 # Cắt bớt nội dung nếu quá dài
-                if len(content) > 500:
-                    content = content[:500] + "... [nội dung đã cắt ngắn]"
+                max_content_length = 300 if current_summary else 500
+                if len(content) > max_content_length:
+                    content = content[:max_content_length] + "... [nội dung đã cắt ngắn]"
                 
                 msg_text = f"{role}: {content}\n\n"
                 
                 # Kiểm tra xem có vượt quá giới hạn không
                 if total_chars + len(msg_text) > max_conversation_chars:
-                    conversation_text += "[...nhiều tin nhắn trước đó đã được bỏ qua để đảm bảo không vượt quá giới hạn token...]\n\n"
+                    conversation_text += "[...một số tin nhắn đã được bỏ qua để đảm bảo không vượt quá giới hạn token...]\n\n"
                     break
                 
                 conversation_text += msg_text
                 total_chars += len(msg_text)
+        
+        # Kết hợp ngữ cảnh hoàn chỉnh
+        full_context = context_for_gemini + conversation_text
         
         # ⭐ TẠOS PHẦN RECIPES VỚI TIÊU ĐỀ RÕ RÀNG - ĐƯA TOÀN BỘ RECIPES VÀO
         recipe_section = ""
@@ -754,13 +775,15 @@ Người dùng: {user_message}
         # Tạo prompt cho Gemini
         prompt = f""""Bạn là một trợ lý y tế thông minh, chuyên tóm tắt thông tin từ cuộc trò chuyện để tạo ra một prompt ngắn gọn, súc tích và đầy đủ thông tin nhất cho mô hình AI y tế chuyên sâu Medichat-LLaMA3-8B.
 
-TOÀN BỘ CUỘC TRÒ CHUYỆN ĐỂ TÓM TẮT:
-{conversation_text}
+NGỮ CẢNH CUỘC TRÒ CHUYỆN ĐỂ TẠO PROMPT CHO MEDICHAT:
+{full_context}
 
 {recipe_section}{beverage_section}{general_instruction}
 
-YÊU CẦU TẠO PROMPT CHO MEDICHAT:
+YÊU CẦU TẠO PROMPT CHO MEDICHAT (DỰA TRÊN NGỮ CẢNH TRÊN, ĐẶC BIỆT LÀ BẢN TÓM TẮT NẾU CÓ VÀ TIN NHẮN MỚI NHẤT):
 1. Nội dung cốt lõi:
+   - Phân tích yêu cầu chính từ TIN NHẮN MỚI NHẤT của người dùng (trong LỊCH SỬ CHAT CHI TIẾT GẦN ĐÂY).
+   - Kết hợp với các thông tin quan trọng đã được đúc kết trong BẢN TÓM TẮT (nếu có) như tình trạng sức khỏe, mục tiêu, sở thích đã biết.
    - Nếu `general_instruction` có nội dung (suggest_general=true): Tạo prompt yêu cầu Medichat thực hiện gợi ý chung theo các tiêu chí đã nêu. Có thể tham khảo `recipe_section` nếu có món phù hợp với tiêu chí chung.
    - Nếu không có `general_instruction`: Tập trung vào yêu cầu chính/vấn đề mà người dùng đang hỏi, bao gồm triệu chứng/tình trạng sức khỏe, bệnh lý nền/dị ứng, thông tin về món ăn/chế độ dinh dưỡng quan tâm, mục tiêu dinh dưỡng/sức khỏe, và thói quen ăn uống đã đề cập.
 
@@ -774,33 +797,37 @@ YÊU CẦU TẠO PROMPT CHO MEDICHAT:
 
 3. XỬ LÝ CÔNG THỨC MÓN ĂN/ĐỒ UỐNG - TẬN DỤNG TỐI ĐA DỮ LIỆU:
 
-⭐ QUAN TRỌNG TUYỆT ĐỐI: Khi Medichat đưa ra gợi ý về một món ăn hoặc đồ uống dựa trên DANH SÁCH CÔNG THỨC MÓN ĂN THAM KHẢO hoặc DANH SÁCH ĐỒ UỐNG THAM KHẢO, Medichat PHẢI:
-   a. Trích xuất và liệt kê CHÍNH XÁC danh sách nguyên liệu từ trường ingredients_summary (đối với món ăn) hoặc các thành phần chính đã biết (nếu có cho đồ uống) được cung cấp trong danh sách đó.
-   b. Medichat TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ Ý THAY ĐỔI, THÊM BỚT, HAY SUY DIỄN danh sách nguyên liệu/thành phần này. Phải giữ nguyên như dữ liệu được cung cấp.
-   c. Trình bày danh sách nguyên liệu/thành phần này một cách rõ ràng cho người dùng dưới dạng: **Nguyên liệu:** [nguyên liệu 1], [nguyên liệu 2], ...
-   d. Prompt bạn (Gemini) tạo ra cho Medichat PHẢI chứa một chỉ dẫn rõ ràng về yêu cầu (a), (b), (c) này. Ví dụ: 'Khi bạn gợi ý một món từ danh sách công thức/đồ uống được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm trong trường "Nguyên liệu:" của món đó, không tự ý thay đổi.'
+⭐ QUAN TRỌNG TUYỆT ĐỐI - YÊU CẦU NHẤT QUÁN MENU: Khi Medichat đưa ra gợi ý về một món ăn hoặc đồ uống, Medichat PHẢI TUÂN THỦ NGHIÊM NGẶT các quy tắc sau:
+   a. CHỈ GỢI Ý CÁC MÓN ĂN/ĐỒ UỐNG CÓ TRONG DANH SÁCH ĐƯỢC CUNG CẤP: Medichat TUYỆT ĐỐI KHÔNG ĐƯỢC tự tạo ra món ăn/đồ uống mới ngoài danh sách recipes và beverages đã cung cấp.
+   b. SỬ DỤNG CHÍNH XÁC NGUYÊN LIỆU TỪ DATABASE: Khi gợi ý một món từ danh sách, Medichat PHẢI trích xuất và sử dụng CHÍNH XÁC danh sách nguyên liệu từ trường ingredients_summary (đối với món ăn) hoặc tên sản phẩm (đối với đồ uống) được cung cấp.
+   c. KHÔNG TỰ Ý THAY ĐỔI NGUYÊN LIỆU: Medichat TUYỆT ĐỐI KHÔNG ĐƯỢC thay đổi, thêm bớt, hay suy diễn danh sách nguyên liệu. Phải giữ nguyên như dữ liệu được cung cấp.
+   d. ĐỊNH DẠNG TRÌNH BÀY CHUẨN: Trình bày danh sách nguyên liệu rõ ràng dưới dạng: **Nguyên liệu:** [nguyên liệu 1], [nguyên liệu 2], ...
+   e. ƯU TIÊN SỬ DỤNG DỮ LIỆU CÓ SẴN: Nếu có cả recipes và beverages, Medichat phải ưu tiên phân tích và chọn từ danh sách này trước khi bổ sung kiến thức bên ngoài.
+   f. Prompt bạn (Gemini) tạo ra cho Medichat PHẢI chứa chỉ dẫn rõ ràng: 'Bạn PHẢI chỉ gợi ý các món ăn/đồ uống có trong danh sách được cung cấp và sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary, không tự tạo ra món mới hay thay đổi nguyên liệu.'
 
 - Khi suggest_general=True VÀ có recipe_section hoặc beverage_section:
-  + Hướng dẫn Medichat xem xét kỹ TẤT CẢ các món ăn trong recipe_section và TẤT CẢ đồ uống trong beverage_section
-  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có) để xem item nào khớp nhất với các tiêu chí gợi ý chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít dị ứng, dễ làm)
-  + Yêu cầu Medichat xem xét TẤT CẢ items trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có). Chọn ra 2-3 items đáp ứng tốt nhất các tiêu chí gợi ý chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít dị ứng, dễ làm). Giải thích và TRÌNH BÀY NGUYÊN LIỆU CHÍNH XÁC của chúng
-  + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý
-  + Chỉ khi danh sách không có đủ lựa chọn phù hợp, Medichat mới bổ sung bằng kiến thức của mình
-  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi muốn gợi ý đồ uống giải nhiệt. Hãy xem xét danh sách đồ uống sau và chọn 2-3 loại phù hợp nhất với tiêu chí phổ biến, dễ làm, ít dị ứng: [Nước ép Xoài (ID:B1), Trà Chanh (ID:B2)]. Liệt kê thành phần chính xác cho mỗi loại được chọn theo định dạng 'Nguyên liệu: ...'. Khi bạn gợi ý một món từ danh sách được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm, không tự ý thay đổi."
+  + Hướng dẫn Medichat PHẢI ƯU TIÊN TUYỆT ĐỐI các món ăn trong recipe_section và đồ uống trong beverage_section
+  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG để chọn ra 2-3 items phù hợp nhất với tiêu chí gợi ý chung
+  + ⭐ QUAN TRỌNG NHẤT QUÁN: Medichat CHỈ ĐƯỢC chọn từ danh sách được cung cấp và PHẢI sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary
+  + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý, sử dụng ĐÚNG dữ liệu từ database
+  + TUYỆT ĐỐI KHÔNG ĐƯỢC bổ sung món ăn/đồ uống ngoài danh sách đã cung cấp
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi muốn gợi ý đồ uống giải nhiệt. Hãy chỉ chọn từ danh sách đồ uống sau: [Nước ép Xoài (ID:B1), Trà Chanh (ID:B2)]. Chọn 2-3 loại phù hợp nhất và sử dụng CHÍNH XÁC thành phần từ database. Bạn PHẢI chỉ gợi ý các món có trong danh sách và sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary, không tự tạo ra món mới hay thay đổi nguyên liệu."
 
 - Khi KHÔNG phải suggest_general=True (người dùng có yêu cầu cụ thể) VÀ có recipe_section hoặc beverage_section:
-  + Tạo prompt hướng dẫn Medichat PHẢI ƯU TIÊN SỬ DỤNG và phân tích TẤT CẢ các món ăn từ recipe_section và/hoặc TẤT CẢ đồ uống từ beverage_section
-  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có) để xem item nào khớp nhất với yêu cầu của người dùng (về sức khỏe, sở thích). Sau đó, chọn ra 2-3 item phù hợp nhất, giải thích lý do, và TRÌNH BÀY NGUYÊN LIỆU CHÍNH XÁC của chúng
-  + Medichat phải đánh giá từng item xem có phù hợp với yêu cầu CỤ THỂ của người dùng không (về tình trạng sức khỏe, sở thích)
-  + Yêu cầu Medichat giải thích chi tiết tại sao chúng phù hợp hoặc không phù hợp, và đưa ra gợi ý điều chỉnh nếu cần
-  + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý
-  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi bị tiểu đường. Từ danh sách sau: [Canh bí đao (ID:R1, Nguyên liệu: bí đao, thịt nạc, hành), Gà kho gừng (ID:R2, Nguyên liệu: gà ta, gừng, nước mắm, đường)], món nào tốt nhất cho tôi? Hãy giải thích và liệt kê CHÍNH XÁC nguyên liệu cho món bạn chọn theo định dạng 'Nguyên liệu: ...'. Khi bạn gợi ý một món từ danh sách được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu đi kèm, không tự ý thay đổi."
+  + Tạo prompt hướng dẫn Medichat PHẢI CHỈ SỬ DỤNG các món ăn từ recipe_section và/hoặc đồ uống từ beverage_section
+  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH để xem item nào khớp nhất với yêu cầu của người dùng, sau đó chọn ra 2-3 item phù hợp nhất
+  + ⭐ QUAN TRỌNG NHẤT QUÁN: Medichat CHỈ ĐƯỢC chọn từ danh sách được cung cấp và PHẢI sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary
+  + Medichat phải đánh giá từng item và giải thích chi tiết tại sao chúng phù hợp với yêu cầu cụ thể của người dùng
+  + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý, sử dụng ĐÚNG dữ liệu từ database
+  + TUYỆT ĐỐI KHÔNG ĐƯỢC tự tạo ra món ăn/đồ uống mới ngoài danh sách
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi bị tiểu đường. Từ danh sách sau: [Canh bí đao (ID:R1, Nguyên liệu: bí đao, thịt nạc, hành), Gà kho gừng (ID:R2, Nguyên liệu: gà ta, gừng, nước mắm, đường)], món nào tốt nhất cho tôi? Hãy chỉ chọn từ danh sách này và sử dụng CHÍNH XÁC nguyên liệu đã cho. Bạn PHẢI chỉ gợi ý các món có trong danh sách và sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary, không tự tạo ra món mới hay thay đổi nguyên liệu."
 
 - Khi có cả món ăn và đồ uống từ database:
-  + Tạo prompt yêu cầu Medichat phân tích TẤT CẢ items từ cả recipe_section và beverage_section
+  + Tạo prompt yêu cầu Medichat CHỈ ĐƯỢC phân tích và chọn từ recipe_section và beverage_section được cung cấp
   + Medichat phải đưa ra gợi ý kết hợp hài hòa từ cả hai danh sách, đảm bảo phù hợp với yêu cầu/tình trạng sức khỏe
-  + ⭐ QUAN TRỌNG: Medichat phải sử dụng CHÍNH XÁC nguyên liệu từ trường 'Nguyên liệu' của từng món trong danh sách, KHÔNG ĐƯỢC tự tạo ra nguyên liệu khác
-  + Ưu tiên sử dụng dữ liệu có sẵn trước khi bổ sung kiến thức bên ngoài
+  + ⭐ QUAN TRỌNG NHẤT QUÁN: Medichat CHỈ ĐƯỢC chọn từ danh sách được cung cấp và PHẢI sử dụng CHÍNH XÁC nguyên liệu từ trường ingredients_summary
+  + TUYỆT ĐỐI KHÔNG ĐƯỢC tự tạo ra món ăn/đồ uống mới hoặc thay đổi nguyên liệu
+  + KHÔNG ĐƯỢC bổ sung kiến thức bên ngoài - chỉ sử dụng dữ liệu có sẵn trong danh sách
 
 4. Giới hạn:
 - TOÀN BỘ prompt kết quả CHO MEDICHAT PHẢI DƯỚI {word_limit} TỪ.
@@ -816,12 +843,14 @@ YÊU CẦU TẠO PROMPT CHO MEDICHAT:
 - KHÔNG ĐƯỢC BỎ QUA: Điều này giúp người dùng biết chính xác cần mua gì để thực hiện món ăn được gợi ý
 - PROMPT CHO MEDICHAT PHẢI BAO GỒM: "Hãy sử dụng CHÍNH XÁC nguyên liệu từ danh sách recipes được cung cấp, không tự tạo ra nguyên liệu khác"
 
-🚨 LƯU Ý QUAN TRỌNG KHI TẠO PROMPT CHO MEDICHAT:
-Prompt bạn tạo ra PHẢI chứa câu yêu cầu rõ ràng về nguyên liệu, ví dụ:
-- "Hãy sử dụng CHÍNH XÁC nguyên liệu từ trường 'Nguyên liệu' của từng món trong danh sách"
-- "KHÔNG ĐƯỢC tự tạo ra hoặc thay đổi nguyên liệu, phải dùng đúng như trong database" 
+🚨 LƯU Ý QUAN TRỌNG NHẤT - YÊU CẦU NHẤT QUÁN MENU:
+Prompt bạn tạo ra PHẢI chứa các câu yêu cầu NGHIÊM NGẶT sau:
+- "Bạn CHỈ ĐƯỢC gợi ý các món ăn/đồ uống có trong danh sách được cung cấp"
+- "TUYỆT ĐỐI KHÔNG ĐƯỢC tự tạo ra món ăn/đồ uống mới ngoài danh sách"
+- "Hãy sử dụng CHÍNH XÁC nguyên liệu từ trường 'ingredients_summary' của từng món trong danh sách"
+- "KHÔNG ĐƯỢC tự tạo ra hoặc thay đổi nguyên liệu, phải dùng đúng như trong database"
 - "Bao gồm danh sách nguyên liệu CHỈ THEO ĐÚNG thông tin đã cung cấp"
-- "Khi bạn gợi ý một món từ danh sách công thức/đồ uống được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm trong trường 'Nguyên liệu:' của món đó, không tự ý thay đổi."
+- "Khi bạn gợi ý một món từ danh sách, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu từ trường 'ingredients_summary', không tự ý thay đổi hay bổ sung."
 
 CHỈ TRẢ VỀ PHẦN PROMPT ĐÃ ĐƯỢC TÓM TẮT VÀ TỐI ƯU HÓA CHO MEDICHAT, KHÔNG BAO GỒM BẤT KỲ LỜI GIẢI THÍCH HAY TIÊU ĐỀ NÀO KHÁC.
 PROMPT KẾT QUẢ (DƯỚI {word_limit} TỪ):"""
@@ -1090,58 +1119,42 @@ CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def create_product_search_prompt(self, medichat_response: str, recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None) -> str:
         """
-        Tạo prompt cho product_find_tool từ phản hồi medichat, recipes và beverages.
-        Gemini sẽ đóng vai trò Kỹ sư AI Trích xuất Thông tin Chính xác để tập trung VÀO 
-        GỢI Ý CUỐI CÙNG của Medichat và phân biệt rõ món ăn/đồ uống.
+        Tạo prompt cho product_find_tool dựa trên NGUYÊN LIỆU CỤ THỂ của các món ăn/đồ uống 
+        ĐÃ ĐƯỢC CHỌN VÀ SẼ HIỂN THỊ CHO NGƯỜI DÙNG từ state['recipe_results'] và state['beverage_results'].
         
         Args:
-            medichat_response: Phản hồi từ medichat
-            recipes: Danh sách recipes mà Medichat có thể đã tham khảo (nếu có)
-            beverages: Danh sách beverages mà Medichat có thể đã tham khảo (nếu có)
+            medichat_response: Phản hồi từ medichat (đã được polish và nhất quán với recipes/beverages)
+            recipes: Danh sách recipes đã được lọc và chọn trong chat_flow.py
+            beverages: Danh sách beverages đã được lọc và chọn trong chat_flow.py
             
         Returns:
-            Query string tự nhiên để tìm sản phẩm/nguyên liệu CHỈ cho gợi ý cuối cùng
+            Query string tự nhiên để tìm sản phẩm/nguyên liệu cho các món đã được chọn
         """
         if not self.api_key:
-            # Fallback được cải thiện - tập trung vào phân tích medichat_response trước
+            # Fallback cải thiện - ưu tiên recipes và beverages đã được chọn
             ingredients = []
             dish_names = []
             beverage_names = []
             
-            # Trích xuất từ medichat_response trước (tập trung vào gợi ý cuối cùng)
-            response_lower = medichat_response.lower()
-            
-            # Tìm kiếm tên món ăn cụ thể từ recipes trong medichat_response
+            # Lấy trực tiếp từ recipes đã được chọn (ưu tiên cao nhất)
             if recipes:
-                for recipe in recipes[:3]:
+                for recipe in recipes:
                     recipe_name = recipe.get('name', '')
-                    if recipe_name and recipe_name.lower() in response_lower:
+                    if recipe_name:
                         dish_names.append(recipe_name)
-                        # Lấy nguyên liệu chi tiết từ recipes
-                        if 'ingredients_summary' in recipe:
-                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
+                    # Lấy nguyên liệu chi tiết từ ingredients_summary
+                    if 'ingredients_summary' in recipe:
+                        recipe_ingredients = [ing.strip() for ing in recipe['ingredients_summary'].split(',') if ing.strip()]
+                        ingredients.extend(recipe_ingredients)
             
-            # Tìm kiếm tên đồ uống từ beverages trong medichat_response
+            # Lấy trực tiếp từ beverages đã được chọn
             if beverages:
-                for beverage in beverages[:3]:
+                for beverage in beverages:
                     beverage_name = beverage.get('product_name', '')
-                    if beverage_name and beverage_name.lower() in response_lower:
+                    if beverage_name:
                         beverage_names.append(beverage_name)
             
-            # Nếu không tìm thấy tên món cụ thể, lấy từ recipes/beverages làm fallback
-            if not dish_names and not beverage_names:
-                if recipes:
-                    for recipe in recipes[:2]:
-                        if 'name' in recipe:
-                            dish_names.append(recipe['name'])
-                        if 'ingredients_summary' in recipe:
-                            ingredients.extend([ing.strip() for ing in recipe['ingredients_summary'].split(',')])
-                
-                if beverages:
-                    for beverage in beverages[:2]:
-                        if 'product_name' in beverage:
-                            beverage_names.append(beverage['product_name'])
-            
+            # Tạo danh sách nguyên liệu duy nhất
             unique_ingredients = list(set(ingredients))[:15]
             all_items = dish_names + beverage_names
             
@@ -1152,62 +1165,40 @@ CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
             elif unique_ingredients:
                 return f"Tôi cần mua các nguyên liệu sau: {', '.join(unique_ingredients)}."
             
-            # Fallback từ medichat_response với phân tích đơn giản
-            if "món" in response_lower or "nguyên liệu" in response_lower:
-                return "Tôi cần mua các nguyên liệu chính từ các món ăn đã được gợi ý."
-            
             return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
 
-        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TRÍCH XUẤT THÔNG TIN CHÍNH XÁC cho hệ thống Chatbot Y tế. Nhiệm vụ cụ thể của bạn là phân tích phản hồi tư vấn y tế để trích xuất thông tin mua sắm nguyên liệu một cách CHÍNH XÁC và HIỆU QUẢ CHỈ CHO CÁC GỢI Ý CUỐI CÙNG.
+        prompt = f"""Bạn là một KỸ SƯ AI CHUYÊN VỀ TRÍCH XUẤT NGUYÊN LIỆU cho hệ thống Chatbot Y tế. Nhiệm vụ của bạn là tạo ra một query mua sắm tự nhiên dựa trên NGUYÊN LIỆU CỤ THỂ của các món ăn/đồ uống ĐÃ ĐƯỢC CHỌN VÀ SẼ HIỂN THỊ CHO NGƯỜI DÙNG.
 
-### ĐÁNH GIÁ NGUỒN DỮ LIỆU:
+### NGUỒN DỮ LIỆU CHÍNH XÁC:
 
-**PHẢN HỒI TƯ VẤN TỪ MEDICHAT:**
+**PHẢN HỒI ĐÃ ĐƯỢC POLISH (nhất quán với recipes/beverages):**
 ```
 {medichat_response}
 ```
 
-**DANH SÁCH CÔNG THỨC MÀ MEDICHAT CÓ THỂ ĐÃ THAM KHẢO:**
-{json.dumps(recipes, ensure_ascii=False, indent=2) if recipes else "Không có danh sách công thức tham khảo kèm theo."}
+**DANH SÁCH CÔNG THỨC ĐÃ ĐƯỢC CHỌN VÀ SẼ LƯU VÀO DATABASE:**
+{json.dumps(recipes, ensure_ascii=False, indent=2) if recipes else "Không có công thức nào được chọn."}
 
-**DANH SÁCH ĐỒ UỐNG MÀ MEDICHAT CÓ THỂ ĐÃ THAM KHẢO:**
-{json.dumps(beverages, ensure_ascii=False, indent=2) if beverages else "Không có danh sách đồ uống tham khảo kèm theo."}
+**DANH SÁCH ĐỒ UỐNG ĐÃ ĐƯỢC CHỌN VÀ SẼ LƯU VÀO DATABASE:**
+{json.dumps(beverages, ensure_ascii=False, indent=2) if beverages else "Không có đồ uống nào được chọn."}
 
-### QUY TRÌNH TRÍCH XUẤT CHUYÊN NGHIỆP:
+### QUY TRÌNH TRÍCH XUẤT NGUYÊN LIỆU:
 
-🎯 **QUAN TRỌNG NHẤT - TẬP TRUNG VÀO GỢI Ý CUỐI CÙNG:**
+🎯 **NGUYÊN TẮC CHÍNH - SỬ DỤNG DỮ LIỆU ĐÃ ĐƯỢC CHỌN:**
 
-RÀ SOÁT KỸ PHẢN HỒI CỦA MEDICHAT. CHỈ XEM XÉT NHỮNG MÓN ĂN VÀ ĐỒ UỐNG MÀ MEDICHAT KHUYẾN NGHỊ TRỰC TIẾP CHO NGƯỜI DÙNG Ở PHẦN KẾT LUẬN HOẶC PHẦN GỢI Ý CHÍNH. 
+Bạn cần tạo query mua sắm dựa trên CHÍNH XÁC các món ăn/đồ uống trong DANH SÁCH ĐÃ ĐƯỢC CHỌN ở trên. Đây là những món đã được hệ thống lọc và sẽ được lưu vào database.
 
-**CÁC TRƯỜNG HỢP CỤ THỂ:**
-- Nếu Medichat liệt kê nhiều lựa chọn rồi chốt lại 2-3 món cuối cùng → CHỈ lấy nguyên liệu cho 2-3 món đó
-- Nếu Medichat nói "Tôi gợi ý bạn làm..." hoặc "Tôi khuyên bạn nên..." → CHỈ lấy nguyên liệu từ những món này
-- Nếu Medichat dùng từ "nên thử", "có thể làm", "phù hợp nhất" → CHỈ lấy nguyên liệu từ những món này
+**BƯỚC 1: TRÍCH XUẤT TÊN MÓN VÀ NGUYÊN LIỆU**
+- Từ DANH SÁCH CÔNG THỨC: Lấy tên món từ trường "name" và nguyên liệu từ trường "ingredients_summary"
+- Từ DANH SÁCH ĐỒ UỐNG: Lấy tên đồ uống từ trường "product_name"
+- KHÔNG cần phân tích phản hồi Medichat để tìm món - chỉ cần dùng danh sách đã cho
 
-**BỎ QUA HOÀN TOÀN:**
-- Các nguyên liệu/món ăn/đồ uống được nhắc đến trong quá trình so sánh, giải thích chung
-- Các ví dụ minh họa mà Medichat không khuyến nghị trực tiếp
-- Các nguyên liệu được đề cập trong phần phân tích hoặc lý thuyết nhưng không phải lựa chọn cuối cùng
+**BƯỚC 2: XÂY DỰNG DANH SÁCH NGUYÊN LIỆU HOÀN CHỈNH**
+- Từ mỗi recipe: Tách ingredients_summary thành danh sách nguyên liệu riêng biệt
+- Từ mỗi beverage: Sử dụng tên sản phẩm làm nguyên liệu chính
+- Loại bỏ trùng lặp và chuẩn hóa tên nguyên liệu
 
-**BƯỚC 1: XÁC ĐỊNH MÓN ĂN/ĐỒ UỐNG ĐƯỢC GỢI Ý CUỐI CÙNG**
-- Tìm các cụm từ chìa khóa: "gợi ý", "khuyên", "nên thử", "phù hợp nhất", "tôi đề xuất"
-- Đọc kỹ phần KẾT LUẬN/GỢI Ý CHÍNH của Medichat (thường ở cuối phản hồi)
-- Phân biệt rõ ràng: Đánh dấu từng item với type "food" hoặc "beverage"
-- Giới hạn tối đa 3-4 món được gợi ý thực sự để tránh phân tán
-
-**BƯỚC 2: THAM CHIẾU RECIPES VÀ BEVERAGES MỘT CÁCH CẨN THẬN**
-- CHỈ sử dụng thông tin từ recipes/beverages nếu Medichat THỰC SỰ GỢI Ý những món đó
-- Nếu Medichat đề cập đến một món ăn cụ thể có ID trong recipes đã cung cấp, hãy ưu tiên lấy danh sách nguyên liệu chi tiết từ recipes đó cho món ăn đó
-- Tương tự với beverages: CHỈ khi Medichat GỢI Ý đồ uống đó trong phần kết luận
-- Nếu Medichat chỉ gợi ý tên chung (ví dụ: "nước ép cam") mà không có ID cụ thể, trích xuất nguyên liệu cơ bản từ kiến thức thông thường
-
-**BƯỚC 3: TRÍCH XUẤT VÀ PHÂN LOẠI NGUYÊN LIỆU**
-- Từ phản hồi Medichat: Thu thập nguyên liệu được đề cập trực tiếp trong phần gợi ý cuối cùng
-- Từ `recipes` (nếu Medichat tham chiếu): CHỈ lấy nguyên liệu từ các món ăn được Medichat GỢI Ý CUỐI CÙNG
-- Từ `beverages` (nếu Medichat tham chiếu): CHỈ lấy thành phần chính từ các đồ uống được Medichat GỢI Ý CUỐI CÙNG
-- Phân biệt: food ingredients vs beverage ingredients trong quá trình tư duy nhưng kết hợp trong kết quả cuối
-
-**BƯỚC 4: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
+**BƯỚC 3: LÀM SẠCH VÀ CHUẨN HÓA NGUYÊN LIỆU**
 - **Loại bỏ nguyên liệu quá chung chung:** "gia vị", "nước lọc", "dầu ăn" (trừ khi cụ thể như "dầu oliu", "muối hạt")
 - **Chuẩn hóa tên gọi:** 
   + "Hành cây", "Hành lá" → "Hành lá"
@@ -1215,34 +1206,20 @@ RÀ SOÁT KỸ PHẢN HỒI CỦA MEDICHAT. CHỈ XEM XÉT NHỮNG MÓN ĂN VÀ 
   + "Cà chua bi", "Cà chua" → "Cà chua"
 - **Tạo danh sách duy nhất:** Loại bỏ trùng lặp, giữ tối đa 15-20 nguyên liệu quan trọng nhất
 
-### CẤU TRÚC JSON TRUNG GIAN MONG MUỐN:
-
-Trước khi tạo query string, hãy tạo một JSON để tổ chức thông tin (chỉ suy nghĩ trong đầu, không xuất ra):
-
-```json
-{{
-  "suggested_items": [
-    {{"item_name": "Canh chua cá lóc", "type": "food", "ingredients": ["cá lóc", "me", "cà chua", "dứa"]}},
-    {{"item_name": "Nước ép dưa hấu", "type": "beverage", "ingredients": ["dưa hấu", "đường (tùy chọn)"]}}
-  ],
-  "combined_unique_ingredients_for_shopping": ["cá lóc", "me", "cà chua", "dứa", "dưa hấu", "đường"]
-}}
-```
-
-**BƯỚC 5: TẠO QUERY MUA SẮM TỰ NHIÊN**
-Dựa trên combined_unique_ingredients_for_shopping và suggested_items, hãy tạo một YÊU CẦU MUA SẮM tự nhiên, ngắn gọn.
+**BƯỚC 4: TẠO QUERY MUA SẮM TỰ NHIÊN**
+Dựa trên danh sách món ăn/đồ uống và nguyên liệu đã trích xuất, tạo một YÊU CẦU MUA SẮM tự nhiên, ngắn gọn.
 
 ### VÍ DỤ HOÀN CHỈNH:
 
 **Input:**
-- Medichat: "Tôi gợi ý bạn làm canh chua cá lóc và uống nước ép dưa hấu. Canh chua giúp giải nhiệt với cá lóc, me, cà chua. Dưa hấu rất tốt để bù nước."
 - Recipes: [{{"name": "Canh chua cá lóc", "ingredients_summary": "cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ"}}]
+- Beverages: [{{"product_name": "Nước ép dưa hấu"}}]
 
 **Output mong đợi:**
 "Tôi cần mua nguyên liệu để nấu Canh chua cá lóc và làm Nước ép dưa hấu, bao gồm: cá lóc, me cây, cà chua, dứa, đậu bắp, giá đỗ, dưa hấu."
 
 ### YÊU CẦU CUỐI CÙNG:
-CHỈ TRẢ VỀ ĐOẠN VĂN BẢN YÊU CẦU MUA SẮM NGẮN GỌN (1-2 CÂU). KHÔNG TRẢ VỀ JSON TRUNG GIAN, KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG THÊM METADATA.
+CHỈ TRẢ VỀ ĐOẠN VĂN BẢN YÊU CẦU MUA SẮM NGẮN GỌN (1-2 CÂU). KHÔNG TRẢ VỀ JSON, KHÔNG GIẢI THÍCH QUÁ TRÌNH, KHÔNG THÊM METADATA.
 
 YÊU CẦU MUA SẮM:"""
 
@@ -1343,7 +1320,7 @@ YÊU CẦU MUA SẮM:"""
             return "Tôi cần mua nguyên liệu để nấu ăn theo tư vấn dinh dưỡng."
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    async def create_enhanced_medichat_prompt(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False) -> str:
+    async def create_enhanced_medichat_prompt(self, messages: List[Dict[str, str]], recipes: List[Dict[str, Any]] = None, beverages: List[Dict[str, Any]] = None, suggest_general: bool = False, current_summary: Optional[str] = None) -> str:
         """
         Tạo prompt nâng cao cho Medichat với recipes và beverages (nếu có) và khả năng gợi ý chung
         
@@ -1352,6 +1329,7 @@ YÊU CẦU MUA SẮM:"""
             recipes: Danh sách recipes từ database (nếu có)
             beverages: Danh sách beverages từ database (nếu có)
             suggest_general: True nếu cần Medichat gợi ý theo tiêu chí chung
+            current_summary: Tóm tắt cuộc trò chuyện từ lượt trước (nếu có)
             
         Returns:
             Prompt được tối ưu hóa cho Medichat
@@ -1364,8 +1342,8 @@ YÊU CẦU MUA SẮM:"""
             else:
                 return "Cần tư vấn dinh dưỡng và món ăn phù hợp."
         
-        # Tạo prompt template với recipes, beverages và suggest_general
-        prompt_template = self._create_medichat_prompt_template(messages, recipes, beverages, suggest_general)
+        # Tạo prompt template với recipes, beverages, suggest_general và current_summary
+        prompt_template = self._create_medichat_prompt_template(messages, recipes, beverages, suggest_general, current_summary)
         
         try:
             # Sử dụng thư viện Google hoặc HTTP API

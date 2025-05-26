@@ -72,17 +72,22 @@ class ChatService:
 
         # Bước 2: Lấy lịch sử chat TRƯỚC khi tin nhắn hiện tại được thêm
         chat_history_before_current_message = self.repository.get_messages(conversation_id)
+        
+        # ⭐ BƯỚC 2.5: Lấy tóm tắt từ lượt trước để tạo prompt tối ưu
+        previous_summary_for_prompt = self.repository.get_latest_summary(conversation_id)
         logger.info(f"🔄 Bắt đầu xử lý tin nhắn cho conversation_id={conversation_id}, user_id={user_id}")
+        logger.info(f"📝 Tóm tắt từ lượt trước: {'Có' if previous_summary_for_prompt else 'Không'} ({len(previous_summary_for_prompt or '')} ký tự)")
 
         try:
-            # Bước 3: Gọi LangGraph để xử lý logic chính
+            # Bước 3: Gọi LangGraph để xử lý logic chính với tóm tắt từ lượt trước
             langgraph_result = await run_chat_flow(
                 user_message=message_content,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 messages=chat_history_before_current_message,
                 repository=self.repository,
-                llm_service=self.llm_service
+                llm_service=self.llm_service,
+                previous_summary=previous_summary_for_prompt  # ⭐ TRUYỀN TÓM TẮT TỪ LƯỢT TRƯỚC
             )
             
             # Bước 4: Xử lý sản phẩm có sẵn nếu có menu được tạo
@@ -520,17 +525,22 @@ class ChatService:
 
         # Bước 2: Lấy lịch sử chat TRƯỚC khi tin nhắn hiện tại được thêm
         chat_history_before_current_message = self.repository.get_messages(conversation_id)
+        
+        # ⭐ BƯỚC 2.5: Lấy tóm tắt từ lượt trước để tạo prompt tối ưu
+        previous_summary_for_prompt = self.repository.get_latest_summary(conversation_id)
         logger.info(f"🔄 Bắt đầu xử lý tin nhắn với background DB cho conversation_id={conversation_id}, user_id={user_id}")
+        logger.info(f"📝 Tóm tắt từ lượt trước: {'Có' if previous_summary_for_prompt else 'Không'} ({len(previous_summary_for_prompt or '')} ký tự)")
 
         try:
-            # Bước 3: Gọi LangGraph để xử lý logic chính
+            # Bước 3: Gọi LangGraph để xử lý logic chính với tóm tắt từ lượt trước
             langgraph_result = await run_chat_flow(
                 user_message=message_content,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 messages=chat_history_before_current_message,
                 repository=self.repository,
-                llm_service=self.llm_service
+                llm_service=self.llm_service,
+                previous_summary=previous_summary_for_prompt  # ⭐ TRUYỀN TÓM TẮT TỪ LƯỢT TRƯỚC
             )
             
             # Bước 4: Chuẩn bị background tasks cho DB operations
