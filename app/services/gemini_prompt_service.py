@@ -602,7 +602,8 @@ Người dùng: {user_message}
      *   a) `is_valid_scope` là true, VÀ
      *   b) `is_food_related` là true (người dùng quan tâm đến món ăn/đồ uống), VÀ
      *   c) ( `user_rejected_info` là `true` (người dùng không muốn/không thể cung cấp thêm chi tiết về SỞ THÍCH/THÓI QUEN ĂN UỐNG CỤ THỂ)
-           HOẶC (thông tin về `dietary_habits`, `food_preferences`, `food_dislikes` trong `collected_info` là RẤT ÍT hoặc KHÔNG CÓ, VÀ người dùng không cung cấp thêm chi tiết khi được hỏi ở lượt trước) ), VÀ
+           HOẶC (thông tin về `dietary_habits`, `food_preferences`, `food_dislikes` trong `collected_info` là RẤT ÍT hoặc KHÔNG CÓ, VÀ người dùng không cung cấp thêm chi tiết khi được hỏi ở lượt trước)
+           HOẶC (query đơn giản và rõ ràng muốn gợi ý ngay lập tức như "thêm món chay đi", "gợi ý món chay", "món chay nào ngon", mà không có yêu cầu cụ thể) ), VÀ
      *   d) Thông tin về SỞ THÍCH CÁ NHÂN cụ thể (ngoài các điều kiện như "không cồn") là KHÔNG ĐỦ để cá nhân hóa sâu sắc gợi ý món ăn/đồ uống, **ngay cả khi đã biết các `health_condition`**.
      *Khi `suggest_general_options` là `true`, chatbot sẽ không hỏi thêm về sở thích chung nữa, mà sẽ đưa ra gợi ý dựa trên các tiêu chí phổ biến và các `health_condition` + `food_dislikes` (ví dụ "không cồn") đã biết.*
    - `need_more_info` (boolean):

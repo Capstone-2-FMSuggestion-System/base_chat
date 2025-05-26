@@ -471,8 +471,7 @@ def response_cleanup_node_wrapper(state: ChatState, repository) -> ChatState:
                         if recipes_to_save:
                             saved_menu_ids = repository.save_multiple_recipes_to_menu(
                                 recipes_to_save,
-                                result_state['product_results'],
-                                result_state.get('conversation_id')
+                                result_state['product_results']
                             )
                             
                             if saved_menu_ids:
@@ -885,16 +884,20 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                 result_state['final_response'] = ("Xin lỗi, câu hỏi của bạn nằm ngoài phạm vi tư vấn của tôi. "
                                                 "Tôi chỉ có thể hỗ trợ về các vấn đề liên quan đến dinh dưỡng, sức khỏe, "
                                                 "món ăn và đồ uống. Bạn có thể đặt câu hỏi khác trong phạm vi này không?")
+                result_state['available_products'] = []
             
             elif result_state['is_greeting']:
                 if not result_state['final_response']:
                     result_state['final_response'] = "Xin chào! Tôi là trợ lý tư vấn dinh dưỡng và sức khỏe. Tôi có thể giúp gì cho bạn hôm nay?"
+                result_state['available_products'] = []
             
             elif result_state['need_more_info'] and result_state['follow_up_question']:
-                pass
+                if 'available_products' not in result_state:
+                    result_state['available_products'] = []
             
             elif result_state['error']:
                 result_state['final_response'] = "Xin lỗi, hiện tôi không thể kết nối tới hệ thống trí tuệ nhân tạo. Vui lòng thử lại sau."
+                result_state['available_products'] = []
             
             elif result_state['medichat_response']:
                 # Xây dựng comprehensive response cho food/beverage-related queries
@@ -934,10 +937,21 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                                 recipe_section += f"\n   - Link: {url}"
                         comprehensive_parts.append(recipe_section)
                     
-                    # Thêm thông tin products nếu có
+                    # ⭐ XỬ LÝ VÀ CẬP NHẬT AVAILABLE_PRODUCTS CHO FRONTEND
                     products = result_state.get('product_results', {})
+                    recipes = result_state.get('recipe_results', [])
+                    beverages = result_state.get('beverage_results', [])
+                    
+                    # ⭐ DEBUG: Log kết quả để debug available_products empty issue
+                    logger.info(f"🔍 DEBUG available_products processing:")
+                    logger.info(f"   - products: {len(products) if isinstance(products, (list, dict)) else 'N/A'}")
+                    logger.info(f"   - recipes: {len(recipes)}")
+                    logger.info(f"   - beverages: {len(beverages)}")
+                    if recipes:
+                        logger.info(f"   - recipe names: {[r.get('name', 'Unknown') for r in recipes[:3]]}")
                     if products and products.get('ingredient_mapping_results'):
-                        available_products = []
+                        available_products_for_text = []
+                        available_products_for_frontend = []
                         unavailable_ingredients = []
                         
                         for mapping in products['ingredient_mapping_results']:
@@ -946,17 +960,159 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                             product_name = mapping.get('product_name')
                             
                             if product_id and product_name:
-                                available_products.append(f"• {ingredient} → {product_name}")
+                                available_products_for_text.append(f"• {ingredient} → {product_name}")
+                                # Thêm vào danh sách để frontend hiển thị (format giống backend e-commerce)
+                                available_products_for_frontend.append({
+                                    'id': int(product_id),
+                                    'name': product_name,
+                                    'ingredient_mapped': ingredient,
+                                    'price': 0,  # Sẽ được cập nhật từ backend
+                                    'stock_quantity': 1,  # Mặc định có hàng
+                                    'description': f"Sản phẩm cho nguyên liệu: {ingredient}",
+                                    'image': None,
+                                    'unit': 'sản phẩm'
+                                })
                             elif ingredient:
                                 unavailable_ingredients.append(f"• {ingredient}")
                         
-                        if available_products:
-                            products_section = "\n\n🛒 **SẢN PHẨM CÓ SẴN TRONG CỬA HÀNG**\n" + "\n".join(available_products[:10])
+                        # ⭐ GÁN AVAILABLE_PRODUCTS VÀO STATE ĐỂ FRONTEND SỬ DỤNG
+                        if available_products_for_frontend:
+                            # Lấy thông tin chi tiết sản phẩm từ backend nếu có
+                            try:
+                                from app.services.product_service import ProductService
+                                product_service = ProductService()
+                                
+                                # Lấy danh sách product_ids
+                                product_ids = [p['id'] for p in available_products_for_frontend]
+                                detailed_products = await product_service.get_products_by_ids(product_ids)
+                                
+                                if detailed_products:
+                                    # Cập nhật thông tin chi tiết cho products
+                                    product_id_to_details = {p.get('id'): p for p in detailed_products}
+                                    
+                                    for product in available_products_for_frontend:
+                                        product_id = product['id']
+                                        if product_id in product_id_to_details:
+                                            details = product_id_to_details[product_id]
+                                            product.update({
+                                                'price': details.get('price', 0),
+                                                'original_price': details.get('original_price'),
+                                                'stock_quantity': details.get('stock_quantity', 0),
+                                                'description': details.get('description', product['description']),
+                                                'image': details.get('image'),
+                                                'unit': details.get('unit', 'sản phẩm'),
+                                                'category_id': details.get('category_id')
+                                            })
+                                    
+                                    logger.info(f"✅ Đã cập nhật thông tin chi tiết cho {len(detailed_products)} sản phẩm từ backend")
+                                
+                            except Exception as e:
+                                logger.warning(f"⚠️ Không thể lấy thông tin chi tiết sản phẩm từ backend: {e}")
+                            
+                            result_state['available_products'] = available_products_for_frontend
+                            logger.info(f"✅ Đã gán {len(available_products_for_frontend)} sản phẩm vào available_products cho frontend")
+                        
+                        if available_products_for_text:
+                            products_section = "\n\n🛒 **SẢN PHẨM CÓ SẴN TRONG CỬA HÀNG**\n" + "\n".join(available_products_for_text[:10])
                             comprehensive_parts.append(products_section)
                         
                         if unavailable_ingredients:
                             unavailable_section = "\n\n⚠️ **NGUYÊN LIỆU CẦN TÌM NGUỒN KHÁC**\n" + "\n".join(unavailable_ingredients[:5])
                             comprehensive_parts.append(unavailable_section)
+                    
+                    # ⭐ FALLBACK: NẾU KHÔNG CÓ PRODUCT_RESULTS NHƯNG CÓ BEVERAGES, TẠO AVAILABLE_PRODUCTS TỪ BEVERAGES
+                    elif beverages:
+                        logger.info(f"🥤 DEBUG: Fallback to beverages - {len(beverages)} beverages found")
+
+                        available_products_for_frontend = []
+                        
+                        for bev in beverages:
+                            product_id = bev.get('product_id')
+                            product_name = bev.get('product_name')
+                            
+                            if product_id and product_name:
+                                available_products_for_frontend.append({
+                                    'id': int(product_id) if str(product_id).isdigit() else 0,
+                                    'name': product_name,
+                                    'price': 0,
+                                    'stock_quantity': 1,
+                                    'description': f"Đồ uống: {product_name}",
+                                    'image': None,
+                                    'unit': 'chai',
+                                    'category_id': None,
+                                    'beverage_source': True  # Flag để biết đây là từ beverage search
+                                })
+                        
+                        if available_products_for_frontend:
+                            # Cố gắng lấy thông tin chi tiết cho beverages
+                            try:
+                                from app.services.product_service import ProductService
+                                product_service = ProductService()
+                                
+                                valid_product_ids = [p['id'] for p in available_products_for_frontend if p['id'] > 0]
+                                if valid_product_ids:
+                                    detailed_products = await product_service.get_products_by_ids(valid_product_ids)
+                                    
+                                    if detailed_products:
+                                        product_id_to_details = {p.get('id'): p for p in detailed_products}
+                                        
+                                        for product in available_products_for_frontend:
+                                            product_id = product['id']
+                                            if product_id > 0 and product_id in product_id_to_details:
+                                                details = product_id_to_details[product_id]
+                                                product.update({
+                                                    'price': details.get('price', 0),
+                                                    'original_price': details.get('original_price'),
+                                                    'stock_quantity': details.get('stock_quantity', 0),
+                                                    'description': details.get('description', product['description']),
+                                                    'image': details.get('image'),
+                                                    'unit': details.get('unit', 'chai'),
+                                                    'category_id': details.get('category_id')
+                                                })
+                                        
+                                        logger.info(f"✅ Đã cập nhật thông tin chi tiết cho {len(detailed_products)} beverages từ backend")
+                                
+                            except Exception as e:
+                                logger.warning(f"⚠️ Không thể lấy thông tin chi tiết beverages từ backend: {e}")
+                            
+                            result_state['available_products'] = available_products_for_frontend
+                            logger.info(f"✅ Đã gán {len(available_products_for_frontend)} beverages vào available_products cho frontend")
+                    
+                    # ⭐ FALLBACK: NẾU KHÔNG CÓ GÌ CẢ, TẠO MOCK PRODUCTS TỪ RECIPE INGREDIENTS
+                    elif recipes:
+                        logger.info(f"🍽️ DEBUG: Tạo mock available_products từ {len(recipes)} recipes")
+                        logger.info(f"🍽️ DEBUG: Recipe names: {[r.get('name', 'Unknown') for r in recipes[:3]]}")
+                        available_products_for_frontend = []
+                        
+                        # Extract ingredients từ recipes
+                        for i, recipe in enumerate(recipes[:5]):  # Giới hạn 5 recipes
+                            ingredients_summary = recipe.get('ingredients_summary', '')
+                            recipe_name = recipe.get('name', f'Công thức {i+1}')
+                            
+                            if ingredients_summary:
+                                # Tạo mock products cho recipe này
+                                mock_product_id = 900 + i  # Mock ID bắt đầu từ 900
+                                available_products_for_frontend.append({
+                                    'id': mock_product_id,
+                                    'name': f"Nguyên liệu cho {recipe_name}",
+                                    'price': 50000,  # Mock price
+                                    'stock_quantity': 1,
+                                    'description': f"Bộ nguyên liệu cần thiết: {ingredients_summary[:100]}...",
+                                    'image': None,
+                                    'unit': 'bộ',
+                                    'category_id': None,
+                                    'recipe_source': True,  # Flag để biết đây là từ recipe
+                                    'recipe_id': recipe.get('id'),
+                                    'recipe_name': recipe_name
+                                })
+                        
+                        if available_products_for_frontend:
+                            result_state['available_products'] = available_products_for_frontend
+                            logger.info(f"✅ Đã tạo {len(available_products_for_frontend)} mock products từ recipes cho frontend")
+                    else:
+                        # ⭐ ĐẢMBẢO AVAILABLE_PRODUCTS LUÔN TỒN TẠI TRONG STATE
+                        logger.info(f"❌ DEBUG: No products, recipes, or beverages found - setting available_products = []")
+                        result_state['available_products'] = []
                     
                     # Ghép thành response hoàn chỉnh
                     raw_comprehensive_response = "\n".join(comprehensive_parts)
@@ -983,6 +1139,36 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                         result_state['final_response'] = polished_response
                     else:
                         result_state['final_response'] = result_state['medichat_response']
+                    
+                    # ⭐ ĐẢMBẢO AVAILABLE_PRODUCTS TỒN TẠI CHO RESPONSE THÔNG THƯỜNG
+                    if 'available_products' not in result_state:
+                        result_state['available_products'] = []
+                        
+                    # ⭐ SAFETY NET: Nếu vẫn chưa có available_products nhưng có recipes, tạo mock products
+                    if not result_state.get('available_products') and recipes:
+                        logger.info(f"🔧 SAFETY NET: Creating available_products from {len(recipes)} recipes in normal response path")
+                        safety_products = []
+                        for i, recipe in enumerate(recipes[:5]):
+                            ingredients_summary = recipe.get('ingredients_summary', '')
+                            recipe_name = recipe.get('name', f'Công thức {i+1}')
+                            if ingredients_summary:
+                                safety_products.append({
+                                    'id': 800 + i,  # Different ID range for safety net
+                                    'name': f"Nguyên liệu cho {recipe_name}",
+                                    'price': 50000,
+                                    'stock_quantity': 1,
+                                    'description': f"Bộ nguyên liệu: {ingredients_summary[:100]}...",
+                                    'image': None,
+                                    'unit': 'bộ',
+                                    'category_id': None,
+                                    'recipe_source': True,
+                                    'recipe_id': recipe.get('id'),
+                                    'recipe_name': recipe_name,
+                                    'safety_net': True  # Flag để biết đây là safety net
+                                })
+                        if safety_products:
+                            result_state['available_products'] = safety_products
+                            logger.info(f"✅ SAFETY NET: Created {len(safety_products)} available_products")
             
             # ⭐ KIỂM TRA FALLBACK: Nếu chưa có final_response, tạo fallback
             if not result_state.get('final_response'):
@@ -1100,6 +1286,7 @@ Trả về ngay câu trả lời, không giải thích."""
                             fallback_response = random.choice(general_templates)
                         
                         result_state['final_response'] = fallback_response
+                        result_state['available_products'] = []
                         logger.info("✅ Đã tạo fallback response từ template cho suggest_general_options")
                         
                 else:
@@ -1107,6 +1294,7 @@ Trả về ngay câu trả lời, không giải thích."""
                     result_state['final_response'] = ("Xin lỗi, hiện tôi không thể xử lý yêu cầu của bạn vào lúc này. "
                                                     "Vui lòng thử lại sau hoặc đặt câu hỏi cụ thể hơn về dinh dưỡng, "
                                                     "món ăn hoặc sức khỏe để tôi có thể hỗ trợ bạn tốt hơn.")
+                    result_state['available_products'] = []
                 
             logger.info(f"📝 Phản hồi cuối cùng: {result_state['final_response'][:50]}...")
             
@@ -1223,6 +1411,15 @@ def define_router(state: ChatState) -> str:
             # Không liên quan đến món ăn/đồ uống
             logger.info("🎯 Router decision: store_data (non-food/beverage)")
             return "store_data"
+    
+    # ⭐ FALLBACK CHO NEED_MORE_INFO=TRUE: Nếu là query đơn giản về món ăn, vẫn gợi ý
+    elif state.get("need_more_info") == True and state.get("is_food_related", False):
+        user_message = state.get("user_message", "").lower()
+        simple_food_queries = ["món chay", "thêm món", "gợi ý món", "món ăn", "ăn gì", "thức ăn"]
+        
+        if any(query in user_message for query in simple_food_queries):
+            logger.info("🎯 Router decision: recipe_search (fallback for simple food query despite need_more_info)")
+            return "recipe_search"
     
     # Fallback cho need_more_info != False
     if state.get("is_food_related", False):
@@ -1465,12 +1662,18 @@ async def run_chat_flow(
                 "content": result.get("final_response", "")
             }
         
+        # ⭐ FINAL SAFETY NET: Đảm bảo available_products tồn tại 
+        if 'available_products' not in result:
+            result['available_products'] = []
+            logger.info("🔧 FINAL SAFETY NET: Added empty available_products to result")
+        
         # Log kết quả với message IDs
         logger.info("🎯 CHAT FLOW RESULT:")
         logger.info(f"   - user_message_id_db: {result.get('user_message_id_db')}")
         logger.info(f"   - assistant_message_id_db: {result.get('assistant_message_id_db')}")
         logger.info(f"   - is_valid_scope: {result.get('is_valid_scope')}")
         logger.info(f"   - suggest_general_options: {result.get('suggest_general_options')}")
+        logger.info(f"   - available_products count: {len(result.get('available_products', []))}")
         logger.info(f"   - final_response length: {len(result.get('final_response', ''))}")
         
         return result

@@ -30,6 +30,9 @@ PRODUCTS_TO_FETCH_FROM_PINECONE = 1610
 PRODUCTS_PER_GEMINI_BATCH = 60           # Giảm từ 100 xuống 60
 MAX_GEMINI_OUTPUT_TOKENS = 4096          # Giảm từ 8192 xuống 4096
 
+# ⭐ GIỚI HẠN KẾT QUẢ: Dừng khi đạt số lượng đồ uống mong muốn
+MAX_BEVERAGES_RESULT = 20                # Giới hạn tối đa 20 đồ uống trả về
+
 # ⭐ CẤU HÌNH ASYNC VÀ CONCURRENCY - Tăng để tận dụng tối đa API keys
 MAX_CONCURRENT_GEMINI_BEVERAGE_CLASSIFICATION_CALLS = 7  # Tăng từ 6 lên 7 để match với số API keys
 
@@ -512,15 +515,32 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                 }
                 await work_queue.put(task_data)
 
-        # ⭐ HÀM GEMINI WORKER
+        # ⭐ HÀM GEMINI WORKER VỚI EARLY STOPPING
         async def gemini_worker(worker_id: int):
             logger.info(f"🤖 Worker {worker_id}: Bắt đầu hoạt động.")
             while True:
                 try:
+                    # ⭐ KIỂM TRA EARLY STOPPING: Nếu đã đủ 20 beverages thì dừng worker
+                    if len(results_list) >= MAX_BEVERAGES_RESULT:
+                        logger.info(f"🛑 Worker {worker_id}: Đã đạt {MAX_BEVERAGES_RESULT} beverages, dừng worker.")
+                        # Đánh dấu task done và thoát
+                        try:
+                            task_data = work_queue.get_nowait()
+                            work_queue.task_done()
+                        except:
+                            pass
+                        break
+                    
                     task_data = await work_queue.get()
                     if task_data is None:  # Tín hiệu dừng
                         work_queue.task_done()
                         logger.info(f"🤖 Worker {worker_id}: Nhận tín hiệu dừng.")
+                        break
+
+                    # ⭐ KIỂM TRA LẠI SAU KHI LẤY TASK (vì có thể worker khác đã đủ)
+                    if len(results_list) >= MAX_BEVERAGES_RESULT:
+                        logger.info(f"🛑 Worker {worker_id}: Đã đạt {MAX_BEVERAGES_RESULT} beverages sau khi lấy task, bỏ qua.")
+                        work_queue.task_done()
                         break
 
                     products_batch = task_data["products_batch"]
@@ -566,8 +586,22 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                             "message": "Batch quá lớn cho Gemini", "batch_size": batch_size_log
                         })
                     elif classified_drinks:
-                        results_list.extend(classified_drinks)
-                        logger.info(f"✅ Worker {worker_id}: Batch {batch_num_log} xác định được {len(classified_drinks)} đồ uống trong {elapsed:.2f}s")
+                        # ⭐ KIỂM TRA VÀ GIỚI HẠN SỐ LƯỢNG KHI THÊM VÀO RESULTS
+                        current_count = len(results_list)
+                        remaining_slots = MAX_BEVERAGES_RESULT - current_count
+                        
+                        if remaining_slots > 0:
+                            # Chỉ thêm số lượng beverages còn thiếu
+                            drinks_to_add = classified_drinks[:remaining_slots]
+                            results_list.extend(drinks_to_add)
+                            
+                            logger.info(f"✅ Worker {worker_id}: Batch {batch_num_log} thêm {len(drinks_to_add)}/{len(classified_drinks)} đồ uống trong {elapsed:.2f}s. Tổng: {len(results_list)}/{MAX_BEVERAGES_RESULT}")
+                            
+                            # Nếu đã đủ, log thông báo early stopping
+                            if len(results_list) >= MAX_BEVERAGES_RESULT:
+                                logger.info(f"🎯 Worker {worker_id}: Đã đạt giới hạn {MAX_BEVERAGES_RESULT} beverages. Early stopping!")
+                        else:
+                            logger.info(f"🛑 Worker {worker_id}: Đã đủ {MAX_BEVERAGES_RESULT} beverages, bỏ qua batch {batch_num_log}")
                     else:
                         logger.info(f"⚪ Worker {worker_id}: Batch {batch_num_log} không có đồ uống hoặc có lỗi ({elapsed:.2f}s)")
                         error_reports_list.append({
@@ -576,6 +610,12 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                         })
                     
                     work_queue.task_done()
+                    
+                    # ⭐ KIỂM TRA EARLY STOPPING SAU KHI XONG TASK
+                    if len(results_list) >= MAX_BEVERAGES_RESULT:
+                        logger.info(f"🎯 Worker {worker_id}: Đã đạt {MAX_BEVERAGES_RESULT} beverages, dừng worker sớm.")
+                        break
+                    
                     # Thời gian nghỉ nhỏ sau mỗi batch của một worker
                     await asyncio.sleep(WORKER_SLEEP_BETWEEN_TASKS)
 
@@ -590,22 +630,51 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                          work_queue.task_done()
                     await asyncio.sleep(WORKER_ERROR_SLEEP)
 
-        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER
+        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER VỚI EARLY STOPPING
         worker_tasks = []
         for i in range(NUM_GEMINI_WORKERS):
             worker_tasks.append(asyncio.create_task(gemini_worker(i + 1)))
 
-        # Chờ tất cả các item trong queue được xử lý
-        await work_queue.join()
+        # ⭐ GIÁM SÁT EARLY STOPPING: Chờ queue xử lý hoặc đạt giới hạn
+        try:
+            while not work_queue.empty() and len(results_list) < MAX_BEVERAGES_RESULT:
+                await asyncio.sleep(0.5)  # Kiểm tra định kỳ
+            
+            # Nếu đã đạt giới hạn, cancel các worker còn lại
+            if len(results_list) >= MAX_BEVERAGES_RESULT:
+                logger.info(f"🎯 Đã đạt giới hạn {MAX_BEVERAGES_RESULT} beverages, dừng toàn bộ workers sớm.")
+                
+                # Cancel các worker tasks
+                for task in worker_tasks:
+                    if not task.done():
+                        task.cancel()
+                
+                # Clear remaining queue items
+                try:
+                    while not work_queue.empty():
+                        await work_queue.get()
+                        work_queue.task_done()
+                except:
+                    pass
+            else:
+                # Chờ tất cả các item trong queue được xử lý bình thường
+                await work_queue.join()
+        
+        except Exception as e:
+            logger.error(f"💥 Lỗi trong giám sát early stopping: {e}")
+            await work_queue.join()  # Fallback to normal join
 
-        # Gửi tín hiệu dừng cho tất cả worker
+        # Gửi tín hiệu dừng cho tất cả worker (nếu chưa cancel)
         for _ in range(NUM_GEMINI_WORKERS):
-            await work_queue.put(None)
+            try:
+                await work_queue.put(None)
+            except:
+                pass
 
-        # Chờ tất cả worker hoàn thành
+        # Chờ tất cả worker hoàn thành hoặc cancel
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả...")
+        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả từ {len(results_list)} beverages...")
         
         # ⭐ LỌC TRÙNG LẶP BẰNG TÊN CHUẨN HÓA
         def normalize_product_name(name: str) -> str:
@@ -647,11 +716,16 @@ async def fetch_and_filter_drinks_in_batches_async(pinecone_index, vector_dimens
                     final_unique_beverages.append(beverage_item)
                     seen_normalized_names.add(normalized_name)
                     seen_product_ids.add(product_id)
+                    
+                    # ⭐ EARLY STOPPING TRONG LỌC TRÙNG LẶP: Dừng khi đủ 20 beverages
+                    if len(final_unique_beverages) >= MAX_BEVERAGES_RESULT:
+                        logger.info(f"🎯 Đã đạt {MAX_BEVERAGES_RESULT} beverages unique, dừng lọc trùng lặp sớm.")
+                        break
                 else:
                     logger.debug(f"Đã lọc beverage trùng tên: {product_name}")
             
             results_list = final_unique_beverages
-            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} beverages duy nhất")
+            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} beverages duy nhất (giới hạn tối đa {MAX_BEVERAGES_RESULT})")
 
         # ⭐ XỬ LÝ KẾT QUẢ CUỐI CÙNG
         identified_drinks_overall.extend(results_list)

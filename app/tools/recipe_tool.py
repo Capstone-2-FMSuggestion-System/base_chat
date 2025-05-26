@@ -37,6 +37,9 @@ TEXT_KEY_IN_PINECONE = "text"
 DOCUMENTS_PER_GEMINI_CALL = 80   # Giảm từ 120 xuống 80 để an toàn hơn
 TOTAL_DOCS_IN_PINECONE = 2351
 
+# ⭐ GIỚI HẠN KẾT QUẢ: Dừng khi đạt số lượng công thức mong muốn
+MAX_RECIPES_RESULT = 20          # Giới hạn tối đa 20 công thức trả về
+
 # ⭐ Dynamic batching constants - giảm mạnh để tránh lỗi JSON
 MAX_CHAR_PER_BATCH = 200000      # Giảm từ 350k xuống 200k (~67k tokens)
 MAX_SAFE_BATCH_SIZE = 60         # Giảm từ 100 xuống 60
@@ -527,15 +530,32 @@ TRẢ VỀ JSON ARRAY:'''
                 }
                 await work_queue.put(task_data)
 
-        # ⭐ HÀM GEMINI WORKER
+        # ⭐ HÀM GEMINI WORKER VỚI EARLY STOPPING
         async def gemini_worker(worker_id: int):
             logger.info(f"🤖 Worker {worker_id}: Bắt đầu hoạt động.")
             while True:
                 try:
+                    # ⭐ KIỂM TRA EARLY STOPPING: Nếu đã đủ 20 recipes thì dừng worker
+                    if len(results_list) >= MAX_RECIPES_RESULT:
+                        logger.info(f"🛑 Worker {worker_id}: Đã đạt {MAX_RECIPES_RESULT} recipes, dừng worker.")
+                        # Đánh dấu task done và thoát
+                        try:
+                            task_data = work_queue.get_nowait()
+                            work_queue.task_done()
+                        except:
+                            pass
+                        break
+                    
                     task_data = await work_queue.get()
                     if task_data is None:  # Tín hiệu dừng
                         work_queue.task_done()
                         logger.info(f"🤖 Worker {worker_id}: Nhận tín hiệu dừng.")
+                        break
+
+                    # ⭐ KIỂM TRA LẠI SAU KHI LẤY TASK (vì có thể worker khác đã đủ)
+                    if len(results_list) >= MAX_RECIPES_RESULT:
+                        logger.info(f"🛑 Worker {worker_id}: Đã đạt {MAX_RECIPES_RESULT} recipes sau khi lấy task, bỏ qua.")
+                        work_queue.task_done()
                         break
 
                     prompt_to_process = task_data["prompt"]
@@ -571,8 +591,24 @@ TRẢ VỀ JSON ARRAY:'''
                         if isinstance(parsed_data, list):
                             valid_items = [item for item in parsed_data if isinstance(item, dict) and "id" in item]
                             if valid_items:
-                                results_list.extend(valid_items)
-                            logger.info(f"🤖 Worker {worker_id}: Batch {batch_num_log} thành công, {len(valid_items)} items.")
+                                # ⭐ KIỂM TRA VÀ GIỚI HẠN SỐ LƯỢNG KHI THÊM VÀO RESULTS
+                                current_count = len(results_list)
+                                remaining_slots = MAX_RECIPES_RESULT - current_count
+                                
+                                if remaining_slots > 0:
+                                    # Chỉ thêm số lượng recipes còn thiếu
+                                    items_to_add = valid_items[:remaining_slots]
+                                    results_list.extend(items_to_add)
+                                    
+                                    logger.info(f"🤖 Worker {worker_id}: Batch {batch_num_log} thành công, thêm {len(items_to_add)}/{len(valid_items)} items. Tổng: {len(results_list)}/{MAX_RECIPES_RESULT}")
+                                    
+                                    # Nếu đã đủ, log thông báo early stopping
+                                    if len(results_list) >= MAX_RECIPES_RESULT:
+                                        logger.info(f"🎯 Worker {worker_id}: Đã đạt giới hạn {MAX_RECIPES_RESULT} recipes. Early stopping!")
+                                else:
+                                    logger.info(f"🛑 Worker {worker_id}: Đã đủ {MAX_RECIPES_RESULT} recipes, bỏ qua batch {batch_num_log}")
+                            else:
+                                logger.info(f"🤖 Worker {worker_id}: Batch {batch_num_log} không có valid items.")
                         else:
                             logger.warning(f"🤖 Worker {worker_id}: Batch {batch_num_log} trả về định dạng không phải list: {type(parsed_data)}")
                             error_reports_list.append({"error_batch": batch_num_log, "error_type": "invalid_gemini_response_format", "doc_count": doc_count_log})
@@ -585,6 +621,12 @@ TRẢ VỀ JSON ARRAY:'''
                         })
                     
                     work_queue.task_done()
+                    
+                    # ⭐ KIỂM TRA EARLY STOPPING SAU KHI XONG TASK
+                    if len(results_list) >= MAX_RECIPES_RESULT:
+                        logger.info(f"🎯 Worker {worker_id}: Đã đạt {MAX_RECIPES_RESULT} recipes, dừng worker sớm.")
+                        break
+                    
                     # Thời gian nghỉ nhỏ sau mỗi batch của một worker
                     await asyncio.sleep(WORKER_SLEEP_BETWEEN_TASKS)
 
@@ -599,22 +641,51 @@ TRẢ VỀ JSON ARRAY:'''
                          work_queue.task_done()
                     await asyncio.sleep(WORKER_ERROR_SLEEP)
 
-        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER
+        # ⭐ KHỞI TẠO VÀ CHẠY CÁC WORKER VỚI EARLY STOPPING
         worker_tasks = []
         for i in range(NUM_GEMINI_WORKERS):
             worker_tasks.append(asyncio.create_task(gemini_worker(i + 1)))
 
-        # Chờ tất cả các item trong queue được xử lý
-        await work_queue.join()
+        # ⭐ GIÁM SÁT EARLY STOPPING: Chờ queue xử lý hoặc đạt giới hạn
+        try:
+            while not work_queue.empty() and len(results_list) < MAX_RECIPES_RESULT:
+                await asyncio.sleep(0.5)  # Kiểm tra định kỳ
+            
+            # Nếu đã đạt giới hạn, cancel các worker còn lại
+            if len(results_list) >= MAX_RECIPES_RESULT:
+                logger.info(f"🎯 Đã đạt giới hạn {MAX_RECIPES_RESULT} recipes, dừng toàn bộ workers sớm.")
+                
+                # Cancel các worker tasks
+                for task in worker_tasks:
+                    if not task.done():
+                        task.cancel()
+                
+                # Clear remaining queue items
+                try:
+                    while not work_queue.empty():
+                        await work_queue.get()
+                        work_queue.task_done()
+                except:
+                    pass
+            else:
+                # Chờ tất cả các item trong queue được xử lý bình thường
+                await work_queue.join()
+        
+        except Exception as e:
+            logger.error(f"💥 Lỗi trong giám sát early stopping: {e}")
+            await work_queue.join()  # Fallback to normal join
 
-        # Gửi tín hiệu dừng cho tất cả worker
+        # Gửi tín hiệu dừng cho tất cả worker (nếu chưa cancel)
         for _ in range(NUM_GEMINI_WORKERS):
-            await work_queue.put(None)
+            try:
+                await work_queue.put(None)
+            except:
+                pass
 
-        # Chờ tất cả worker hoàn thành
+        # Chờ tất cả worker hoàn thành hoặc cancel
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả...")
+        logger.info(f"🏁 Tất cả các worker đã hoàn thành. Tổng hợp kết quả từ {len(results_list)} recipes...")
 
         # ⭐ LỌC TRÙNG LẶP BẰNG TÊN CHUẨN HÓA
         def normalize_recipe_name(name: str) -> str:
@@ -642,11 +713,16 @@ TRẢ VỀ JSON ARRAY:'''
                 if normalized_name and normalized_name not in seen_normalized_names:
                     final_unique_recipes.append(recipe_item)
                     seen_normalized_names.add(normalized_name)
+                    
+                    # ⭐ EARLY STOPPING TRONG LỌC TRÙNG LẶP: Dừng khi đủ 20 recipes
+                    if len(final_unique_recipes) >= MAX_RECIPES_RESULT:
+                        logger.info(f"🎯 Đã đạt {MAX_RECIPES_RESULT} recipes unique, dừng lọc trùng lặp sớm.")
+                        break
                 else:
                     logger.debug(f"Đã lọc recipe trùng lặp: {recipe_item.get('name', 'Unknown')}")
             
             results_list = final_unique_recipes
-            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} recipes duy nhất")
+            logger.info(f"✅ Sau khi lọc trùng lặp: {len(results_list)} recipes duy nhất (giới hạn tối đa {MAX_RECIPES_RESULT})")
 
         # ⭐ XỬ LÝ KẾT QUẢ CUỐI CÙNG
         if not results_list and error_reports_list:
