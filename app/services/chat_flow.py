@@ -68,6 +68,9 @@ class ChatState(TypedDict):
     
     # Menu IDs đã được lưu vào database (để lấy sản phẩm có sẵn)
     menu_ids: Optional[List[int]] # Danh sách ID của menu đã được lưu
+    
+    # Sản phẩm có sẵn để gửi cho frontend
+    available_products: Optional[List[Dict[str, Any]]] # Danh sách sản phẩm có sẵn từ product-index
 
 # Các node xử lý
 async def check_scope_node(state: ChatState) -> ChatState:
@@ -120,6 +123,10 @@ async def check_scope_node(state: ChatState) -> ChatState:
         state['is_food_related'] = analysis.get('is_food_related', False)
         state['user_rejected_info'] = analysis.get('user_rejected_info', False)
         state['suggest_general_options'] = analysis.get('suggest_general_options', False)
+        
+        # ⭐ Khởi tạo available_products ngay từ đầu
+        if 'available_products' not in state:
+            state['available_products'] = []
         
         # ⭐ CÁC CỜ MỚI TỪ NHIỆM VỤ E.1: Phân loại món ăn và đồ uống
         state['requests_food'] = analysis.get('requests_food', False)
@@ -471,7 +478,8 @@ def response_cleanup_node_wrapper(state: ChatState, repository) -> ChatState:
                         if recipes_to_save:
                             saved_menu_ids = repository.save_multiple_recipes_to_menu(
                                 recipes_to_save,
-                                result_state['product_results']
+                                result_state['product_results'],
+                                conversation_id=result_state['conversation_id']
                             )
                             
                             if saved_menu_ids:
@@ -945,13 +953,185 @@ def enhanced_response_cleanup_node_wrapper(state: ChatState, repository) -> Chat
                     # ⭐ DEBUG: Log kết quả để debug available_products empty issue
                     logger.info(f"🔍 DEBUG available_products processing:")
                     logger.info(f"   - products: {len(products) if isinstance(products, (list, dict)) else 'N/A'}")
-                    logger.info(f"   - recipes: {len(recipes)}")
-                    logger.info(f"   - beverages: {len(beverages)}")
+                    logger.info(f"   - recipes: {len(recipes) if recipes is not None else 'N/A'}")
+                    logger.info(f"   - beverages: {len(beverages) if beverages is not None else 'N/A'}")
+                    if recipes:
+                        logger.info(f"   - recipe names: {[r.get('name', 'Unknown') for r in recipes[:3]]}")
+                    if products and isinstance(products, dict):
+                        logger.info(f"   - products structure: {list(products.keys())}")
+                        if products.get('ingredient_mapping_results'):
+                            logger.info(f"   - ingredient mappings count: {len(products['ingredient_mapping_results'])}")
+                    
+                    # Khởi tạo danh sách available_products
+                    available_products_for_frontend = []
+                    
+                    # 1. XỬ LÝ SẢN PHẨM TỪ PRODUCT_RESULTS (TỪ PRODUCT-INDEX)
+                    if products and isinstance(products, dict):
+                        logger.info("🎯 Bắt đầu xử lý sản phẩm từ product_results")
+                        
+                        # ⭐ A. Xử lý ingredient_mapping_results
+                        if products.get('ingredient_mapping_results'):
+                            logger.info(f"📝 Xử lý {len(products['ingredient_mapping_results'])} ingredient mappings")
+                            for mapping in products['ingredient_mapping_results']:
+                                product_id = mapping.get('product_id')
+                                product_name = mapping.get('product_name', '')
+                                ingredient_name = mapping.get('requested_ingredient', '')
+                                
+                                if product_id:
+                                    try:
+                                        from app.services.product_service import ProductService
+                                        product_service = ProductService()
+                                        
+                                        # Lấy thông tin chi tiết sản phẩm
+                                        detailed_products = await product_service.get_products_by_ids([product_id])
+                                        if detailed_products:
+                                            product = detailed_products[0].copy()
+                                            product['ingredient_mapped'] = ingredient_name
+                                            product['source'] = 'ingredient_mapping'
+                                            available_products_for_frontend.append(product)
+                                            logger.info(f"✅ Đã thêm sản phẩm ingredient mapping: {product.get('name')} (ID: {product_id}) cho nguyên liệu '{ingredient_name}'")
+                                        else:
+                                            # Tạo mock product nếu không tìm được chi tiết
+                                            mock_product = {
+                                                'id': product_id,
+                                                'name': product_name or f"Sản phẩm #{product_id}",
+                                                'price': 0,
+                                                'stock_quantity': 1,
+                                                'description': f"Sản phẩm cho nguyên liệu: {ingredient_name}",
+                                                'image': None,
+                                                'unit': 'sản phẩm',
+                                                'ingredient_mapped': ingredient_name,
+                                                'source': 'ingredient_mapping_mock'
+                                            }
+                                            available_products_for_frontend.append(mock_product)
+                                            logger.info(f"⚠️ Tạo mock product cho mapping: {product_name} (ID: {product_id})")
+                                    except Exception as e:
+                                        logger.error(f"❌ Lỗi khi xử lý ingredient mapping {product_id}: {str(e)}")
+                        
+                        # ⭐ B. Xử lý menu_items đã được lưu vào DB
+                        menu_ids = result_state.get('menu_ids', [])
+                        if menu_ids:
+                            logger.info(f"📁 Xử lý {len(menu_ids)} menu items đã lưu")
+                            try:
+                                from app.services.product_service import ProductService
+                                product_service = ProductService()
+                                
+                                # Lấy thông tin sản phẩm có sẵn từ menu items
+                                all_menu_items = []
+                                for menu_id in menu_ids:
+                                    menu_item = repository.get_menu_item_by_id(menu_id)
+                                    if menu_item:
+                                        all_menu_items.append(menu_item.to_dict())
+                                
+                                if all_menu_items:
+                                    menu_available_products = await product_service.get_available_products_from_menu_items(all_menu_items)
+                                    
+                                    for product in menu_available_products:
+                                        # Tránh trùng lặp với ingredient mapping
+                                        existing_ids = [p.get('id') for p in available_products_for_frontend]
+                                        if product.get('id') not in existing_ids:
+                                            product['source'] = 'menu_items'
+                                            available_products_for_frontend.append(product)
+                                    
+                                    logger.info(f"✅ Đã thêm {len(menu_available_products)} sản phẩm từ menu items, tổng cộng: {len(available_products_for_frontend)}")
+                            except Exception as e:
+                                logger.error(f"❌ Lỗi khi xử lý menu items: {str(e)}")
+                        
+                        # ⭐ C. Xử lý product_list từ product_results
+                        if products.get('product_list'):
+                            logger.info(f"🛍️ Xử lý {len(products['product_list'])} sản phẩm từ product_list")
+                            for product_info in products['product_list']:
+                                product_id = product_info.get('product_id')
+                                if product_id:
+                                    # Tránh trùng lặp
+                                    existing_ids = [p.get('id') for p in available_products_for_frontend]
+                                    if product_id not in existing_ids:
+                                        try:
+                                            from app.services.product_service import ProductService
+                                            product_service = ProductService()
+                                            
+                                            detailed_products = await product_service.get_products_by_ids([product_id])
+                                            if detailed_products:
+                                                product = detailed_products[0].copy()
+                                                product['source'] = 'product_list'
+                                                available_products_for_frontend.append(product)
+                                                logger.info(f"✅ Đã thêm sản phẩm từ product_list: {product.get('name')} (ID: {product_id})")
+                                        except Exception as e:
+                                            logger.error(f"❌ Lỗi khi xử lý product_list {product_id}: {str(e)}")
+                    
+                    # 2. XỬ LÝ SẢN PHẨM TỪ BEVERAGE_RESULTS
+                    if beverages:
+                        logger.info(f"🥤 Xử lý {len(beverages)} đồ uống từ beverage_results")
+                        for bev in beverages:
+                            product_id = bev.get('product_id')
+                            product_name = bev.get('product_name', '')
+                            
+                            if product_id:
+                                # Tránh trùng lặp với products đã có
+                                existing_ids = [p.get('id') for p in available_products_for_frontend]
+                                if product_id not in existing_ids:
+                                    try:
+                                        from app.services.product_service import ProductService
+                                        product_service = ProductService()
+                                        
+                                        detailed_products = await product_service.get_products_by_ids([product_id])
+                                        if detailed_products:
+                                            product = detailed_products[0].copy()
+                                            product['source'] = 'beverage'
+                                            available_products_for_frontend.append(product)
+                                            logger.info(f"✅ Đã thêm đồ uống: {product.get('name')} (ID: {product_id})")
+                                        else:
+                                            # Tạo mock product cho beverage nếu không tìm được chi tiết
+                                            mock_beverage = {
+                                                'id': product_id,
+                                                'name': product_name or f"Đồ uống #{product_id}",
+                                                'price': 0,
+                                                'stock_quantity': 1,
+                                                'description': f"Đồ uống: {product_name}",
+                                                'image': None,
+                                                'unit': 'chai/ly',
+                                                'source': 'beverage_mock'
+                                            }
+                                            available_products_for_frontend.append(mock_beverage)
+                                            logger.info(f"⚠️ Tạo mock beverage: {product_name} (ID: {product_id})")
+                                    except Exception as e:
+                                        logger.error(f"❌ Lỗi khi xử lý đồ uống {product_id}: {str(e)}")
+                    
+                    # 3. Thêm sản phẩm từ recipes nếu không có sản phẩm nào
+                    if not available_products_for_frontend and recipes:
+                        for i, recipe in enumerate(recipes[:5]):  # Giới hạn 5 recipes
+                            ingredients_summary = recipe.get('ingredients_summary', '')
+                            recipe_name = recipe.get('name', f'Công thức {i+1}')
+                            
+                            if ingredients_summary:
+                                mock_product_id = 900 + i  # Mock ID bắt đầu từ 900
+                                available_products_for_frontend.append({
+                                    'id': mock_product_id,
+                                    'name': f"Nguyên liệu cho {recipe_name}",
+                                    'price': 50000,  # Mock price
+                                    'stock_quantity': 1,
+                                    'description': f"Bộ nguyên liệu cần thiết: {ingredients_summary[:100]}...",
+                                    'image': None,
+                                    'unit': 'bộ',
+                                    'category_id': None,
+                                    'recipe_source': True,  # Flag để biết đây là từ recipe
+                                    'recipe_id': recipe.get('id'),
+                                    'recipe_name': recipe_name
+                                })
+                                logger.info(f"✅ Đã thêm mock product cho recipe {recipe_name}")
+                    
+                    # Gán vào state và log kết quả
+                    result_state['available_products'] = available_products_for_frontend
+                    logger.info(f"✅ Tổng cộng đã gán {len(available_products_for_frontend)} sản phẩm vào available_products")
+                    
+                    # Log chi tiết các sản phẩm để debug
+                    for i, prod in enumerate(available_products_for_frontend[:3]):  # Log 3 sản phẩm đầu
+                        logger.debug(f"  Product {i+1}: ID={prod.get('id')}, Name='{prod.get('name')}', Stock={prod.get('stock_quantity')}")
+                    
                     if recipes:
                         logger.info(f"   - recipe names: {[r.get('name', 'Unknown') for r in recipes[:3]]}")
                     if products and products.get('ingredient_mapping_results'):
                         available_products_for_text = []
-                        available_products_for_frontend = []
                         unavailable_ingredients = []
                         
                         for mapping in products['ingredient_mapping_results']:
@@ -1321,7 +1501,8 @@ Trả về ngay câu trả lời, không giải thích."""
                         if recipes_to_save:
                             saved_menu_ids = repository.save_multiple_recipes_to_menu(
                                 recipes_to_save,
-                                result_state['product_results']
+                                result_state['product_results'],
+                                result_state['conversation_id']  # ⭐ THÊM CONVERSATION_ID
                             )
                             
                             if saved_menu_ids:
@@ -1331,6 +1512,38 @@ Trả về ngay câu trả lời, không giải thích."""
                                 logger.info(f"📋 Tên các recipes đã lưu: {saved_recipe_names}")
                                 # ⭐ THÊM MENU_IDS VÀO RESULT_STATE để ChatService có thể sử dụng
                                 result_state['menu_ids'] = saved_menu_ids
+
+                                # ⭐ LẤY AVAILABLE_PRODUCTS TỪ MENU_ITEMS ĐÃ LƯU
+                                logger.info(f"🔍 Lấy available_products từ {len(saved_menu_ids)} menu đã lưu")
+                                
+                                # Lấy tất cả menu_items cho các menu vừa lưu
+                                all_menu_items_for_saved = repository.get_menu_items_for_menus(saved_menu_ids)
+                                
+                                if all_menu_items_for_saved:
+                                    logger.info(f"📋 Tìm thấy {len(all_menu_items_for_saved)} menu items cho các menu đã lưu")
+                                    
+                                    # Khởi tạo ProductService để lấy available products
+                                    from app.services.product_service import ProductService
+                                    product_service = ProductService()
+                                    
+                                    available_products_list = await product_service.get_available_products_from_menu_items(all_menu_items_for_saved)
+                                    
+                                    if available_products_list:
+                                        # ⭐ CẬP NHẬT AVAILABLE_PRODUCTS TRONG STATE (GHI ĐÈ NẾU CÓ)
+                                        result_state['available_products'] = available_products_list
+                                        logger.info(f"🛍️ Đã cập nhật {len(available_products_list)} sản phẩm có sẵn từ menu đã lưu")
+                                        
+                                        # Log chi tiết các sản phẩm để debug
+                                        for i, prod in enumerate(available_products_list[:3]):  # Log 3 sản phẩm đầu
+                                            logger.debug(f"  Product {i+1}: ID={prod.get('id')}, Name='{prod.get('name')}', Stock={prod.get('stock_quantity')}")
+                                    else:
+                                        logger.info("🛍️ Không tìm thấy sản phẩm có sẵn nào từ menu đã lưu")
+                                        if 'available_products' not in result_state:
+                                            result_state['available_products'] = []
+                                else:
+                                    logger.info("🛍️ Không có menu items nào được tìm thấy cho các menu đã lưu")
+                                    if 'available_products' not in result_state:
+                                        result_state['available_products'] = []
                         else:
                             logger.info("⚠️ Không có recipes nào để lưu sau khi filter")
                     except Exception as recipe_save_error:

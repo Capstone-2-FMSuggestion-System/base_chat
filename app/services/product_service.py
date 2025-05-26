@@ -26,14 +26,34 @@ class ProductService:
                         f"{self.backend_url}/api/e-commerce/products/{product_id}"
                     )
                     if response.status_code == 200:
-                        product_data = response.json()
-                        formatted_product = self._format_product_for_chat(product_data)
-                        products.append(formatted_product)
-                        logger.debug(f"✅ Lấy thành công sản phẩm {product_id}: {formatted_product['name']}")
+                        product_data_raw = None
+                        try:
+                            product_data_raw = response.json()
+                        except Exception as json_error:
+                            logger.error(f"💥 Lỗi khi parse JSON cho sản phẩm {product_id}: {str(json_error)}")
+                            logger.error(f"Response text: {response.text}")
+                            continue # Bỏ qua sản phẩm này nếu không parse được JSON
+                        
+                        # Kiểm tra xem product_data_raw có phải là dictionary không
+                        if not isinstance(product_data_raw, dict):
+                            logger.error(f"💥 Dữ liệu sản phẩm {product_id} không phải là dictionary. Nhận được: {type(product_data_raw)}")
+                            logger.error(f"Data: {product_data_raw}")
+                            continue # Bỏ qua sản phẩm này
+
+                        try:
+                            formatted_product = self._format_product_for_chat(product_data_raw)
+                            products.append(formatted_product)
+                            logger.debug(f"✅ Lấy thành công sản phẩm {product_id}: {formatted_product['name']}")
+                        except Exception as format_error:
+                            logger.error(f"💥 Lỗi khi format sản phẩm {product_id} (dữ liệu: {product_data_raw}): {str(format_error)}")
+                            continue
                     else:
-                        logger.warning(f"❌ Không thể lấy thông tin sản phẩm {product_id}: HTTP {response.status_code}")
+                        logger.warning(f"❌ Không thể lấy thông tin sản phẩm {product_id}: HTTP {response.status_code} - Response: {response.text}")
+                except httpx.RequestError as req_err:
+                    logger.error(f"💥 Lỗi request HTTP khi lấy sản phẩm {product_id}: {str(req_err)}")
+                    continue
                 except Exception as e:
-                    logger.error(f"💥 Lỗi khi lấy sản phẩm {product_id}: {str(e)}")
+                    logger.error(f"💥 Lỗi không xác định khi lấy sản phẩm {product_id}: {str(e)}")
                     continue
         
         logger.info(f"🎯 Hoàn thành lấy thông tin sản phẩm: {len(products)}/{len(product_ids)} thành công")
@@ -41,14 +61,26 @@ class ProductService:
     
     def _format_product_for_chat(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """Format dữ liệu sản phẩm để hiển thị trong chat"""
-        images = product_data.get('images', [])
-        image_url = images[0].get('image_url') if images else None
-        
+        image_url = None
+        images_raw = product_data.get('images') # Không cung cấp giá trị mặc định để có thể kiểm tra None
+
+        if isinstance(images_raw, list) and images_raw: # Kiểm tra là list và không rỗng
+            first_image_item = images_raw[0]
+            if isinstance(first_image_item, dict):
+                image_url = first_image_item.get('image_url')
+            elif isinstance(first_image_item, str):
+                image_url = first_image_item # Nếu phần tử đầu tiên là string, giả sử đó là URL
+                logger.warning(f"Product ID {product_data.get('product_id')}: 'images' list contains a string instead of a dict: {first_image_item}")
+            else:
+                logger.warning(f"Product ID {product_data.get('product_id')}: First item in 'images' is not a dict or string: {type(first_image_item)}")
+        elif images_raw is not None: # Nếu images_raw không phải list nhưng không phải None
+             logger.warning(f"Product ID {product_data.get('product_id')}: 'images' field is not a list: {type(images_raw)}, data: {images_raw}")
+
         formatted_product = {
             'id': product_data.get('product_id'),
             'name': product_data.get('name'),
-            'price': float(product_data.get('price', 0)),
-            'original_price': float(product_data.get('original_price', 0)),
+            'price': float(product_data.get('price', 0.0)), # Đảm bảo float
+            'original_price': float(product_data.get('original_price', 0.0)), # Đảm bảo float
             'description': product_data.get('description'),
             'image': image_url,
             'unit': product_data.get('unit'),
@@ -56,7 +88,7 @@ class ProductService:
             'category_id': product_data.get('category_id')
         }
         
-        logger.debug(f"📦 Formatted product: {formatted_product['name']} - {formatted_product['price']}đ")
+        logger.debug(f"📦 Formatted product: {formatted_product.get('name')} - {formatted_product.get('price')}đ")
         return formatted_product
     
     async def get_available_products_from_menu_items(self, menu_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

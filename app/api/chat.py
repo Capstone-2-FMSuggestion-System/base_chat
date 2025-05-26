@@ -115,6 +115,19 @@ async def stream_chat(
             if "final_response" in result and result["final_response"]:
                 response = result["final_response"]
                 yield f"data: {response}\n\n"
+                
+                # ⭐ GỬI AVAILABLE_PRODUCTS SAU KHI STREAM KẾT THÚC
+                available_products = result.get("available_products", [])
+                if available_products:
+                    logger.info(f"🎯 Streaming: Gửi {len(available_products)} sản phẩm có sẵn")
+                    products_data = {
+                        "type": "available_products",
+                        "data": available_products
+                    }
+                    yield f"data: {json.dumps(products_data, ensure_ascii=False)}\n\n"
+                else:
+                    logger.info("📦 Streaming: Không có sản phẩm available_products để gửi")
+                
                 yield "data: [DONE]\n\n"
                 return
             
@@ -168,6 +181,19 @@ async def stream_chat(
                 
                 if polished_response != full_response:
                     yield f"data: {{\"replace\": \"{json.dumps(polished_response)}\"}}\n\n"
+                
+                # ⭐ GỬI AVAILABLE_PRODUCTS SAU KHI STREAM KẾT THÚC
+                available_products = result.get("available_products", [])
+                if available_products:
+                    logger.info(f"🎯 Streaming: Gửi {len(available_products)} sản phẩm có sẵn")
+                    products_data = {
+                        "type": "available_products", 
+                        "data": available_products
+                    }
+                    yield f"data: {json.dumps(products_data, ensure_ascii=False)}\n\n"
+                else:
+                    logger.info("📦 Streaming: Không có sản phẩm available_products để gửi")
+                
             else:
                 if not full_response.strip():
                     error_message = "Xin lỗi, không nhận được phản hồi từ hệ thống AI. Vui lòng thử lại sau."

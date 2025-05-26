@@ -105,6 +105,12 @@ class BackgroundDBService:
         self.pending_tasks[task_id] = task
         logger.debug(f"🔄 Tạo task save_health_data: {task_id}")
         return task_id
+
+    def save_summary_task(self, conversation_id: int, assistant_message_id: int,
+                         summary_text: str, repository_instance: Any) -> str:
+        """Alias cho save_conversation_summary_task để backward compatibility"""
+        return self.save_conversation_summary_task(conversation_id, assistant_message_id, 
+                                                  summary_text, repository_instance)
     
     def execute_task(self, task_id: str) -> None:
         """Execute một DB task cụ thể trong background"""

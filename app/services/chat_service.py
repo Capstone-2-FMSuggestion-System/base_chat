@@ -118,69 +118,40 @@ class ChatService:
             langgraph_result: Kết quả từ LangGraph chứa thông tin menu đã tạo
         """
         try:
-            # Kiểm tra xem có menu_ids được tạo không
-            menu_ids = langgraph_result.get("menu_ids", [])
-            if not menu_ids:
-                logger.debug("Không có menu nào được tạo, bỏ qua việc lấy sản phẩm")
-                return
+            # ⭐ LOGIC MỚI: Available products đã được xử lý trong chat_flow.py
+            # Hàm này giờ chỉ cần đảm bảo available_products tồn tại
             
-            logger.info(f"🛒 Bắt đầu lấy sản phẩm có sẵn cho {len(menu_ids)} menu")
-            
-            # Danh sách tất cả sản phẩm có sẵn từ tất cả menu
-            all_available_products = []
-            processed_product_ids = set()  # Tránh trùng lặp sản phẩm
-            
-            # Xử lý từng menu
-            for menu_id in menu_ids:
-                try:
-                    # Lấy thông tin recipe từ repository
-                    recipe_data = self.repository.get_recipe_by_id(menu_id)
-                    if not recipe_data:
-                        logger.warning(f"Không tìm thấy recipe với menu_id={menu_id}")
-                        continue
+            if 'available_products' not in langgraph_result:
+                # Fallback: Kiểm tra xem có menu_ids được tạo không
+                menu_ids = langgraph_result.get("menu_ids", [])
+                if menu_ids:
+                    logger.info(f"🔧 Fallback: Lấy available_products cho {len(menu_ids)} menu từ ChatService")
                     
-                    # Lấy danh sách ingredients có product_id
-                    ingredients = recipe_data.get('ingredients', [])
-                    logger.debug(f"📋 Menu {menu_id} có {len(ingredients)} ingredients")
+                    # ⭐ SỬ DỤNG HÀM MỚI get_menu_items_for_menus
+                    all_menu_items = self.repository.get_menu_items_for_menus(menu_ids)
                     
-                    # Lấy sản phẩm có sẵn cho menu này
-                    available_products = await self.product_service.get_available_products_from_menu_items(ingredients)
-                    
-                    if available_products:
-                        # Lọc ra sản phẩm chưa được xử lý (tránh trùng lặp)
-                        new_products = []
-                        for product in available_products:
-                            product_id = product.get('id')
-                            if product_id and product_id not in processed_product_ids:
-                                new_products.append(product)
-                                processed_product_ids.add(product_id)
+                    if all_menu_items:
+                        logger.info(f"📋 Fallback: Tìm thấy {len(all_menu_items)} menu items")
                         
-                        all_available_products.extend(new_products)
+                        # Lấy sản phẩm có sẵn từ tất cả menu items
+                        available_products = await self.product_service.get_available_products_from_menu_items(all_menu_items)
                         
-                        # Cập nhật cache cho recipe này
-                        recipe_data['available_products'] = available_products
-                        from app.services.cache_service import CacheService
-                        CacheService.cache_recipe_data(menu_id, recipe_data)
-                        
-                        logger.info(f"✅ Menu {menu_id}: Thêm {len(new_products)} sản phẩm mới ({len(available_products)} total)")
+                        langgraph_result['available_products'] = available_products
+                        logger.info(f"🎯 Fallback: Thêm {len(available_products)} sản phẩm có sẵn vào response")
                     else:
-                        logger.debug(f"❌ Menu {menu_id}: Không có sản phẩm nào có sẵn")
-                        
-                except Exception as e:
-                    logger.error(f"💥 Lỗi khi xử lý sản phẩm cho menu_id={menu_id}: {str(e)}")
-                    continue
-            
-            # Thêm tất cả sản phẩm có sẵn vào langgraph_result
-            if all_available_products:
-                langgraph_result['available_products'] = all_available_products
-                logger.info(f"🎯 Tổng cộng: {len(all_available_products)} sản phẩm có sẵn được thêm vào response")
-                
-                # Log chi tiết các sản phẩm
-                for product in all_available_products:
-                    logger.debug(f"🛍️ Available product: {product.get('name')} (ID: {product.get('id')}) - Stock: {product.get('stock_quantity')}")
+                        logger.info("📭 Fallback: Không tìm thấy menu items nào")
+                        langgraph_result['available_products'] = []
+                else:
+                    logger.debug("📭 Không có menu nào được tạo")
+                    langgraph_result['available_products'] = []
             else:
-                logger.info("ℹ️ Không có sản phẩm nào có sẵn trong kho cho các menu được tạo")
-                langgraph_result['available_products'] = []
+                # Available products đã được xử lý trong chat_flow
+                available_products = langgraph_result.get('available_products', [])
+                logger.info(f"✅ Available products đã có sẵn từ chat_flow: {len(available_products)} sản phẩm")
+                
+                # Log chi tiết để debug
+                for i, product in enumerate(available_products[:3]):  # Log 3 sản phẩm đầu
+                    logger.debug(f"  Product {i+1}: ID={product.get('id')}, Name='{product.get('name')}', Stock={product.get('stock_quantity')}")
                     
         except Exception as e:
             logger.error(f"💥 Lỗi nghiêm trọng khi xử lý sản phẩm có sẵn: {str(e)}", exc_info=True)
@@ -490,45 +461,34 @@ class ChatService:
                 logger.debug(f"📭 Không tìm thấy menu nào cho conversation_id={conversation_id}")
                 return []
             
-            all_available_products = []
-            processed_product_ids = set()
+            # Lấy danh sách menu_ids
+            menu_ids = [menu_data.get('menu_id') for menu_data in menu_data_list if menu_data.get('menu_id')]
             
-            for menu_data in menu_data_list:
-                try:
-                    menu_id = menu_data.get('menu_id')
-                    if not menu_id:
-                        continue
-                    
-                    # Lấy thông tin recipe từ repository
-                    recipe_data = self.repository.get_recipe_by_id(menu_id)
-                    if not recipe_data:
-                        logger.warning(f"Không tìm thấy recipe với menu_id={menu_id}")
-                        continue
-                    
-                    # Lấy danh sách ingredients có product_id
-                    ingredients = recipe_data.get('ingredients', [])
-                    if not ingredients:
-                        continue
-                    
-                    # Lấy sản phẩm có sẵn cho menu này
-                    available_products = await self.product_service.get_available_products_from_menu_items(ingredients)
-                    
-                    if available_products:
-                        # Lọc ra sản phẩm chưa được xử lý (tránh trùng lặp)
-                        for product in available_products:
-                            product_id = product.get('id')
-                            if product_id and product_id not in processed_product_ids:
-                                all_available_products.append(product)
-                                processed_product_ids.add(product_id)
-                                
-                        logger.debug(f"✅ Menu {menu_id}: Tìm thấy {len(available_products)} sản phẩm có sẵn")
-                    
-                except Exception as e:
-                    logger.error(f"💥 Lỗi khi xử lý menu trong conversation: {str(e)}")
-                    continue
+            if not menu_ids:
+                logger.debug(f"📭 Không có menu_id hợp lệ cho conversation_id={conversation_id}")
+                return []
             
-            logger.info(f"🛒 Tổng cộng: {len(all_available_products)} sản phẩm có sẵn cho conversation_id={conversation_id}")
-            return all_available_products
+            logger.info(f"🔍 Lấy available_products cho {len(menu_ids)} menu: {menu_ids}")
+            
+            # ⭐ SỬ DỤNG HÀM MỚI get_menu_items_for_menus
+            all_menu_items = self.repository.get_menu_items_for_menus(menu_ids)
+            
+            if not all_menu_items:
+                logger.info(f"📭 Không tìm thấy menu items nào cho conversation_id={conversation_id}")
+                return []
+            
+            logger.info(f"📋 Tìm thấy {len(all_menu_items)} menu items tổng cộng")
+            
+            # Lấy sản phẩm có sẵn từ tất cả menu items
+            available_products = await self.product_service.get_available_products_from_menu_items(all_menu_items)
+            
+            logger.info(f"🛒 Tổng cộng: {len(available_products)} sản phẩm có sẵn cho conversation_id={conversation_id}")
+            
+            # Log chi tiết để debug
+            for i, product in enumerate(available_products[:3]):  # Log 3 sản phẩm đầu
+                logger.debug(f"  Available Product {i+1}: ID={product.get('id')}, Name='{product.get('name')}', Stock={product.get('stock_quantity')}")
+            
+            return available_products
             
         except Exception as e:
             logger.error(f"💥 Lỗi khi lấy sản phẩm có sẵn cho conversation_id={conversation_id}: {str(e)}", exc_info=True)

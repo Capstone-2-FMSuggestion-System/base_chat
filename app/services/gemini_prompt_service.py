@@ -2,6 +2,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 import json
 import httpx
+import re
 from tenacity import retry, stop_after_attempt, wait_exponential
 import asyncio
 
@@ -314,15 +315,27 @@ class GeminiPromptService:
                 if len(parts) > 1:  # Có dấu ":" trong phản hồi
                     polished_response = ":".join(parts[1:]).strip()
             
+            # Bước 1: Chuẩn hóa tất cả các kiểu xuống dòng thành \n
+            polished_response = polished_response.replace('\r\n', '\n').replace('\r', '\n')
+
+            # Bước 2: Loại bỏ các khoảng trắng thừa ở đầu và cuối mỗi dòng
+            lines = polished_response.split('\n')
+            stripped_lines = [line.strip() for line in lines]
+            polished_response = '\n'.join(stripped_lines)
+
+            # Bước 3: Loại bỏ multiple line breaks - chỉ giữ single line break
+            # (thay thế 2 hoặc nhiều \n liên tiếp bằng \n)
+            polished_response = re.sub(r'\n{2,}', '\n', polished_response)
+
             # Loại bỏ các dấu xuống dòng thừa ở đầu
             while polished_response.startswith("\n"):
                 polished_response = polished_response[1:]
             
             # Loại bỏ các dấu xuống dòng thừa ở cuối
-            while polished_response.endswith("\n\n"):
+            while polished_response.endswith("\n"):
                 polished_response = polished_response[:-1]
             
-            logger.info(f"Đã điều chỉnh phản hồi: {len(polished_response)} ký tự")
+            logger.info(f"Đã điều chỉnh và chuẩn hóa định dạng xuống dòng cho phản hồi: {len(polished_response)} ký tự")
             return polished_response.strip()
                 
         except Exception as e:
@@ -694,28 +707,25 @@ Người dùng: {user_message}
                 conversation_text += msg_text
                 total_chars += len(msg_text)
         
-        # Tạo phần recipes nếu có - ĐƯA TOÀN BỘ RECIPES VÀO
+        # ⭐ TẠOS PHẦN RECIPES VỚI TIÊU ĐỀ RÕ RÀNG - ĐƯA TOÀN BỘ RECIPES VÀO
         recipe_section = ""
         if recipes:
-            recipe_section = "\n\nCÔNG THỨC MÓN ĂN CÓ SẴN TRONG DATABASE:\n"
+            recipe_section = "\n\n### DANH SÁCH CÔNG THỨC MÓN ĂN THAM KHẢO TỪ DATABASE:\n"
             for i, recipe in enumerate(recipes, 1):  # Đưa TOÀN BỘ recipes vào (không giới hạn)
                 recipe_id = recipe.get('id', f'R{i}')
                 name = recipe.get('name', 'N/A')
                 ingredients = recipe.get('ingredients_summary', 'N/A')
                 url = recipe.get('url', '')
                 
-                # Tóm tắt nguyên liệu nếu quá dài để tiết kiệm không gian
-                if len(ingredients) > 100:
-                    ingredients = ingredients[:97] + "..."
-                
+                # ⭐ GIỮ NGUYÊN INGREDIENTS_SUMMARY CHÍNH XÁC, KHÔNG CẮT NGẮN
                 recipe_section += f"{i}. [ID: {recipe_id}] {name}\n   - Nguyên liệu: {ingredients}\n"
                 if url and len(url) < 50:  # Chỉ thêm URL nếu không quá dài
                     recipe_section += f"   - Link: {url}\n"
         
-        # Tạo phần beverages nếu có - ĐƯA TOÀN BỘ BEVERAGES VÀO
+        # ⭐ TẠO PHẦN BEVERAGES VỚI TIÊU ĐỀ RÕ RÀNG - ĐƯA TOÀN BỘ BEVERAGES VÀO
         beverage_section = ""
         if beverages:
-            beverage_section = "\n\nĐỒ UỐNG CÓ SẴN TRONG DATABASE:\n"
+            beverage_section = "\n\n### DANH SÁCH ĐỒ UỐNG THAM KHẢO TỪ DATABASE:\n"
             for i, bev in enumerate(beverages, 1):  # Đưa TOÀN BỘ beverages vào (không giới hạn)
                 bev_id = bev.get('product_id', f'B{i}')
                 name = bev.get('product_name', 'N/A')
@@ -763,20 +773,28 @@ YÊU CẦU TẠO PROMPT CHO MEDICHAT:
 + Nếu gợi ý chung: "Tôi cần gợi ý món ăn/đồ uống [dựa trên tiêu chí từ general_instruction]. Xin đưa ra 2-3 lựa chọn cụ thể."
 
 3. XỬ LÝ CÔNG THỨC MÓN ĂN/ĐỒ UỐNG - TẬN DỤNG TỐI ĐA DỮ LIỆU:
+
+⭐ QUAN TRỌNG TUYỆT ĐỐI: Khi Medichat đưa ra gợi ý về một món ăn hoặc đồ uống dựa trên DANH SÁCH CÔNG THỨC MÓN ĂN THAM KHẢO hoặc DANH SÁCH ĐỒ UỐNG THAM KHẢO, Medichat PHẢI:
+   a. Trích xuất và liệt kê CHÍNH XÁC danh sách nguyên liệu từ trường ingredients_summary (đối với món ăn) hoặc các thành phần chính đã biết (nếu có cho đồ uống) được cung cấp trong danh sách đó.
+   b. Medichat TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ Ý THAY ĐỔI, THÊM BỚT, HAY SUY DIỄN danh sách nguyên liệu/thành phần này. Phải giữ nguyên như dữ liệu được cung cấp.
+   c. Trình bày danh sách nguyên liệu/thành phần này một cách rõ ràng cho người dùng dưới dạng: **Nguyên liệu:** [nguyên liệu 1], [nguyên liệu 2], ...
+   d. Prompt bạn (Gemini) tạo ra cho Medichat PHẢI chứa một chỉ dẫn rõ ràng về yêu cầu (a), (b), (c) này. Ví dụ: 'Khi bạn gợi ý một món từ danh sách công thức/đồ uống được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm trong trường "Nguyên liệu:" của món đó, không tự ý thay đổi.'
+
 - Khi suggest_general=True VÀ có recipe_section hoặc beverage_section:
   + Hướng dẫn Medichat xem xét kỹ TẤT CẢ các món ăn trong recipe_section và TẤT CẢ đồ uống trong beverage_section
-  + Yêu cầu Medichat PHẢI phân tích và CHỌN LỌC 2-3 items TỐT NHẤT từ danh sách này dựa trên tiêu chí chung (phổ biến, cân bằng dinh dưỡng, ít dị ứng, dễ làm)
-  + Medichat phải giải thích tại sao những items được chọn phù hợp với tiêu chí
+  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có) để xem item nào khớp nhất với các tiêu chí gợi ý chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít dị ứng, dễ làm)
+  + Yêu cầu Medichat xem xét TẤT CẢ items trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có). Chọn ra 2-3 items đáp ứng tốt nhất các tiêu chí gợi ý chung (phổ biến, đa dạng, cân bằng dinh dưỡng, ít dị ứng, dễ làm). Giải thích và TRÌNH BÀY NGUYÊN LIỆU CHÍNH XÁC của chúng
   + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý
   + Chỉ khi danh sách không có đủ lựa chọn phù hợp, Medichat mới bổ sung bằng kiến thức của mình
-  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi muốn vài gợi ý đồ uống giải nhiệt, ngọt ngào, phổ biến và dễ làm. Hãy xem xét kỹ danh sách đồ uống sau đây và chọn ra 2-3 loại phù hợp nhất: [liệt kê TẤT CẢ tên và ID từ beverage_section]. Giải thích tại sao chúng phù hợp với tiêu chí. QUAN TRỌNG: Hãy sử dụng CHÍNH XÁC nguyên liệu từ trường 'Nguyên liệu' của từng món trong danh sách, KHÔNG ĐƯỢC tự tạo ra nguyên liệu khác. Nếu không có đủ lựa chọn phù hợp, hãy bổ sung thêm."
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi muốn gợi ý đồ uống giải nhiệt. Hãy xem xét danh sách đồ uống sau và chọn 2-3 loại phù hợp nhất với tiêu chí phổ biến, dễ làm, ít dị ứng: [Nước ép Xoài (ID:B1), Trà Chanh (ID:B2)]. Liệt kê thành phần chính xác cho mỗi loại được chọn theo định dạng 'Nguyên liệu: ...'. Khi bạn gợi ý một món từ danh sách được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm, không tự ý thay đổi."
 
 - Khi KHÔNG phải suggest_general=True (người dùng có yêu cầu cụ thể) VÀ có recipe_section hoặc beverage_section:
   + Tạo prompt hướng dẫn Medichat PHẢI ƯU TIÊN SỬ DỤNG và phân tích TẤT CẢ các món ăn từ recipe_section và/hoặc TẤT CẢ đồ uống từ beverage_section
+  + Yêu cầu Medichat phân tích KỸ LƯỠNG TỪNG item trong DANH SÁCH CÔNG THỨC MÓN ĂN và DANH SÁCH ĐỒ UỐNG (nếu có) để xem item nào khớp nhất với yêu cầu của người dùng (về sức khỏe, sở thích). Sau đó, chọn ra 2-3 item phù hợp nhất, giải thích lý do, và TRÌNH BÀY NGUYÊN LIỆU CHÍNH XÁC của chúng
   + Medichat phải đánh giá từng item xem có phù hợp với yêu cầu CỤ THỂ của người dùng không (về tình trạng sức khỏe, sở thích)
   + Yêu cầu Medichat giải thích chi tiết tại sao chúng phù hợp hoặc không phù hợp, và đưa ra gợi ý điều chỉnh nếu cần
   + ⭐ QUAN TRỌNG: Medichat phải bao gồm DANH SÁCH NGUYÊN LIỆU CHI TIẾT cho từng món được gợi ý
-  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi bị tiểu đường và muốn một món canh ít đường. Hãy phân tích từng món trong danh sách này: [liệt kê TẤT CẢ tên và ID từ recipe_section]. Món nào phù hợp nhất? Tại sao? Có cần điều chỉnh gì không? QUAN TRỌNG: Hãy sử dụng CHÍNH XÁC nguyên liệu từ trường 'Nguyên liệu' của từng món trong danh sách, KHÔNG ĐƯỢC tự tạo ra nguyên liệu khác. Nếu không có món nào phù hợp, hãy gợi ý thêm."
+  + VÍ DỤ PROMPT CHO MEDICHAT: "Tôi bị tiểu đường. Từ danh sách sau: [Canh bí đao (ID:R1, Nguyên liệu: bí đao, thịt nạc, hành), Gà kho gừng (ID:R2, Nguyên liệu: gà ta, gừng, nước mắm, đường)], món nào tốt nhất cho tôi? Hãy giải thích và liệt kê CHÍNH XÁC nguyên liệu cho món bạn chọn theo định dạng 'Nguyên liệu: ...'. Khi bạn gợi ý một món từ danh sách được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu đi kèm, không tự ý thay đổi."
 
 - Khi có cả món ăn và đồ uống từ database:
   + Tạo prompt yêu cầu Medichat phân tích TẤT CẢ items từ cả recipe_section và beverage_section
@@ -801,8 +819,9 @@ YÊU CẦU TẠO PROMPT CHO MEDICHAT:
 🚨 LƯU Ý QUAN TRỌNG KHI TẠO PROMPT CHO MEDICHAT:
 Prompt bạn tạo ra PHẢI chứa câu yêu cầu rõ ràng về nguyên liệu, ví dụ:
 - "Hãy sử dụng CHÍNH XÁC nguyên liệu từ trường 'Nguyên liệu' của từng món trong danh sách"
-- "KHÔNG ĐƯỢC tự tạo ra hoặc thay đổi nguyên liệu, phải dùng đúng như trong database"
+- "KHÔNG ĐƯỢC tự tạo ra hoặc thay đổi nguyên liệu, phải dùng đúng như trong database" 
 - "Bao gồm danh sách nguyên liệu CHỈ THEO ĐÚNG thông tin đã cung cấp"
+- "Khi bạn gợi ý một món từ danh sách công thức/đồ uống được cung cấp, hãy đảm bảo bạn trích xuất và liệt kê chính xác danh sách nguyên liệu/thành phần đi kèm trong trường 'Nguyên liệu:' của món đó, không tự ý thay đổi."
 
 CHỈ TRẢ VỀ PHẦN PROMPT ĐÃ ĐƯỢC TÓM TẮT VÀ TỐI ƯU HÓA CHO MEDICHAT, KHÔNG BAO GỒM BẤT KỲ LỜI GIẢI THÍCH HAY TIÊU ĐỀ NÀO KHÁC.
 PROMPT KẾT QUẢ (DƯỚI {word_limit} TỪ):"""
@@ -836,9 +855,10 @@ HƯỚNG DẪN BIÊN TẬP VÀ TINH CHỈNH:
 - Ngôn ngữ có DỄ HIỂU, THÂN THIỆN, và PHÙ HỢP với người dùng không?
 - Có chứa thông tin thừa, metadata, hoặc các cụm từ không tự nhiên (ví dụ: "dưới đây là...", "đánh giá của tôi...") không?
 2. Hành động:
-- Nếu phản hồi thô đã tốt (chính xác, đầy đủ, dễ hiểu) VÀ có đầy đủ nguyên liệu: Hãy loại bỏ TOÀN BỘ metadata, các cụm từ đánh giá, định dạng thừa. Giữ lại phần nội dung cốt lõi và đảm bảo nó mạch lạc, tự nhiên.
+- Nếu phản hồi thô đã tốt (chính xác, đầy đủ, dễ hiểu) VÀ có đầy đủ nguyên liệu: Hãy loại bỏ TOÀN BỘ metadata, các cụm từ đánh giá, định dạng thừa. Giữ lại phần nội dung cốt lõi. ĐẢM BẢO NỘI DUNG CUỐI CÙNG SỬ DỤNG KÝ TỰ XUỐNG DÒNG `\n` MỘT CÁCH HỢP LÝ: một `\n` để ngắt dòng trong cùng một ý hoặc tạo danh sách, và hai `\n\n` để tạo khoảng cách rõ ràng giữa các đoạn văn, các mục lớn (ví dụ: giữa các món ăn được gợi ý, hoặc giữa phần mô tả và phần nguyên liệu).
 - Nếu phản hồi thô THIẾU NGUYÊN LIỆU: Hãy BỔ SUNG danh sách nguyên liệu chi tiết cho từng món ăn/đồ uống được gợi ý theo định dạng "**Nguyên liệu:** [danh sách]". 🚨 QUAN TRỌNG: Chỉ sử dụng nguyên liệu từ kiến thức chung về món ăn đó, KHÔNG tự tạo ra nguyên liệu lạ hoặc không phù hợp
-- Nếu phản hồi thô chưa tốt (lạc đề, không đầy đủ, khó hiểu, chứa thông tin sai lệch, hoặc quá máy móc): Hãy VIẾT LẠI HOÀN TOÀN một phản hồi mới dựa trên PROMPT GỐC. Phản hồi mới phải chính xác, đầy đủ, thân thiện, dễ hiểu, cung cấp giá trị thực sự cho người dùng VÀ BẮT BUỘC có nguyên liệu cho từng món.
+- Nếu phản hồi thô chưa tốt (lạc đề, không đầy đủ, khó hiểu, chứa thông tin sai lệch, hoặc quá máy móc): Hãy VIẾT LẠI HOÀN TOÀN một phản hồi mới dựa trên PROMPT GỐC. Phản hồi mới phải chính xác, đầy đủ, thân thiện, dễ hiểu, cung cấp giá trị thực sự cho người dùng VÀ ĐẢM BẢO SỬ DỤNG KÝ TỰ XUỐNG DÒNG `\n` MỘT CÁCH HỢP LÝ như đã mô tả ở trên VÀ BẮT BUỘC có nguyên liệu cho từng món.
+- Nếu trình bày danh sách (ví dụ: nguyên liệu, cách làm), hãy sử dụng dấu gạch đầu dòng (`- ` hoặc `* ` bắt đầu mỗi mục) hoặc đánh số (`1. `, `2. `). Mỗi mục trong danh sách PHẢI được trình bày trên một dòng mới (sử dụng `\n` để ngắt dòng).
 3. YÊU CẦU TUYỆT ĐỐI CHO ĐẦU RA CUỐI CÙNG:
 - Đầu ra của bạn sẽ được gửi TRỰC TIẾP cho người dùng.
 - KHÔNG BAO GIỜ bao gồm các từ/cụm từ như: "Đánh giá:", "Kiểm tra:", "Điều chỉnh:", "Phản hồi đã được điều chỉnh:", "Phân tích phản hồi:", "HỢP LỆ", "Dưới đây là...", "Theo tôi...", v.v.
@@ -848,6 +868,7 @@ HƯỚNG DẪN BIÊN TẬP VÀ TINH CHỈNH:
 - LUÔN sử dụng tiếng Việt tự nhiên, thân thiện, chuyên nghiệp và mạch lạc.
 - LUÔN đảm bảo thông tin y tế/dinh dưỡng là chính xác và hữu ích.
 - Đảm bảo phản hồi ngắn gọn, súc tích nhất có thể mà vẫn đủ ý.
+- LUÔN đảm bảo định dạng xuống dòng nhất quán và dễ đọc, sử dụng \n cho ngắt dòng và \n\n cho ngắt đoạn.
 TRẢ VỀ NGAY LẬP TỨC CHỈ PHẦN NỘI DUNG PHẢN HỒI CUỐI CÙNG DÀNH CHO NGƯỜI DÙNG. KHÔNG CÓ BẤT KỲ METADATA, GIẢI THÍCH, HAY BÌNH LUẬN NÀO.
 """
         

@@ -629,26 +629,33 @@ class ChatRepository:
     def save_recipe_to_menu(self, recipe_name: str, recipe_description: str, 
                            ingredients_with_products: List[Dict[str, Any]], conversation_id: Optional[int] = None) -> Optional[int]:
         try:
-            menu = Menu(name=recipe_name, description=recipe_description, conversation_id=conversation_id)
+            # Tạo menu với conversation_id nếu được cung cấp
+            menu = Menu(
+                name=recipe_name,
+                description=recipe_description,
+                conversation_id=conversation_id  # Lưu conversation_id vào menu
+            )
+            
+            logger.info(f"Lưu công thức '{recipe_name}' với conversation_id={conversation_id}")
+
             self.db.add(menu)
             self.db.flush()
             
             menu_id = menu.menu_id
-            logger.info(f"Đã tạo menu '{recipe_name}' với ID={menu_id}")
+            logger.info(f"Đã tạo menu '{recipe_name}' với ID={menu_id}, conversation_id={conversation_id}")
             
             menu_items_data = []
             ingredients_saved_count = 0
             
-            # ⭐ LƯU TẤT CẢ NGUYÊN LIỆU, PRODUCT_ID CÓ THỂ NULL
             for ing in ingredients_with_products:
                 ingredient_name = ing.get('ingredient_name', '').strip()
                 product_id = ing.get('product_id')
                 quantity = ing.get('quantity', 1)
                 
-                if ingredient_name:  # Chỉ cần có tên nguyên liệu
+                if ingredient_name:
                     menu_item = MenuItem(
                         menu_id=menu_id,
-                        product_id=product_id,  # Có thể là None
+                        product_id=product_id,
                         quantity=quantity
                     )
                     self.db.add(menu_item)
@@ -666,13 +673,14 @@ class ChatRepository:
                 'menu_id': menu_id,
                 'name': recipe_name,
                 'description': recipe_description,
+                'conversation_id': conversation_id,
                 'created_at': datetime.now().isoformat(),
                 'ingredients': menu_items_data,
-                'available_products': []  # Sẽ được cập nhật bởi ProductService
+                'available_products': []
             }
             CacheService.cache_recipe_data(menu_id, recipe_data_cache)
             
-            logger.info(f"Đã lưu công thức '{recipe_name}' với {ingredients_saved_count} nguyên liệu")
+            logger.info(f"Đã lưu công thức '{recipe_name}' với {ingredients_saved_count} nguyên liệu vào menu ID {menu_id}")
             return menu_id
             
         except Exception as e:
@@ -1005,20 +1013,69 @@ class ChatRepository:
         logger.debug(f"✅ Committed and refreshed health_data id={health_data.id}")
         return health_data
 
+    def get_menu_items_for_menus(self, menu_ids: List[int]) -> List[Dict[str, Any]]:
+        """
+        Lấy tất cả menu_items (bao gồm product_id, quantity, và ingredient_name) 
+        cho một danh sách các menu_id.
+        
+        Args:
+            menu_ids: Danh sách các menu ID
+            
+        Returns:
+            List[Dict]: Danh sách menu items với thông tin chi tiết
+        """
+        if not menu_ids:
+            logger.debug("Danh sách menu_ids trống")
+            return []
+        
+        try:
+            from app.db.models import MenuItem, Menu, Product
+            
+            # Query các MenuItem liên quan đến danh sách menu_ids
+            # Join với bảng Menu để có thể lấy tên món ăn (recipe_name)
+            # Và join với bảng Product để có thể lấy tên nguyên liệu (product_name)
+            menu_items_with_details = self.db.query(
+                MenuItem.product_id, 
+                MenuItem.quantity,
+                Menu.name.label("recipe_name"),
+                Product.name.label("ingredient_name_from_product")
+            ).join(Menu, MenuItem.menu_id == Menu.menu_id)\
+             .outerjoin(Product, MenuItem.product_id == Product.product_id)\
+             .filter(MenuItem.menu_id.in_(menu_ids))\
+             .all()
+
+            formatted_items = []
+            for item in menu_items_with_details:
+                formatted_items.append({
+                    "product_id": item.product_id,
+                    "quantity": item.quantity,
+                    # Ưu tiên ingredient_name từ Product nếu có, nếu không thì ghi chú không rõ
+                    "ingredient_name": item.ingredient_name_from_product if item.product_id else f"Nguyên liệu không rõ cho công thức '{item.recipe_name}'",
+                    "recipe_name": item.recipe_name  # Thêm tên món ăn để có context
+                })
+            
+            logger.info(f"🔍 Lấy được {len(formatted_items)} menu items cho {len(menu_ids)} menus: {menu_ids}")
+            return formatted_items
+            
+        except Exception as e:
+            logger.error(f"💥 Lỗi khi lấy menu items cho menu_ids={menu_ids}: {str(e)}", exc_info=True)
+            return []
+
     def get_menu_data_by_conversation(self, conversation_id: int) -> List[Dict[str, Any]]:
         """
-        Lấy tất cả menu data đã được tạo trong conversation.
+        Lấy tất cả menu data thuộc conversation_id cụ thể.
+        Sử dụng foreign key constraint đã được thêm vào.
         
         Args:
             conversation_id: ID cuộc trò chuyện
             
         Returns:
-            List các menu data dictionary
+            List các menu data dictionary thuộc conversation này
         """
         try:
             from app.db.models import Menu
             
-            # Query tất cả menu được tạo trong conversation này
+            # Query chỉ những menu thuộc conversation_id này
             menus = self.db.query(Menu).filter(
                 Menu.conversation_id == conversation_id
             ).order_by(Menu.created_at.desc()).all()
@@ -1027,14 +1084,14 @@ class ChatRepository:
             for menu in menus:
                 menu_data = {
                     'menu_id': menu.menu_id,
-                    'conversation_id': menu.conversation_id,
                     'name': menu.name,
                     'description': menu.description,
+                    'conversation_id': menu.conversation_id,
                     'created_at': menu.created_at.isoformat() if menu.created_at else None,
                 }
                 menu_data_list.append(menu_data)
             
-            logger.debug(f"📋 Tìm thấy {len(menu_data_list)} menu cho conversation_id={conversation_id}")
+            logger.info(f"📋 Lấy được {len(menu_data_list)} menu thuộc conversation_id={conversation_id}")
             return menu_data_list
             
         except Exception as e:
