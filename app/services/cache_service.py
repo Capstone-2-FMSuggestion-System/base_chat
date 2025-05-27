@@ -26,6 +26,7 @@ class CacheService:
     RECENT_RECIPES = "recent_recipes:limit_{limit}"
     UNSUMMARIZED_CONVERSATIONS = "unsummarized_conversations:threshold_{threshold}"
     BATCH_RECIPE_SAVE = "batch_recipe_save:{timestamp}"
+    ALL_PRODUCTS_LIST = "all_products_master_list"
     
     # Default TTL values (in seconds)
     TTL_SHORT = 600      # 10 minutes
@@ -204,6 +205,18 @@ class CacheService:
         """Lấy message summary từ cache"""
         key = cls._get_cache_key(cls.MESSAGE_SUMMARY, message_id=message_id)
         return cls.get_cache(key, str)
+    
+    @classmethod
+    def cache_all_products_list(cls, products: List[Dict[str, Any]], ttl: int = TTL_EXTRA_LONG) -> bool:
+        """Cache danh sách toàn bộ sản phẩm (product_id và name)"""
+        logger.info(f"CACHE_SERVICE: Caching {len(products)} sản phẩm vào cache")
+        return cls.set_cache(cls.ALL_PRODUCTS_LIST, products, ttl)
+
+    @classmethod
+    def get_all_products_list(cls) -> Optional[List[Dict[str, Any]]]:
+        """Lấy danh sách toàn bộ sản phẩm từ cache"""
+        logger.debug("CACHE_SERVICE: Lấy danh sách sản phẩm từ cache")
+        return cls.get_cache(cls.ALL_PRODUCTS_LIST, expected_type=list)
     
     @classmethod
     def invalidate_conversation_cache(cls, conversation_id: int) -> None:
