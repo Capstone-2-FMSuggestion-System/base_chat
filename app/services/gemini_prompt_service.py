@@ -607,7 +607,15 @@ Người dùng: {user_message}
      - Các thông tin cốt lõi như `health_condition`, `allergies`, `health_goals` một khi đã được cung cấp phải được GIỮ LẠI trong `collected_info` qua các lượt phân tích sau, trừ khi người dùng nói rõ là thông tin đó đã thay đổi.
      - Đối với `dietary_habits`, `food_preferences`, `food_dislikes`: Nếu người dùng ở lượt TRƯỚC đã cung cấp, nhưng ở TIN NHẮN MỚI NHẤT lại nói "ăn gì cũng được", "bình thường", thì các trường này trong `collected_info` nên được làm rỗng hoặc phản ánh sự không chắc chắn đó, và đây là một tín hiệu cho `user_rejected_info`.
 
-**3. ĐÁNH GIÁ THÁI ĐỘ NGƯỜI DÙNG VÀ QUYẾT ĐỊNH HƯỚNG HÀNH XỬ CỦA CHATBOT:**
+**3. XỬ LÝ INPUT KHÔNG MẠCH LẠC HOẶC NGOÀI PHẠM VI RÕ RÀNG:**
+   - Nếu TIN NHẮN MỚI NHẤT hoàn toàn vô nghĩa, không phải câu hỏi, hoặc rõ ràng nằm ngoài phạm vi tư vấn (ví dụ: một từ đơn, một dãy số, tên riêng không kèm ngữ cảnh), hãy đặt:
+     - `is_valid_scope`: `false`
+     - `is_food_related`: `false`
+     - `need_more_info`: `false`
+     - `follow_up_question`: `null`
+     - `collected_info`: giữ nguyên từ lịch sử nếu có, không thêm gì mới.
+
+**4. ĐÁNH GIÁ THÁI ĐỘ NGƯỜI DÙNG VÀ QUYẾT ĐỊNH HƯỚNG HÀNH XỬ CỦA CHATBOT:**
    - `user_rejected_info` (boolean): Phân tích TIN NHẮN MỚI NHẤT. Người dùng có đang từ chối (rõ ràng hoặc ngầm) cung cấp THÊM THÔNG TIN CHI TIẾT về sở thích/thói quen, SAU KHI chatbot đã đặt câu hỏi gợi ý không?
      *   Các ví dụ từ chối bao gồm: "tôi không muốn nói", "tôi không rõ", "tôi không biết", "sao cũng được", "gì cũng được", "tùy bạn", "bạn cứ gợi ý đi", "cho tôi ví dụ", "gia đình tôi ăn uống bình thường", "không có yêu cầu gì đặc biệt", "không có sở thích cụ thể".
      *   **ĐẶC BIỆT QUAN TRỌNG**: Nếu chatbot hỏi "Bạn thích loại A, B, hay C?" và người dùng trả lời "Loại nào cũng được nhưng trừ X" hoặc "Tôi không biết chọn loại nào, bạn gợi ý đi", thì `user_rejected_info` (cho việc chọn loại cụ thể A,B,C) là `true`.
@@ -617,7 +625,8 @@ Người dùng: {user_message}
      *   c) ( `user_rejected_info` là `true` (người dùng không muốn/không thể cung cấp thêm chi tiết về SỞ THÍCH/THÓI QUEN ĂN UỐNG CỤ THỂ)
            HOẶC (thông tin về `dietary_habits`, `food_preferences`, `food_dislikes` trong `collected_info` là RẤT ÍT hoặc KHÔNG CÓ, VÀ người dùng không cung cấp thêm chi tiết khi được hỏi ở lượt trước)
            HOẶC (query đơn giản và rõ ràng muốn gợi ý ngay lập tức như "thêm món chay đi", "gợi ý món chay", "món chay nào ngon", mà không có yêu cầu cụ thể) ), VÀ
-     *   d) Thông tin về SỞ THÍCH CÁ NHÂN cụ thể (ngoài các điều kiện như "không cồn") là KHÔNG ĐỦ để cá nhân hóa sâu sắc gợi ý món ăn/đồ uống, **ngay cả khi đã biết các `health_condition`**.
+     *   d) Thông tin về SỞ THÍCH CÁ NHÂN cụ thể (ngoài các điều kiện như "không cồn") là KHÔNG ĐỦ để cá nhân hóa sâu sắc gợi ý món ăn/đồ uống.
+     *   **QUY TẮC ƯU TIÊN THÔNG TIN SỨC KHỎE:** Nếu `collected_info.health_condition` hoặc `collected_info.health_goals` chứa thông tin chi tiết và cụ thể (ví dụ: nhiều hơn 2-3 từ mô tả bệnh/mục tiêu), thì `suggest_general_options` NÊN LÀ `false`, trừ khi người dùng RÕ RÀNG yêu cầu gợi ý chung hoặc từ chối cung cấp thêm chi tiết về món ăn.
      *Khi `suggest_general_options` là `true`, chatbot sẽ không hỏi thêm về sở thích chung nữa, mà sẽ đưa ra gợi ý dựa trên các tiêu chí phổ biến và các `health_condition` + `food_dislikes` (ví dụ "không cồn") đã biết.*
    - `need_more_info` (boolean):
      *   **QUY TẮC THÉP 1: NẾU `user_rejected_info` là `true`, thì `need_more_info` PHẢI LÀ `FALSE`.**
@@ -1009,31 +1018,35 @@ Ví dụ output:
 
 CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
         else:
-            prompt = f"""Bạn là chuyên gia dinh dưỡng và ẩm thực. Nhiệm vụ của bạn là tạo ra một câu truy vấn tối ưu để tìm kiếm công thức món ăn phù hợp.
+            prompt = f"""Bạn là chuyên gia dinh dưỡng và ẩm thực. Nhiệm vụ của bạn là tạo ra một câu truy vấn tìm kiếm công thức món ăn TỐI ƯU và CHI TIẾT NHẤT.
 
-YÊU CẦU CỦA NGƯỜI DÙNG:
+YÊU CẦU CỤ THỂ CỦA NGƯỜI DÙNG:
 "{user_message}"
 
-THÔNG TIN SỨC KHỎE ĐÃ THU THẬP:
-{json.dumps(collected_info, ensure_ascii=False, indent=2) if collected_info else "Không có thông tin cụ thể"}
+THÔNG TIN SỨC KHỎE VÀ SỞ THÍCH ĐÃ THU THẬP (QUAN TRỌNG - PHẢI SỬ DỤNG):
+{json.dumps(collected_info, ensure_ascii=False, indent=2) if collected_info else "Chưa có thông tin cụ thể."}
 
 NHIỆM VỤ:
-Tạo một câu truy vấn ngắn gọn, súc tích (tối đa 150 từ) để tìm kiếm công thức món ăn phù hợp nhất.
+Tạo một câu truy vấn NGẮN GỌN (tối đa 15-20 từ) nhưng ĐẦY ĐỦ THÔNG TIN NHẤT để tìm kiếm công thức món ăn. Query này PHẢI phản ánh chính xác yêu cầu trong `user_message` VÀ TẤT CẢ các điều kiện liên quan trong `THÔNG TIN SỨC KHỎE ĐÃ THU THẬP`.
 
 QUY TẮC TẠO QUERY:
-1. **Nếu có thông tin sức khỏe cụ thể**: Kết hợp yêu cầu người dùng với các điều kiện sức khỏe
-2. **Nếu không có thông tin**: Sử dụng tiêu chí mặc định:
-   - Tính phổ biến và đa dạng
-   - Cân bằng dinh dưỡng
-   - Không gây dị ứng phổ biến
-   - Dễ chế biến
+1. Bắt đầu bằng loại món hoặc yêu cầu chính từ `user_message`.
+2. **TÍCH HỢP MỌI ĐIỀU KIỆN** từ `THÔNG TIN SỨC KHỎE ĐÃ THU THẬP`:
+   - Nếu có `health_condition` (ví dụ: "tiểu đường, béo phì, suy dinh dưỡng"), query PHẢI bao gồm các từ khóa như "cho người tiểu đường", "người béo phì", "tăng cân", "suy dinh dưỡng".
+   - Nếu có `allergies`, query phải có "không dị ứng [tên dị ứng]".
+   - Nếu có `dietary_habits` (ví dụ: "ăn chay"), query phải có "món chay".
+   - Nếu có `food_preferences` hoặc `food_dislikes`, cố gắng đưa vào (ví dụ: "ít cay", "không hành").
+3. Bao gồm các từ khóa về lợi ích nếu có trong `health_goals` (ví dụ: "giảm cân", "tăng cơ", "tốt cho tim").
+4. Giữ query tự nhiên nhưng súc tích.
 
-CẤU TRÚC QUERY MONG MUỐN:
-"[Loại món ăn/yêu cầu chính] + [điều kiện sức khỏe nếu có] + [ưu tiên dinh dưỡng] + [ưu tiên chế biến]"
+VÍ DỤ:
+User message: "bữa ăn cho gia đình tôi"
+Collected_info: {{"health_condition": "bố tiểu đường, mẹ tiểu đường, anh suy dinh dưỡng, tôi béo phì"}}
+Output Query mong muốn (ví dụ): "Bữa ăn gia đình phù hợp tiểu đường suy dinh dưỡng béo phì" hoặc "Thực đơn gia đình cho người tiểu đường béo phì và suy dinh dưỡng"
 
-Ví dụ:
-- "Món canh dinh dưỡng cho người tiểu đường, ít đường, nhiều chất xơ, dễ nấu"
-- "Món ăn sáng healthy, cân bằng dinh dưỡng, không gây dị ứng, nhanh chóng"
+User message: "món canh giải nhiệt"
+Collected_info: {{"allergies": "hải sản"}}
+Output Query mong muốn: "Canh giải nhiệt không hải sản"
 
 CHỈ TRẢ VỀ QUERY CUỐI CÙNG, KHÔNG CÓ GIẢI THÍCH THÊM:"""
 

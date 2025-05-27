@@ -24,8 +24,8 @@ PINECONE_API_KEY = os.getenv("PRODUCT_DB_PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "product-index")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-TOP_K_PRODUCTS_PER_INGREDIENT = 500
-MAX_CONCURRENT_GEMINI_PRODUCT_CALLS = 3
+TOP_K_PRODUCTS_PER_INGREDIENT = 100
+MAX_CONCURRENT_GEMINI_PRODUCT_CALLS = min(get_api_key_manager().total_keys(), 7)
 
 api_key_manager = get_api_key_manager()
 
@@ -253,15 +253,18 @@ async def find_product_for_ingredient_async(pinecone_index, embeddings_model, in
     Dưới đây là danh sách các sản phẩm (ID và Tên) có thể liên quan được tìm thấy:
     {potential_products_str}
 
-    Hãy chọn ra sản phẩm (ID và Tên) PHÙ HỢP NHẤT cho nguyên liệu "{ingredient_name}".
-    Một sản phẩm được coi là phù hợp nếu tên của nó khớp hoặc là một biến thể/loại cụ thể của nguyên liệu đó.
-    Ví dụ, nếu người dùng cần "gà", sản phẩm "Gà ta nguyên con" hoặc "Ức gà" có thể phù hợp.
+    **QUY TẮC CHỌN LỰA NGHIÊM NGẶT:**
+    1. ƯU TIÊN TUYỆT ĐỐI: Chọn sản phẩm có tên CHỨA ĐÚNG hoặc GẦN NHƯ ĐÚNG tên nguyên liệu "{ingredient_name}".
+       Ví dụ: Nếu nguyên liệu là "nấm đông cô", hãy tìm "Nấm đông cô tươi", "Nấm đông cô khô".
+    2. TRÁNH TUYỆT ĐỐI: KHÔNG chọn các sản phẩm chế biến sẵn chỉ CHỨA một phần nhỏ nguyên liệu đó (ví dụ: KHÔNG chọn "Mì gói vị nấm đông cô" nếu chỉ cần "nấm đông cô").
+    3. Nếu có nhiều sản phẩm phù hợp, chọn sản phẩm có vẻ là nguyên liệu thô hoặc sơ chế cơ bản nhất.
+    4. Nếu không có sản phẩm nào khớp chính xác hoặc là biến thể trực tiếp, hãy trả về null.
 
     Trả lời dưới dạng một đối tượng JSON DUY NHẤT có các trường:
     - "selected_product_id": (string) ID của sản phẩm bạn chọn. Nếu không có sản phẩm nào phù hợp, để là null.
     - "selected_product_name": (string) Tên của sản phẩm bạn chọn. Nếu không có, để là null.
 
-    Ví dụ phản hồi: {{"selected_product_id": "123", "selected_product_name": "Gà ta nguyên con"}}
+    Ví dụ phản hồi nếu nguyên liệu là "nấm đông cô": {{"selected_product_id": "123", "selected_product_name": "Nấm Đông Cô Khô HQ"}}
     Hoặc nếu không có: {{"selected_product_id": null, "selected_product_name": null}}
     Chỉ trả về đối tượng JSON.
     """
