@@ -84,36 +84,11 @@ async def check_scope_node(state: ChatState) -> ChatState:
     logger.info(f"🔍 Đang kiểm tra phạm vi nội dung: {state['user_message'][:50]}...")
     
     try:
-        # ⭐ BƯỚC 1: PRE-FILTERING - Kiểm tra input không hợp lệ trước khi gọi Gemini
-        import re
-        user_msg_lower = state['user_message'].lower().strip()
-        if (not user_msg_lower or 
-            len(user_msg_lower) < 3 or 
-            user_msg_lower.isnumeric() or 
-            not re.search(r'[a-zA-ZÀ-ỹ]', user_msg_lower)):
-            
-            logger.warning(f"Tin nhắn quá ngắn, không hợp lệ hoặc chỉ chứa số/ký tự đặc biệt: '{state['user_message']}'")
-            state['is_valid_scope'] = False
-            state['is_greeting'] = False
-            state['final_response'] = "Tin nhắn của bạn không hợp lệ. Vui lòng đặt câu hỏi rõ ràng hơn."
-            # Các cờ khác đặt về false/null
-            state['is_food_related'] = False
-            state['need_more_info'] = False
-            state['user_rejected_info'] = False
-            state['suggest_general_options'] = False
-            state['follow_up_question'] = None
-            state['collected_info'] = {}
-            state['requests_food'] = False
-            state['requests_beverage'] = False
-            if 'available_products' not in state:
-                state['available_products'] = []
-            return state
-        
         # Tạo dịch vụ Gemini
         gemini_service = GeminiPromptService()
         
         # Kiểm tra xem có phải tin nhắn chào hỏi không - vẫn giữ xử lý cơ bản này
-        greeting_words = ["chào", "hello", "hi", "xin chào", "hey", "good morning", "good afternoon", "good evening"]
+        greeting_words = ["chào", "hello", "hi", "xin chào", "hey", "good morning", "good afternoon", "good evening","2"]
         is_greeting = any(word in state['user_message'].lower() for word in greeting_words)
         state['is_greeting'] = is_greeting
         
@@ -1740,12 +1715,14 @@ async def run_chat_flow(
             result["user_message"] = {"role": "user", "content": user_message}
         
         # Đảm bảo có assistant_message cho API trả về và luôn là dictionary
+        
+        if result is None:
+            result = {}
         if not result.get("assistant_message") or not isinstance(result["assistant_message"], dict):
             result["assistant_message"] = {
                 "role": "assistant",
                 "content": result.get("final_response", "")
             }
-        
         # ⭐ FINAL SAFETY NET: Đảm bảo available_products tồn tại 
         if 'available_products' not in result:
             result['available_products'] = []
@@ -1757,13 +1734,8 @@ async def run_chat_flow(
         logger.info(f"   - assistant_message_id_db: {result.get('assistant_message_id_db')}")
         logger.info(f"   - is_valid_scope: {result.get('is_valid_scope')}")
         logger.info(f"   - suggest_general_options: {result.get('suggest_general_options')}")
-        logger.info(f"   - available_products count: {len(result.get('available_products') or [])}")
+        logger.info(f"   - available_products count: {len(result.get('available_products', []))}")
         logger.info(f"   - final_response length: {len(result.get('final_response', ''))}")
-        
-        # Đảm bảo available_products không bao giờ là None trong kết quả cuối cùng
-        if result.get('available_products') is None:
-            result['available_products'] = []
-            logger.warning("`available_products` was None in final result, defaulted to [].")
         
         return result
         
